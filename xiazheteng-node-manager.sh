@@ -2,1165 +2,668 @@
 #!/usr/bin/env bash
 # ============================================================
 # 瞎折腾吧 | VPS 节点管理器
-# 文件：xiazheteng-node-manager.sh
-# GitHub: https://github.com/xiazheteng8/xiazheteng-node-manager
-# YouTube: https://www.youtube.com/@xiazheteng8
+# GitHub:   https://github.com/xiazheteng8/xiazheteng-node-manager
+# YouTube:  https://www.youtube.com/@xiazheteng8
 # Telegram: https://t.me/xiazheteng8
 #
-# 默认无域名
-# 输入 x 即可快速启动
-# 菜单 5：合并已识别的节点分享链接
+# 功能：
+# 1. VLESS-REALITY 一键部署
+# 2. 可选域名 + HTTPS 订阅
+# 3. 无域名模式（默认）
+# 4. 自动选择空闲端口
+# 5. 订阅聚合
+# 6. SSH 输入 x / X 快捷启动
+# 7. 管理本脚本独立创建的服务
+#
+# 注意：独立配置，不覆盖 Xray 原有全局配置。
 # ============================================================
 
 set -Eeuo pipefail
 umask 077
 
-APP="xiazheteng-node-manager"
-SCRIPT_NAME="xiazheteng-node-manager.sh"
+APP_NAME="xiazheteng-node-manager"
+APP_TITLE="瞎折腾吧 | VPS 节点管理器"
 GITHUB_RAW="https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazheteng-node-manager.sh"
-UPSTREAM_URL="https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh"
 
-BASE="/etc/$APP"
-CONF="$BASE/config"
-DATA="$BASE/data"
-BACKUP="$BASE/backups"
+BASE_DIR="/etc/${APP_NAME}"
+CONFIG_DIR="${BASE_DIR}/config"
+DATA_DIR="${BASE_DIR}/data"
+XRAY_CONFIG="${CONFIG_DIR}/xray.json"
+NODES_FILE="${DATA_DIR}/nodes.txt"
+SETTINGS_FILE="${BASE_DIR}/settings"
+TOKEN_FILE="${BASE_DIR}/subscription-token"
+MANAGER_PATH="/usr/local/bin/${APP_NAME}.sh"
+SHORTCUT_PATH="/usr/local/bin/x"
 
 XRAY="/usr/local/bin/xray"
-XRAY_CONFIG="$CONF/xray.json"
-NODE_FILE="$DATA/node.txt"
-SUB_FILE="$DATA/subscribe.txt"
-SUB_URL_FILE="$DATA/subscribe_url"
-TOKEN_FILE="$DATA/token"
-DOMAIN_FILE="$DATA/domain"
+SERVICE_NAME="${APP_NAME}.service"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 
-SERVICE="xiazheteng-node-manager.service"
-SERVICE_FILE="/etc/systemd/system/$SERVICE"
-NGINX_SITE="/etc/nginx/conf.d/${APP}.conf"
-WEB_ROOT="/var/www/$APP"
-UPSTREAM="/opt/$APP/upstream/sb.sh"
+NGINX_ROOT="/var/www/html"
+SUB_DIR="${NGINX_ROOT}/sub"
 
-info(){ printf '[信息] %s\n' "$*"; }
-ok(){ printf '[成功] %s\n' "$*"; }
-warn(){ printf '[注意] %s\n' "$*"; }
-err(){ printf '[错误] %s\n' "$*" >&2; }
-pause(){ echo; read -r -p "按回车键继续..." _; }
-has(){ command -v "$1" >/dev/null 2>&1; }
+mkdir -p "$CONFIG_DIR" "$DATA_DIR"
 
-require_root(){
-    if [[ "$EUID" -ne 0 ]]; then
-        err "请使用 root 用户运行。"
+# -------------------- 基础工具 --------------------
+
+info() { printf '\033[1;34m[信息]\033[0m %s\n' "$*"; }
+ok()   { printf '\033[1;32m[成功]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[提示]\033[0m %s\n' "$*"; }
+err()  { printf '\033[1;31m[错误]\033[0m %s\n' "$*" >&2; }
+
+pause() {
+    echo
+    read -r -p "按回车键继续..." _ || true
+}
+
+need_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        err "请使用 root 权限运行。"
         exit 1
     fi
 }
 
-dirs(){
-    install -d -m 700 "$BASE" "$CONF" "$DATA" "$BACKUP"
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
 }
 
-install_deps(){
-    if has apt-get; then
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y
-        apt-get install -y curl ca-certificates openssl python3
-    elif has dnf; then
-        dnf install -y curl ca-certificates openssl python3
-    elif has yum; then
-        yum install -y curl ca-certificates openssl python3
-    elif has apk; then
-        apk add --no-cache curl ca-certificates openssl python3
+install_packages() {
+    export DEBIAN_FRONTEND=noninteractive
+
+    if command_exists apt-get; then
+        apt-get update
+        apt-get install -y curl ca-certificates unzip openssl \
+            python3 nginx certbot python3-certbot-nginx \
+            iproute2 uuid-runtime
     else
-        err "无法识别系统包管理器。"
+        err "当前版本仅自动处理 Debian / Ubuntu 的 apt 包管理器。"
         return 1
     fi
 }
 
-# ============================================================
-# SSH 快捷命令
-# SSH 登录后直接输入 x
-# ============================================================
+random_port() {
+    local port tries=0
 
-install_shortcut(){
-    local target="/usr/local/bin/$SCRIPT_NAME"
-    local shortcut="/usr/local/bin/x"
-    local source="${BASH_SOURCE[0]}"
-    local tmp
+    while (( tries < 200 )); do
+        port="$(shuf -i 20000-60000 -n 1)"
 
-    install -d -m 755 /usr/local/bin /etc/profile.d
-
-    if [[ -f "$source" && "$source" != /dev/fd/* ]]; then
-        if ! install -m 755 "$source" "$target"; then
-            warn "无法安装管理器入口：$target"
-            return 1
-        fi
-    else
-        tmp="$(mktemp)"
-
-        if ! curl -fsSL --retry 3 --connect-timeout 10 \
-            "$GITHUB_RAW" -o "$tmp"; then
-            rm -f "$tmp"
-            warn "无法从 GitHub 下载持久脚本。"
-            warn "请先将完整脚本提交到指定仓库。"
-            return 1
+        if ! ss -H -lntup 2>/dev/null |
+            awk '{print $5}' |
+            grep -Eq "[:.]${port}$"; then
+            printf '%s\n' "$port"
+            return 0
         fi
 
-        if ! bash -n "$tmp"; then
-            rm -f "$tmp"
-            warn "下载的脚本语法检查失败。"
-            return 1
-        fi
+        ((tries+=1))
+    done
 
-        install -m 755 "$tmp" "$target"
-        rm -f "$tmp"
-    fi
-
-    cat > "$shortcut" <<'EOF'
-#!/usr/bin/env bash
-SCRIPT="/usr/local/bin/xiazheteng-node-manager.sh"
-
-if [[ ! -f "$SCRIPT" ]]; then
-    echo "[错误] 找不到管理器脚本：$SCRIPT"
-    exit 1
-fi
-
-exec /usr/bin/env bash "$SCRIPT" "$@"
-EOF
-
-    chmod 755 "$shortcut"
-
-    cat > /etc/profile.d/xiazheteng-node-manager.sh <<'EOF'
-case ":$PATH:" in
-    *:/usr/local/bin:*) ;;
-    *) export PATH="/usr/local/bin:$PATH" ;;
-esac
-EOF
-
-    chmod 644 /etc/profile.d/xiazheteng-node-manager.sh
-    export PATH="/usr/local/bin:$PATH"
-
-    ok "SSH 快捷命令 x 已安装。"
+    err "无法找到空闲端口。"
+    return 1
 }
 
-public_ip(){
+get_public_ip() {
     local ip=""
     ip="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
 
     if [[ -z "$ip" ]]; then
-        ip="$(curl -4 -fsS --max-time 8 https://ifconfig.me/ip 2>/dev/null || true)"
+        ip="$(curl -4 -fsS --max-time 8 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)"
     fi
 
-    printf '%s' "$ip"
-}
-
-port_used(){
-    local p="$1"
-
-    if has ss; then
-        ss -H -lntu 2>/dev/null |
-            awk '{print $5}' |
-            grep -Eq "[:.]${p}$"
-    else
+    if [[ -z "$ip" ]]; then
+        err "无法自动获取公网 IPv4，请检查 VPS 网络。"
         return 1
     fi
+
+    printf '%s\n' "$ip"
 }
 
-random_port(){
-    python3 - <<'PY'
-import secrets
-print(secrets.randbelow(40000) + 20000)
-PY
-}
+# -------------------- 快捷入口 --------------------
 
-free_port(){
-    local i p
+install_shortcut() {
+    info "配置管理器快捷入口..."
 
-    for i in $(seq 1 100); do
-        p="$(random_port)"
-
-        if ! port_used "$p"; then
-            printf '%s\n' "$p"
-            return 0
+    # 如果当前正在执行的就是本地文件，直接安装当前版本。
+    if [[ -f "${BASH_SOURCE[0]}" && "${BASH_SOURCE[0]}" != /dev/fd/* ]]; then
+        if [[ "$(readlink -f "${BASH_SOURCE[0]}")" != "$(readlink -m "$MANAGER_PATH")" ]]; then
+            install -m 755 "${BASH_SOURCE[0]}" "$MANAGER_PATH"
         fi
-    done
+    elif [[ ! -f "$MANAGER_PATH" ]]; then
+        # 通过 curl | bash 或进程替换启动时，尝试从仓库下载持久版本。
+        if ! curl -fLsS --retry 2 "$GITHUB_RAW" -o "$MANAGER_PATH"; then
+            warn "无法从 GitHub 下载持久脚本。"
+            warn "请先将完整脚本提交到仓库后，再运行安装入口。"
+        else
+            chmod 755 "$MANAGER_PATH"
+        fi
+    fi
 
-    err "无法找到未被本机监听的端口。"
-    return 1
+    if [[ -f "$MANAGER_PATH" ]]; then
+        cat > "$SHORTCUT_PATH" <<'SHORTCUT'
+#!/usr/bin/env bash
+exec bash /usr/local/bin/xiazheteng-node-manager.sh "$@"
+SHORTCUT
+        chmod 755 "$SHORTCUT_PATH"
+        ok "快捷入口已配置：输入 x 即可启动。"
+    fi
 }
 
-install_xray(){
+# -------------------- Xray 安装 --------------------
+
+install_xray() {
     if [[ -x "$XRAY" ]]; then
-        info "Xray 已安装：$("$XRAY" version 2>/dev/null | head -n 1 || true)"
+        ok "检测到 Xray：$("$XRAY" version 2>/dev/null | head -n 1 || true)"
         return 0
     fi
 
-    local tmp
-    tmp="$(mktemp)"
+    info "正在安装 Xray..."
 
-    if ! curl -fL --retry 3 \
-        https://github.com/XTLS/Xray-install/raw/main/install-release.sh \
-        -o "$tmp"; then
-        rm -f "$tmp"
-        err "下载 Xray 安装脚本失败。"
-        return 1
-    fi
+    install_packages
 
-    if ! bash "$tmp" install; then
-        rm -f "$tmp"
-        err "Xray 安装失败。"
-        return 1
-    fi
-
-    rm -f "$tmp"
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 
     if [[ ! -x "$XRAY" ]]; then
-        err "安装后没有找到 $XRAY"
+        err "Xray 安装后未找到 $XRAY。"
         return 1
     fi
+
+    ok "Xray 安装完成。"
 }
 
-# ============================================================
-# REALITY 密钥解析
-#
-# 兼容常见输出：
-# PrivateKey: ...
-# Private key: ...
-# Password: ...
-# PublicKey: ...
-# Public key: ...
-#
-# 不将私钥当作公钥。
-# ============================================================
+# -------------------- REALITY 密钥解析 --------------------
 
-reality_keys(){
+reality_keys() {
     local output
-    local parsed
 
     output="$("$XRAY" x25519 2>&1)" || {
-        err "Xray x25519 执行失败："
+        err "Xray 密钥生成命令执行失败："
         printf '%s\n' "$output" >&2
         return 1
     }
 
-    parsed="$(
-        printf '%s\n' "$output" |
-        python3 -c '
+    # 兼容：
+    # PrivateKey: ...
+    # Password (PublicKey): ...
+    # Hash32: ...
+    #
+    # 也兼容 Private key / Public key 等常见字段名称。
+    python3 -c '
 import re
 import sys
 
 text = sys.stdin.read()
-
-def normalize(label):
-    return re.sub(r"[^a-z]", "", label.lower())
-
-values = {}
+fields = {}
 
 for line in text.splitlines():
     if ":" not in line:
         continue
 
     label, value = line.split(":", 1)
-    label = normalize(label)
+    label = re.sub(r"[^a-z]", "", label.lower())
     value = value.strip()
 
     if value:
-        values[label] = value
+        fields[label] = value
 
-private_key = ""
-public_key = ""
-
-for key in ("privatekey", "private"):
-    if values.get(key):
-        private_key = values[key]
-        break
-
-# Xray 某些版本将公钥称为 Password。
-# 优先读取明确的 PublicKey 字段。
-for key in ("publickey", "public"):
-    if values.get(key):
-        public_key = values[key]
-        break
-
-if not public_key and values.get("password"):
-    public_key = values["password"]
+private_key = fields.get("privatekey", "")
+public_key = (
+    fields.get("passwordpublickey", "")
+    or fields.get("publickey", "")
+    or fields.get("password", "")
+    or fields.get("public", "")
+)
 
 if not private_key or not public_key:
-    print("无法识别密钥输出格式。", file=sys.stderr)
-    print("识别到的字段：" + ", ".join(sorted(values.keys())), file=sys.stderr)
+    print("[错误] 无法识别 Xray 密钥输出格式。", file=sys.stderr)
+    print("识别到的字段：" + ", ".join(fields.keys()), file=sys.stderr)
     print("原始输出如下：", file=sys.stderr)
     print(text, file=sys.stderr)
     sys.exit(1)
 
 if private_key == public_key:
-    print("私钥和公钥字段相同，拒绝继续。", file=sys.stderr)
+    print("[错误] 私钥与公钥字段相同，拒绝继续。", file=sys.stderr)
     sys.exit(1)
 
 print(private_key)
 print(public_key)
-'
-    )" || {
-        err "无法识别当前 Xray 的密钥输出格式。"
-        printf '%s\n' "$output" >&2
-        return 1
-    }
-
-    printf '%s\n' "$parsed"
+' <<< "$output"
 }
 
-make_vless(){
-    local uuid="$1"
-    local host="$2"
-    local port="$3"
-    local pub="$4"
-    local sid="$5"
+# -------------------- 节点链接 --------------------
 
-    python3 - "$uuid" "$host" "$port" "$pub" "$sid" <<'PY'
+make_reality_link() {
+    local ip="$1"
+    local port="$2"
+    local uuid="$3"
+    local public_key="$4"
+    local sid="$5"
+    local remark="$6"
+
+    python3 - "$ip" "$port" "$uuid" "$public_key" "$sid" "$remark" <<'PY'
 import sys
 from urllib.parse import quote
 
-uid, host, port, pub, sid = sys.argv[1:]
+ip, port, uid, pbk, sid, remark = sys.argv[1:]
 
-if ":" in host and not host.startswith("["):
-    host = "[" + host + "]"
+params = (
+    "encryption=none"
+    "&flow=xtls-rprx-vision"
+    "&security=reality"
+    "&sni=www.microsoft.com"
+    "&fp=chrome"
+    f"&pbk={quote(pbk, safe='')}"
+    f"&sid={quote(sid, safe='')}"
+    "&type=tcp"
+)
 
 print(
-    f"vless://{uid}@{host}:{port}"
-    f"?encryption=none&security=reality"
-    f"&sni=www.microsoft.com&fp=chrome"
-    f"&pbk={quote(pub, safe='')}"
-    f"&sid={quote(sid, safe='')}"
-    f"&type=tcp&flow=xtls-rprx-vision"
-    f"#Xiazheteng-REALITY"
+    f"vless://{uid}@{ip}:{port}?{params}#{quote(remark, safe='')}"
 )
 PY
 }
 
-write_xray_config(){
-    local uuid="$1"
-    local port="$2"
-    local priv="$3"
-    local sid="$4"
+# -------------------- 域名 HTTPS 订阅 --------------------
 
-    python3 - "$XRAY_CONFIG" "$uuid" "$port" "$priv" "$sid" <<'PY'
-import json
-import sys
+configure_https_subscription() {
+    local domain email token
 
-path, uid, port, private_key, short_id = sys.argv[1:]
+    echo
+    read -r -p "请输入已解析到本机的域名：" domain
 
-cfg = {
-    "log": {
-        "loglevel": "warning"
-    },
-    "inbounds": [{
-        "listen": "0.0.0.0",
-        "port": int(port),
-        "protocol": "vless",
-        "settings": {
-            "clients": [{
-                "id": uid,
-                "flow": "xtls-rprx-vision"
-            }],
-            "decryption": "none"
-        },
-        "streamSettings": {
-            "network": "tcp",
-            "security": "reality",
-            "realitySettings": {
-                "show": False,
-                "dest": "www.microsoft.com:443",
-                "xver": 0,
-                "serverNames": ["www.microsoft.com"],
-                "privateKey": private_key,
-                "shortIds": [short_id]
-            }
-        },
-        "sniffing": {
-            "enabled": True,
-            "destOverride": ["http", "tls", "quic"]
+    domain="${domain,,}"
+    domain="${domain%.}"
+
+    if [[ ! "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] ||
+       [[ "$domain" != *.* ]] ||
+       [[ "$domain" == *..* ]]; then
+        err "域名格式不正确。"
+        return 1
+    fi
+
+    read -r -p "请输入用于证书申请的邮箱：" email
+
+    if [[ ! "$email" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then
+        err "邮箱格式不正确。"
+        return 1
+    fi
+
+    install_packages
+    mkdir -p "$SUB_DIR"
+
+    # 为 Certbot 保留标准 HTTP Web 根目录。
+    systemctl enable --now nginx
+
+    info "正在为 ${domain} 申请 HTTPS 证书..."
+
+    if ! certbot --nginx \
+        -d "$domain" \
+        --non-interactive \
+        --agree-tos \
+        --email "$email" \
+        --redirect; then
+        err "证书申请失败。请检查域名 DNS、80/443 端口和服务商安全组。"
+        return 1
+    fi
+
+    token="$(openssl rand -hex 24)"
+    printf '%s\n' "$token" > "$TOKEN_FILE"
+    printf '%s\n' "$domain" > "$SETTINGS_FILE"
+
+    mkdir -p "$SUB_DIR"
+    chmod 755 "$NGINX_ROOT" "$SUB_DIR"
+
+    ok "HTTPS 订阅域名配置完成。"
+}
+
+# -------------------- 订阅文件生成 --------------------
+
+write_subscription() {
+    local raw_file="$1"
+    local domain token out_file
+
+    if [[ ! -s "$raw_file" ]]; then
+        err "没有可生成的节点链接。"
+        return 1
+    fi
+
+    if [[ -s "$SETTINGS_FILE" && -s "$TOKEN_FILE" ]]; then
+        domain="$(head -n 1 "$SETTINGS_FILE")"
+        token="$(head -n 1 "$TOKEN_FILE")"
+        out_file="${SUB_DIR}/${token}"
+
+        mkdir -p "$SUB_DIR"
+        base64 -w 0 "$raw_file" > "$out_file"
+        chmod 644 "$out_file"
+
+        echo
+        ok "HTTPS 订阅已更新："
+        printf 'https://%s/sub/%s\n' "$domain" "$token"
+        return 0
+    fi
+
+    echo
+    info "当前没有配置域名 HTTPS 订阅。"
+    info "以下为可直接导入客户端的节点链接："
+    cat "$raw_file"
+}
+
+# -------------------- VLESS-REALITY 部署 --------------------
+
+deploy_reality() {
+    local mode port ip uuid keys private_key public_key sid remark link
+    local raw_file="${DATA_DIR}/nodes.txt"
+
+    echo
+    echo "请选择订阅模式："
+    echo "1. 域名 + HTTPS 订阅"
+    echo "2. 不使用域名（默认）"
+    read -r -p "请选择 [默认 2]：" mode
+    mode="${mode:-2}"
+
+    if [[ "$mode" != "1" && "$mode" != "2" ]]; then
+        err "无效选项。"
+        return 1
+    fi
+
+    install_packages
+    install_xray
+
+    if [[ "$mode" == "1" ]]; then
+        if ! configure_https_subscription; then
+            return 1
+        fi
+    fi
+
+    ip="$(get_public_ip)" || return 1
+    port="$(random_port)" || return 1
+    uuid="$(cat /proc/sys/kernel/random/uuid)"
+    sid="$(openssl rand -hex 4)"
+    remark="XiaZheTeng-REALITY-${port}"
+
+    keys="$(reality_keys)" || return 1
+    private_key="$(printf '%s\n' "$keys" | sed -n '1p')"
+    public_key="$(printf '%s\n' "$keys" | sed -n '2p')"
+
+    if [[ -z "$private_key" || -z "$public_key" ]]; then
+        err "密钥解析结果为空，已停止部署。"
+        return 1
+    fi
+
+    mkdir -p "$CONFIG_DIR" "$DATA_DIR"
+
+    # 只写入本项目独立配置，不覆盖 /usr/local/etc/xray/config.json。
+    cat > "$XRAY_CONFIG" <<JSON
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "xiazheteng-reality",
+      "listen": "0.0.0.0",
+      "port": ${port},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${uuid}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.microsoft.com:443",
+          "xver": 0,
+          "serverNames": [
+            "www.microsoft.com"
+          ],
+          "privateKey": "${private_key}",
+          "shortIds": [
+            "${sid}"
+          ]
         }
-    }],
-    "outbounds": [
-        {"protocol": "freedom", "tag": "direct"},
-        {"protocol": "blackhole", "tag": "block"}
-    ]
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ]
 }
+JSON
 
-with open(path, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, indent=2)
-    f.write("\n")
-PY
+    if ! "$XRAY" run -test -config "$XRAY_CONFIG"; then
+        err "Xray 配置测试失败，服务未启动。"
+        return 1
+    fi
 
-    chmod 600 "$XRAY_CONFIG"
-}
-
-write_service(){
-    cat > "$SERVICE_FILE" <<EOF
+    cat > "$SERVICE_FILE" <<SERVICE
 [Unit]
-Description=Xiazheteng Node Manager Xray Service
+Description=XiaZheTeng Node Manager Xray Service
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$XRAY run -config $XRAY_CONFIG
+User=root
+ExecStart=${XRAY} run -config ${XRAY_CONFIG}
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SERVICE
 
     systemctl daemon-reload
-    systemctl enable "$SERVICE" >/dev/null
-}
+    systemctl enable --now "$SERVICE_NAME"
 
-encode_file(){
-    local source="$1"
-    local destination="$2"
-
-    if [[ ! -s "$source" ]]; then
-        err "订阅源文件为空：$source"
+    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+        err "节点服务启动失败。"
+        journalctl -u "$SERVICE_NAME" -n 50 --no-pager || true
         return 1
     fi
 
-    base64 < "$source" | tr -d '\n' > "$destination"
-    printf '\n' >> "$destination"
-    chmod 600 "$destination"
-}
+    link="$(make_reality_link "$ip" "$port" "$uuid" "$public_key" "$sid" "$remark")"
 
-open_local_port(){
-    local p="$1"
-
-    if has ufw && ufw status 2>/dev/null | grep -q 'Status: active'; then
-        ufw allow "$p/tcp" || true
-    elif has firewall-cmd && systemctl is-active --quiet firewalld; then
-        firewall-cmd --permanent --add-port="${p}/tcp" || true
-        firewall-cmd --reload || true
-    else
-        info "未自动修改本机防火墙。"
+    # 保留已登记节点并避免重复写入同一链接。
+    touch "$NODES_FILE"
+    if ! grep -Fxq "$link" "$NODES_FILE"; then
+        printf '%s\n' "$link" >> "$NODES_FILE"
     fi
 
-    warn "请检查云厂商安全组是否放行 TCP $p。"
+    # 生成客户端订阅内容。
+    write_subscription "$NODES_FILE"
+
+    echo
+    ok "VLESS-REALITY 部署完成。"
+    printf '服务器地址：%s\n' "$ip"
+    printf '监听端口：%s\n' "$port"
+    printf '客户端 UUID：%s\n' "$uuid"
+    printf 'REALITY 公钥：%s\n' "$public_key"
+    printf 'Short ID：%s\n' "$sid"
+    echo
+    warn "请在云服务商安全组中放行 TCP ${port}。"
+    warn "本脚本不会自动修改所有云平台的外部安全组。"
 }
 
-validate_domain(){
-    [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]]
-}
+# -------------------- 订阅聚合 --------------------
 
-setup_nginx_packages(){
-    if has nginx; then
+aggregate_subscription() {
+    local tmp="${DATA_DIR}/subscription.raw"
+
+    touch "$NODES_FILE"
+
+    # 仅聚合本管理器登记的可识别分享链接。
+    # 不把服务器配置 JSON 直接当作客户端分享链接。
+    grep -E '^(vless|vmess|trojan|ss|hysteria2|tuic)://' \
+        "$NODES_FILE" 2>/dev/null | awk '!seen[$0]++' > "$tmp" || true
+
+    if [[ ! -s "$tmp" ]]; then
+        warn "当前没有发现本管理器登记的节点链接。"
         return 0
     fi
 
-    if has apt-get; then
-        apt-get install -y nginx
-    elif has dnf; then
-        dnf install -y nginx
-    elif has yum; then
-        yum install -y nginx
-    else
-        err "无法自动安装 Nginx。"
-        return 1
-    fi
+    write_subscription "$tmp"
 }
 
-setup_certbot(){
-    if has certbot; then
+# -------------------- 服务管理 --------------------
+
+service_status() {
+    echo
+    systemctl status "$SERVICE_NAME" --no-pager || true
+    pause
+}
+
+restart_service() {
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        warn "本项目的节点服务尚未安装。"
         return 0
     fi
 
-    if has apt-get; then
-        apt-get install -y certbot python3-certbot-nginx
-    elif has dnf; then
-        dnf install -y certbot python3-certbot-nginx ||
-            dnf install -y certbot
-    elif has yum; then
-        yum install -y certbot python3-certbot-nginx ||
-            yum install -y certbot
-    else
-        err "请手动安装 Certbot。"
-        return 1
-    fi
+    systemctl restart "$SERVICE_NAME"
+    systemctl status "$SERVICE_NAME" --no-pager || true
 }
 
-publish_subscription(){
-    local domain="$1"
-    local token pubip dnsip url
-
-    validate_domain "$domain" || {
-        err "域名格式不正确。"
-        return 1
-    }
-
-    setup_nginx_packages || return 1
-
-    pubip="$(public_ip)"
-    dnsip="$(getent ahostsv4 "$domain" 2>/dev/null |
-        awk 'NR==1 {print $1}')"
-
-    if [[ -z "$pubip" || -z "$dnsip" || "$pubip" != "$dnsip" ]]; then
-        err "域名解析未指向当前服务器 IPv4。"
-        echo "服务器公网 IP：${pubip:-未知}"
-        echo "域名解析 IP：${dnsip:-未知}"
-        return 1
-    fi
-
-    if [[ -e "$NGINX_SITE" ]]; then
-        err "已存在管理器 Nginx 配置，拒绝覆盖：$NGINX_SITE"
-        return 1
-    fi
-
-    token="$(openssl rand -hex 24)"
-    install -d -m 755 "$WEB_ROOT/sub"
-    install -m 644 "$SUB_FILE" "$WEB_ROOT/sub/$token"
-
-    cat > "$NGINX_SITE" <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $domain;
-
-    location = /sub/$token {
-        default_type text/plain;
-        alias $WEB_ROOT/sub/$token;
-        add_header Cache-Control "no-store";
-    }
-
-    location / {
-        return 404;
-    }
-}
-EOF
-
-    if ! nginx -t; then
-        rm -f "$NGINX_SITE"
-        err "Nginx 配置校验失败。"
-        return 1
-    fi
-
-    systemctl enable --now nginx
-    systemctl reload nginx
-
-    setup_certbot || return 1
-
-    if ! certbot --nginx -d "$domain" \
-        --non-interactive --agree-tos \
-        --register-unsafely-without-email --redirect; then
-        err "HTTPS 证书申请失败。"
-        return 1
-    fi
-
-    nginx -t || return 1
-    systemctl reload nginx
-
-    url="https://$domain/sub/$token"
-
-    if ! curl -fsS --connect-timeout 8 --max-time 15 \
-        "$url" -o /dev/null; then
-        err "HTTPS 订阅 URL 检查失败。"
-        return 1
-    fi
-
-    printf '%s\n' "$token" > "$TOKEN_FILE"
-    printf '%s\n' "$domain" > "$DOMAIN_FILE"
-    printf '%s\n' "$url" > "$SUB_URL_FILE"
-
-    chmod 600 "$TOKEN_FILE" "$DOMAIN_FILE" "$SUB_URL_FILE"
-
-    printf '%s\n' "$url"
-}
-
-install_node(){
-    require_root
-    install_deps
-    dirs
-    install_xray
-
+uninstall_manager() {
     echo
-    echo "请选择订阅模式："
-    echo "1. 域名 + HTTPS 订阅"
-    echo "2. 不使用域名（默认）"
-    read -r -p "请选择 [默认 2]：" mode
-    mode="${mode:-2}"
+    warn "此操作只卸载本管理器创建的服务与配置。"
+    warn "不会主动删除系统中的其他 Xray 配置或其他服务。"
+    read -r -p "确认卸载本管理器节点服务及其配置？[y/N]：" answer
 
-    [[ "$mode" == 1 || "$mode" == 2 ]] || {
-        err "无效选项。"
-        return 1
-    }
+    case "${answer,,}" in
+        y|yes)
+            systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
+            rm -f "$SERVICE_FILE"
+            systemctl daemon-reload
 
-    local domain=""
-    if [[ "$mode" == 1 ]]; then
-        read -r -p "请输入已解析到本机的域名：" domain
-        [[ -n "$domain" ]] || {
-            err "域名不能为空。"
-            return 1
-        }
-    fi
+            rm -rf "$BASE_DIR"
 
-    local port uuid sid keys priv pub host uri
-    port="$(free_port)"
-    uuid="$(cat /proc/sys/kernel/random/uuid)"
-    sid="$(openssl rand -hex 8)"
-
-    keys="$(reality_keys)" || return 1
-    priv="$(printf '%s\n' "$keys" | sed -n '1p')"
-    pub="$(printf '%s\n' "$keys" | sed -n '2p')"
-
-    write_xray_config "$uuid" "$port" "$priv" "$sid"
-
-    if ! "$XRAY" run -test -config "$XRAY_CONFIG"; then
-        err "Xray 配置校验失败，未启动服务。"
-        return 1
-    fi
-
-    write_service
-    systemctl restart "$SERVICE"
-    sleep 2
-
-    if ! systemctl is-active --quiet "$SERVICE"; then
-        err "Xray 服务启动失败。"
-        journalctl -u "$SERVICE" -n 60 --no-pager || true
-        return 1
-    fi
-
-    host="$(public_ip)"
-    if [[ -z "$host" ]]; then
-        read -r -p "无法自动获取公网 IP，请输入节点地址：" host
-    fi
-
-    [[ -n "$host" ]] || {
-        err "节点地址不能为空。"
-        return 1
-    }
-
-    uri="$(make_vless "$uuid" "$host" "$port" "$pub" "$sid")"
-
-    printf '%s\n' "$uri" > "$NODE_FILE"
-    encode_file "$NODE_FILE" "$SUB_FILE"
-    open_local_port "$port"
-
-    echo
-    ok "Xray 配置校验通过，服务已启动。"
-    echo "节点连接："
-    cat "$NODE_FILE"
-    echo
-    echo "本地 Base64 订阅文件：$SUB_FILE"
-
-    if [[ "$mode" == 1 ]]; then
-        local url
-
-        if url="$(publish_subscription "$domain")"; then
-            echo
-            ok "HTTPS 订阅地址："
-            echo "$url"
-        else
-            warn "公网订阅未验证成功，请检查 DNS、80/443 端口和证书。"
-        fi
-    else
-        echo
-        echo "Base64 订阅内容："
-        cat "$SUB_FILE"
-    fi
-
-    echo
-    warn "请在云厂商安全组中放行 TCP $port。"
-    warn "服务启动成功不代表公网端口一定可达。"
+            # 不删除共享的 Nginx、Certbot 或系统 Xray 安装。
+            warn "本项目服务及配置已删除。"
+            warn "为避免影响其他程序，快捷入口和管理脚本未自动删除。"
+            ;;
+        *)
+            info "已取消。"
+            ;;
+    esac
 }
 
-# ============================================================
-# 订阅扫描
-# ============================================================
-
-scan_share_file(){
-    local f="$1"
-    [[ -r "$f" ]] || return 0
-
-    grep -Eo \
-      '(vless|vmess|trojan|ss|ssr|hysteria|hysteria2|tuic|wireguard)://[^[:space:]"<>]+' \
-      "$f" 2>/dev/null || true
-}
-
-scan_json_config(){
-    local f="$1"
-    [[ -r "$f" ]] || return 0
-
-    python3 - "$f" <<'PY'
-import json, sys
-from urllib.parse import urlencode, quote
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as fp:
-        cfg = json.load(fp)
-except Exception:
-    sys.exit(0)
-
-for ib in cfg.get("inbounds", []):
-    try:
-        port = ib.get("port")
-        proto = str(ib.get("protocol", "")).lower()
-        settings = ib.get("settings", {})
-        stream = ib.get("streamSettings", {})
-        network = stream.get("network", "tcp")
-        security = stream.get("security", "none")
-        host = ib.get("listen", "")
-
-        if not host or host in (
-            "0.0.0.0", "::", "[::]", "localhost", "127.0.0.1"
-        ):
-            continue
-        if not port:
-            continue
-
-        if proto == "vless" and security != "reality":
-            for client in settings.get("clients", []):
-                uid = client.get("id")
-                if not uid:
-                    continue
-
-                params = {
-                    "encryption": "none",
-                    "type": network,
-                    "security": security
-                }
-
-                flow = client.get("flow")
-                if flow:
-                    params["flow"] = flow
-
-                if security == "tls":
-                    tls = stream.get("tlsSettings", {})
-                    if tls.get("serverName"):
-                        params["sni"] = tls["serverName"]
-
-                print(
-                    f"vless://{uid}@{host}:{port}?"
-                    f"{urlencode(params)}#scanned-vless"
-                )
-
-        elif proto == "trojan":
-            for client in settings.get("clients", []):
-                password = client.get("password")
-                if not password:
-                    continue
-
-                params = {"type": network, "security": security}
-
-                if security == "tls":
-                    tls = stream.get("tlsSettings", {})
-                    if tls.get("serverName"):
-                        params["sni"] = tls["serverName"]
-
-                print(
-                    f"trojan://{quote(password, safe='')}@{host}:{port}?"
-                    f"{urlencode(params)}#scanned-trojan"
-                )
-    except Exception:
-        continue
-PY
-}
-
-discover_files(){
-    local roots=(
-        /usr/local/etc/xray
-        /usr/local/etc/v2ray
-        /etc/xray
-        /etc/v2ray
-        /etc/sing-box
-        /usr/local/etc/sing-box
-        /opt
-    )
-
-    local d
-    for d in "${roots[@]}"; do
-        [[ -d "$d" ]] || continue
-
-        find "$d" -maxdepth 5 -type f \
-            \( -name '*.json' -o -name '*.txt' -o -name '*.conf' \) \
-            -not -path "$BASE/*" -print 2>/dev/null || true
-    done | sort -u
-}
-
-subscribe_all(){
-    require_root
-    dirs
-
-    echo
-    echo "请选择订阅模式："
-    echo "1. 域名 + HTTPS 订阅"
-    echo "2. 不使用域名（默认）"
-    read -r -p "请选择 [默认 2]：" mode
-    mode="${mode:-2}"
-
-    [[ "$mode" == 1 || "$mode" == 2 ]] || {
-        err "无效选项。"
-        return 1
-    }
-
-    local domain=""
-    if [[ "$mode" == 1 ]]; then
-        read -r -p "请输入已解析到本机的域名：" domain
-
-        [[ -n "$domain" ]] && validate_domain "$domain" || {
-            err "域名为空或格式错误。"
-            return 1
-        }
-    fi
-
-    local tmp f merged count
-    tmp="$(mktemp)"
-    merged="$DATA/all-nodes.txt"
-
-    [[ -r "$NODE_FILE" ]] && cat "$NODE_FILE" >> "$tmp"
-
-    while IFS= read -r f; do
-        case "$f" in
-            *.txt|*.conf)
-                scan_share_file "$f" >> "$tmp"
-                ;;
-            *.json)
-                scan_json_config "$f" >> "$tmp"
-                ;;
-        esac
-    done < <(discover_files)
-
-    grep -E \
-      '^(vless|vmess|trojan|ss|ssr|hysteria|hysteria2|tuic|wireguard)://' \
-      "$tmp" | sed 's/\r$//' | sort -u > "$merged" || true
-
-    rm -f "$tmp"
-
-    count="$(grep -c . "$merged" 2>/dev/null || true)"
-    count="${count:-0}"
-
-    if [[ "$count" -eq 0 ]]; then
-        err "没有发现可直接导入的节点分享链接。"
-        warn "无法确认公钥或客户端参数的服务端配置会被跳过。"
-        return 1
-    fi
-
-    encode_file "$merged" "$SUB_FILE"
-
-    ok "订阅合并完成，共 $count 条去重分享链接。"
-    echo "节点清单：$merged"
-    echo "Base64 订阅文件：$SUB_FILE"
-
-    if [[ "$mode" == 1 ]]; then
-        local url
-
-        if url="$(publish_subscription "$domain")"; then
-            echo
-            ok "HTTPS 订阅地址："
-            echo "$url"
-        else
-            err "公网订阅未通过检查；本地订阅文件仍已生成。"
-            return 1
-        fi
-    else
-        echo
-        echo "Base64 订阅内容："
-        cat "$SUB_FILE"
-        echo
-        warn "无域名模式不会生成公网 HTTPS 订阅地址。"
-    fi
-}
-
-show_status(){
-    echo
-    systemctl --no-pager -l status "$SERVICE" 2>/dev/null || true
-
-    if [[ -x "$XRAY" ]]; then
-        "$XRAY" version 2>/dev/null | head -n 3
-    fi
-}
-
-restart_xray(){
-    if systemctl restart "$SERVICE"; then
-        ok "服务已重启。"
-    else
-        err "服务重启失败。"
-        journalctl -u "$SERVICE" -n 50 --no-pager || true
-    fi
-}
-
-show_logs(){
-    journalctl -u "$SERVICE" -n 100 --no-pager || true
-}
-
-update_xray(){
-    local tmp rc
-    tmp="$(mktemp)"
-
-    if ! curl -fL --retry 3 \
-        https://github.com/XTLS/Xray-install/raw/main/install-release.sh \
-        -o "$tmp"; then
-        rm -f "$tmp"
-        err "下载更新脚本失败。"
-        return 1
-    fi
-
-    if bash "$tmp" install; then
-        rc=0
-    else
-        rc=$?
-    fi
-
-    rm -f "$tmp"
-    return "$rc"
-}
-
-backup_config(){
-    dirs
-
-    local file="$BACKUP/backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-    tar -czf "$file" -C "$BASE" config data
-    chmod 600 "$file"
-
-    ok "备份完成：$file"
-}
-
-show_node(){
-    if [[ -r "$NODE_FILE" ]]; then
-        cat "$NODE_FILE"
-    else
-        warn "本管理器尚未生成节点。"
-    fi
-}
-
-check_ports(){
-    if has ss; then
-        ss -lntup
-    else
-        warn "系统缺少 ss 命令。"
-    fi
-}
-
-kernel_menu(){
-    while true; do
-        echo
-        echo "========== 内核与服务管理 =========="
-        echo "1. 查看服务状态"
-        echo "2. 重启 Xray 服务"
-        echo "3. 查看服务日志"
-        echo "4. 更新 Xray"
-        echo "5. 查看本管理器节点"
-        echo "6. 备份配置"
-        echo "7. 检查监听端口"
-        echo "0. 返回主菜单"
-
-        read -r -p "请选择：" c
-
-        case "$c" in
-            1) show_status; pause ;;
-            2) restart_xray; pause ;;
-            3) show_logs; pause ;;
-            4) update_xray; pause ;;
-            5) show_node; pause ;;
-            6) backup_config; pause ;;
-            7) check_ports; pause ;;
-            0) return ;;
-            *) warn "无效选项。" ;;
-        esac
-    done
-}
-
-install_upstream(){
-    install -d -m 700 "$(dirname "$UPSTREAM")"
-
-    local tmp
-    tmp="$(mktemp)"
-
-    if ! curl -fL --retry 3 "$UPSTREAM_URL" -o "$tmp"; then
-        rm -f "$tmp"
-        err "下载勇哥脚本失败。"
-        return 1
-    fi
-
-    if ! head -n 1 "$tmp" | grep -q '^#!'; then
-        rm -f "$tmp"
-        err "下载内容不是预期的 Shell 脚本。"
-        return 1
-    fi
-
-    install -m 700 "$tmp" "$UPSTREAM"
-    rm -f "$tmp"
-
-    ok "已保存上游脚本：$UPSTREAM"
-}
-
-run_upstream(){
-    if [[ ! -x "$UPSTREAM" ]]; then
-        install_upstream || return 1
-    fi
-
-    warn "即将以 root 权限运行第三方脚本。"
-    read -r -p "确定运行？[y/N]：" c
-
-    if [[ "$c" == y || "$c" == Y ]]; then
-        bash "$UPSTREAM"
-    fi
-}
-
-show_subscription(){
-    if [[ -r "$SUB_FILE" ]]; then
-        cat "$SUB_FILE"
-    else
-        warn "尚无订阅文件。"
-    fi
-
-    if [[ -r "$SUB_URL_FILE" ]]; then
-        echo
-        echo "已记录的公网订阅地址："
-        cat "$SUB_URL_FILE"
-    fi
-}
-
-enable_bbr(){
-    touch /etc/sysctl.conf
-
-    grep -q '^net.core.default_qdisc=fq$' /etc/sysctl.conf ||
-        echo 'net.core.default_qdisc=fq' >> /etc/sysctl.conf
-
-    grep -q '^net.ipv4.tcp_congestion_control=bbr$' /etc/sysctl.conf ||
-        echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf
-
-    sysctl -p
-}
-
-check_https(){
-    if [[ -r "$SUB_URL_FILE" ]]; then
-        curl -fsS -D - --connect-timeout 8 --max-time 15 \
-            "$(cat "$SUB_URL_FILE")" -o /dev/null
-    else
-        warn "没有已验证的 HTTPS 订阅地址。"
-    fi
-}
-
-update_manager(){
-    local tmp
-    tmp="$(mktemp)"
-
-    if ! curl -fL --retry 3 "$GITHUB_RAW" -o "$tmp"; then
-        rm -f "$tmp"
-        err "下载管理器更新失败。"
-        return 1
-    fi
-
-    if ! bash -n "$tmp"; then
-        rm -f "$tmp"
-        err "新脚本语法检查失败，取消更新。"
-        return 1
-    fi
-
-    install -m 755 "$tmp" "/usr/local/bin/$SCRIPT_NAME"
-    rm -f "$tmp"
-
-    ok "管理器已更新。"
-}
-
-more_menu(){
+more_features() {
     while true; do
         echo
         echo "========== 更多功能 =========="
-        echo "1. 打开勇哥 Sing-box 菜单"
-        echo "2. 下载/更新勇哥脚本"
-        echo "3. 查看 Base64 订阅"
-        echo "4. 开启 BBR"
-        echo "5. 检查 HTTPS 订阅"
-        echo "6. 更新本管理器"
+        echo "1. 查看本项目节点服务状态"
+        echo "2. 重启本项目节点服务"
+        echo "3. 查看本项目节点配置路径"
+        echo "4. 查看订阅聚合结果"
         echo "0. 返回主菜单"
+        read -r -p "请选择：" choice
 
-        read -r -p "请选择：" c
-
-        case "$c" in
-            1) run_upstream; pause ;;
-            2) install_upstream; pause ;;
-            3) show_subscription; pause ;;
-            4) enable_bbr; pause ;;
-            5) check_https; pause ;;
-            6) update_manager; pause ;;
+        case "$choice" in
+            1) service_status ;;
+            2) restart_service; pause ;;
+            3)
+                echo "Xray 配置：$XRAY_CONFIG"
+                echo "节点列表：$NODES_FILE"
+                pause
+                ;;
+            4) aggregate_subscription; pause ;;
             0) return ;;
             *) warn "无效选项。" ;;
         esac
     done
 }
 
-uninstall_manager(){
-    echo
-    warn "将删除本管理器服务与配置，不会卸载全局 Xray 或 Nginx。"
-    read -r -p "输入 DELETE 确认卸载：" c
+# -------------------- 主菜单 --------------------
 
-    [[ "$c" == DELETE ]] || {
-        info "已取消。"
-        return
-    }
-
-    systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
-    rm -f "$SERVICE_FILE"
-
-    if [[ -f "$NGINX_SITE" ]] && grep -q "$WEB_ROOT" "$NGINX_SITE"; then
-        rm -f "$NGINX_SITE"
-
-        if nginx -t >/dev/null 2>&1; then
-            systemctl reload nginx >/dev/null 2>&1 || true
-        fi
-    fi
-
-    rm -rf "$BASE" "$WEB_ROOT" "/opt/$APP"
-    systemctl daemon-reload
-
-    warn "不会自动删除系统中的其他站点或证书。"
-    read -r -p "是否删除快捷命令 x 和管理器入口？[y/N]：" c
-
-    if [[ "$c" == y || "$c" == Y ]]; then
-        rm -f /usr/local/bin/x
-        rm -f "/usr/local/bin/$SCRIPT_NAME"
-        rm -f /etc/profile.d/xiazheteng-node-manager.sh
-    fi
-
-    ok "管理器清理完成。"
-}
-
-main_menu(){
+show_menu() {
     while true; do
         clear 2>/dev/null || true
 
-        echo "=================================================="
-        echo "          瞎折腾吧 | VPS 节点管理器"
-        echo "=================================================="
-        echo "1. 一键安装"
-        echo "2. 一键卸载"
-        echo "3. 内核与服务管理"
+        echo "=============================================="
+        echo "       ${APP_TITLE}"
+        echo "=============================================="
+        echo "1. 一键部署 VLESS-REALITY"
+        echo "2. 卸载本项目节点服务"
+        echo "3. 系统与服务设置"
         echo "4. 更多功能"
-        echo "5. 一键订阅所有已安装节点"
+        echo "5. 一键聚合订阅"
+        echo "0. 退出"
+        echo "----------------------------------------------"
+        echo "快捷键：x / X 启动菜单，q / Q 退出"
         echo
-        echo "输入 x / X：安装快捷入口并返回菜单"
-        echo "输入 q / Q：退出"
-        echo "=================================================="
 
-        read -r -p "请输入选项：" c
+        read -r -p "请选择：" choice || exit 0
 
-        case "$c" in
-            1) install_node; pause ;;
-            2) uninstall_manager; pause ;;
-            3) kernel_menu ;;
-            4) more_menu ;;
-            5) subscribe_all; pause ;;
-            x|X)
-                install_shortcut || true
-                info "以后 SSH 登录后可直接输入 x 启动。"
+        case "${choice,,}" in
+            1)
+                deploy_reality
                 pause
                 ;;
-            q|Q) exit 0 ;;
-            *) warn "无效选项。"; sleep 1 ;;
+            2)
+                uninstall_manager
+                pause
+                ;;
+            3)
+                echo
+                echo "========== 系统与服务设置 =========="
+                echo "1. 查看本项目服务状态"
+                echo "2. 重启本项目服务"
+                echo "0. 返回"
+                read -r -p "请选择：" subchoice
+
+                case "$subchoice" in
+                    1) service_status ;;
+                    2) restart_service; pause ;;
+                    *) ;;
+                esac
+                ;;
+            4)
+                more_features
+                ;;
+            5)
+                aggregate_subscription
+                pause
+                ;;
+            0|q)
+                exit 0
+                ;;
+            x)
+                continue
+                ;;
+            *)
+                warn "无效选项。"
+                pause
+                ;;
         esac
     done
 }
 
-main(){
-    require_root
-    dirs
+# -------------------- 入口 --------------------
 
-    install_shortcut || warn "快捷命令安装失败，主菜单仍可继续使用。"
-    main_menu
+main() {
+    need_root
+    install_shortcut
+    show_menu
 }
 
 main "$@"
