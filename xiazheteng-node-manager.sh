@@ -1,357 +1,328 @@
+# 瞎折腾吧｜VPS 节点管理器
 
-#!/usr/bin/env bash
-# ============================================================
-# 瞎折腾吧 VPS 多协议节点统一管理器
-# Xray 无证书实例 + Sing-box-yg 五协议模块
-#
-# 原有 Xray:
-#   Config: /usr/local/etc/xray/node-manager-nocert.json
-#   Service: xray-node-manager-nocert.service
-#   Subscription: /var/lib/node-manager-nocert/subscription.txt
-#
-# Upstream:
-#   https://github.com/yonggekkk/sing-box-yg
-#
-# 注意：Sing-box-yg 保留为独立模块，不合并两种内核的 JSON。
-# ============================================================
+一个面向 Linux VPS 的轻量级节点管理入口，旨在简化 Xray 无证书节点、有证书节点以及第三方 Sing-box 多协议脚本的使用和维护流程。
 
-set -Eeuo pipefail
-umask 077
+<p align="center">
 
-APP_NAME="瞎折腾吧 VPS 节点管理器"
-BASE="/opt/xiazheteng-node-manager"
-UPSTREAM_DIR="$BASE/upstream"
-UPSTREAM_SCRIPT="$UPSTREAM_DIR/sb.sh"
-UPSTREAM_URL="https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh"
+**作者：瞎折腾吧**
 
-XRAY="/usr/local/bin/xray"
-XRAY_CONFIG="/usr/local/etc/xray/node-manager-nocert.json"
-XRAY_SERVICE="xray-node-manager-nocert.service"
-SUB_SERVICE="node-manager-nocert-subscription.service"
-SUB_FILE="/var/lib/node-manager-nocert/subscription.txt"
-BACKUP_DIR="/root/node-manager-backups"
+[YouTube 频道](https://www.youtube.com/@xiazheteng8) · [Telegram 频道](https://t.me/xiazheteng8) · [GitHub 项目](https://github.com/xiazheteng8/xiazheteng-node-manager)
 
-need_root() {
-    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-        echo "请使用 root 运行："
-        echo "sudo bash /root/xiazheteng-node-manager.sh"
-        exit 1
-    fi
-}
+</p>
 
-pause() {
-    echo
-    read -r -p "按回车键返回菜单……" _
-}
+---
 
-line() {
-    printf '%s\n' '============================================================'
-}
+## 一、项目介绍
 
-init_dirs() {
-    mkdir -p "$BASE" "$UPSTREAM_DIR" "$BACKUP_DIR"
-    chmod 700 "$BASE" "$UPSTREAM_DIR" "$BACKUP_DIR"
-}
+在 VPS 上部署和管理代理节点时，经常需要分别运行不同的安装脚本、查找配置文件、检查服务状态，以及处理端口冲突等问题。
 
-check_xray_files() {
-    [[ -x "$XRAY" ]] || {
-        echo "未找到 Xray：$XRAY"
-        return 1
-    }
-    [[ -f "$XRAY_CONFIG" ]] || {
-        echo "未找到无证书配置：$XRAY_CONFIG"
-        return 1
-    }
-}
+本项目希望提供一个统一的管理入口，将常用的管理操作集中起来，减少重复输入命令的麻烦。
 
-backup_xray() {
-    check_xray_files || return 1
-    mkdir -p "$BACKUP_DIR"
-    chmod 700 "$BACKUP_DIR"
+项目围绕以下方向进行设计：
 
-    local stamp
-    stamp="$(date +%Y%m%d-%H%M%S)"
+- **统一入口：** 通过一个 Shell 脚本进入管理菜单。
+- **现有 Xray 配置检查：** 检查指定的无证书 Xray 配置及其运行状态。
+- **上游脚本调用：** 下载、更新并调用勇哥的 Sing-box 多协议脚本。
+- **配置备份与恢复：** 为支持的配置文件提供备份和恢复入口。
+- **订阅信息管理：** 查看现有无证书节点管理模块的订阅信息。
+- **尽量减少操作：** 通过菜单完成常见管理任务。
 
-    cp -a "$XRAY_CONFIG" \
-        "$BACKUP_DIR/node-manager-nocert-$stamp.json"
+本项目仍在持续完善中。具体可用功能以当前版本脚本实际实现为准。
 
-    if [[ -f "$SUB_FILE" ]]; then
-        cp -a "$SUB_FILE" \
-            "$BACKUP_DIR/subscription-$stamp.txt"
-    fi
+## 二、功能说明
 
-    echo "Xray 配置备份完成。"
-    echo "备份目录：$BACKUP_DIR"
-}
+| 功能 | 说明 |
+|---|---|
+| 统一管理菜单 | 从一个入口进入管理功能 |
+| 无证书 Xray 配置检查 | 检查指定配置文件及 Xray 配置语法 |
+| Xray 服务状态查看 | 查看指定独立 Xray 服务的运行情况 |
+| Sing-box 上游脚本 | 下载、更新并调用勇哥的多协议脚本 |
+| 配置备份 | 备份管理器指定的配置文件 |
+| 配置恢复 | 从已有备份中选择配置进行恢复 |
+| 订阅信息查看 | 查看现有订阅文件及相关信息 |
 
-check_xray_config() {
-    check_xray_files || return 1
-    line
-    echo "检查现有无证书 Xray 配置……"
-    "$XRAY" run -test -config "$XRAY_CONFIG"
-    local result=$?
-    line
-    return "$result"
-}
+### 关于多协议和证书模式
 
-show_status() {
-    line
-    echo "【现有无证书 Xray 服务】"
-    systemctl --no-pager --full status "$XRAY_SERVICE" || true
+本项目的设计目标是整合无证书、有证书及多协议节点管理。
 
-    echo
-    echo "【现有订阅服务】"
-    systemctl --no-pager --full status "$SUB_SERVICE" || true
+其中，勇哥的 Sing-box 脚本是一个独立的上游项目，拥有自己的安装流程、配置和菜单。通过本项目调用上游脚本，并不代表上游所有协议都已经合并到本项目的配置或订阅系统中。
 
-    echo
-    echo "【默认 Xray 服务】"
-    echo "以下仅显示状态，不会操作默认服务。"
-    systemctl is-active xray.service 2>/dev/null || true
+上游项目：
 
-    echo
-    echo "【端口监听】"
-    ss -lntup 2>/dev/null |
-        grep -E '(:80|:443|:8388|:18080)([[:space:]]|$)' || true
+- [yonggekkk/sing-box-yg](https://github.com/yonggekkk/sing-box-yg)
 
-    echo
-    echo "【现有节点配置检查】"
-    if [[ -x "$XRAY" && -f "$XRAY_CONFIG" ]]; then
-        "$XRAY" run -test -config "$XRAY_CONFIG" || true
-    else
-        echo "现有 Xray 配置或程序不存在。"
-    fi
-    line
-}
+请以本项目当前脚本及上游脚本实际提供的菜单为准。
 
-download_upstream() {
-    init_dirs
+## 三、系统要求
 
-    if ! command -v curl >/dev/null 2>&1; then
-        echo "缺少 curl。请先安装 curl 后再试。"
-        return 1
-    fi
+建议使用以下环境：
 
-    local tmp
-    tmp="$(mktemp "$UPSTREAM_DIR/sb.sh.XXXXXX")"
+- Linux VPS，具有 root 权限。
+- 支持 Bash 的 Linux 发行版，例如 Debian 或 Ubuntu。
+- 可正常访问 GitHub 或配置可用的下载代理。
+- 已安装或能够安装 `curl`、`git` 等常用工具。
+- 如果使用 Xray 检查、备份或恢复功能，服务器上需要存在相应的配置文件或服务。
 
-    echo "正在下载勇哥公开仓库的 VPS 脚本……"
-    if ! curl -fL --connect-timeout 15 --max-time 180 \
-        --retry 2 "$UPSTREAM_URL" -o "$tmp"; then
-        rm -f "$tmp"
-        echo "下载失败，请检查网络或稍后重试。"
-        return 1
-    fi
+如果 VPS 上已经运行 Nginx、网站、邮件服务、Xray 或其他代理服务，请先备份数据，再使用涉及安装、端口和防火墙的功能。
 
-    if [[ ! -s "$tmp" ]] || ! head -n 1 "$tmp" | grep -q 'bash'; then
-        rm -f "$tmp"
-        echo "下载文件校验失败，已取消。"
-        return 1
-    fi
+## 四、安装与启动
 
-    chmod 700 "$tmp"
-    mv -f "$tmp" "$UPSTREAM_SCRIPT"
+### 方法一：一条命令启动
 
-    echo "已保存：$UPSTREAM_SCRIPT"
-    echo "来源：$UPSTREAM_URL"
-}
+以 root 用户登录 VPS 后执行：
 
-run_upstream() {
-    init_dirs
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazheteng-node-manager.sh)
+```
 
-    if [[ ! -s "$UPSTREAM_SCRIPT" ]]; then
-        download_upstream || return 1
-    else
-        echo "当前本地模块：$UPSTREAM_SCRIPT"
-        echo "如需获取上游最新版本，请先使用“下载/更新勇哥模块”。"
-    fi
+该命令会下载并执行 GitHub 仓库中的主脚本。
 
-    echo
-    line
-    echo "即将启动 Sing-box-yg 独立模块。"
-    echo
-    echo "该模块支持的功能以其上游版本为准，包括："
-    echo "  - VLESS REALITY Vision"
-    echo "  - VMess WS/TLS 或 Argo"
-    echo "  - Hysteria 2"
-    echo "  - TUIC v5"
-    echo "  - AnyTLS"
-    echo "  - 上游版本所提供的证书、订阅和隧道管理功能"
-    echo
-    echo "重要保护提示："
-    echo "  1. 本管理器不会主动停止现有 Xray 服务。"
-    echo "  2. 上游脚本是独立安装程序，仍可能修改系统依赖、防火墙或服务。"
-    echo "  3. 证书申请可能需要 80/443 端口；你当前的 Nginx/邮件网站需先确认兼容性。"
-    echo "  4. 不要在未确认端口和配置的情况下选择覆盖现有服务的操作。"
-    line
+**注意：** 这种方式适合快速启动，但执行远程脚本前，建议先查看源码，确认脚本内容符合预期。
 
-    local answer
-    read -r -p "确认运行上游脚本？输入 YES 继续：" answer
-    [[ "$answer" == "YES" ]] || {
-        echo "已取消。"
-        return 0
-    }
+### 方法二：克隆仓库后运行
 
-    bash "$UPSTREAM_SCRIPT"
-    local result=$?
+先安装必要工具：
 
-    echo
-    echo "上游脚本退出，退出码：$result"
-    echo "返回前请确认现有 Xray 服务仍正常。"
-    return 0
-}
+```bash
+apt-get update
+apt-get install -y git curl
+```
 
-update_upstream() {
-    echo "更新操作只下载脚本，不会自动执行。"
-    download_upstream || return 1
-    echo
-    echo "下载完成。之后可从菜单启动上游模块。"
-}
+克隆项目：
 
-show_subscription_info() {
-    line
-    echo "订阅文件：$SUB_FILE"
-    if [[ -f "$SUB_FILE" ]]; then
-        stat -c '权限=%a 文件大小=%s 字节 修改时间=%y' "$SUB_FILE"
-    else
-        echo "订阅文件不存在。"
-    fi
+```bash
+git clone https://github.com/xiazheteng8/xiazheteng-node-manager.git
+```
 
-    echo
-    echo "订阅服务状态："
-    systemctl is-active "$SUB_SERVICE" 2>/dev/null || true
+进入目录：
 
-    echo
-    echo "订阅服务配置路径："
-    systemctl show "$SUB_SERVICE" -p FragmentPath -p ExecStart \
-        --no-pager 2>/dev/null || true
+```bash
+cd xiazheteng-node-manager
+```
 
-    echo
-    echo "订阅 URL 使用格式："
-    echo "http://服务器地址:订阅端口/订阅令牌"
-    echo "本菜单不会打印令牌，避免终端截图意外泄露。"
-    line
-}
+设置脚本权限：
 
-show_backups() {
-    line
-    echo "备份目录：$BACKUP_DIR"
-    if [[ -d "$BACKUP_DIR" ]]; then
-        ls -lht "$BACKUP_DIR" | head -n 30
-    else
-        echo "尚无备份。"
-    fi
-    line
-}
+```bash
+chmod 700 xiazheteng-node-manager.sh
+```
 
-restore_xray_backup() {
-    check_xray_files || return 1
+启动管理菜单：
 
-    mapfile -t backups < <(
-        find "$BACKUP_DIR" -maxdepth 1 -type f \
-            -name 'node-manager-nocert-*.json' -printf '%T@ %p\n' |
-        sort -nr | awk '{$1=""; sub(/^ /,""); print}'
-    )
+```bash
+bash xiazheteng-node-manager.sh
+```
 
-    if [[ ${#backups[@]} -eq 0 ]]; then
-        echo "没有找到 Xray 配置备份。"
-        return 1
-    fi
+### 方法三：下载脚本后运行
 
-    echo "可恢复的 Xray 配置备份："
-    local i=1
-    local f
-    for f in "${backups[@]}"; do
-        echo "$i. $f"
-        ((i+=1))
-    done
+如果不想安装 Git，可以直接下载：
 
-    echo
-    read -r -p "输入编号恢复，输入 0 取消：" choice
-    [[ "$choice" =~ ^[0-9]+$ ]] || {
-        echo "无效编号。"
-        return 1
-    }
-    (( choice >= 1 && choice <= ${#backups[@]} )) || {
-        echo "已取消或编号超出范围。"
-        return 1
-    }
+```bash
+curl -fL \
+  https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazheteng-node-manager.sh \
+  -o /root/xiazheteng-node-manager.sh
+```
 
-    local selected="${backups[$((choice-1))]}"
-    echo
-    echo "即将恢复：$selected"
-    echo "此操作只恢复无证书 Xray 配置，不恢复订阅文件。"
-    read -r -p "输入 RESTORE 确认：" answer
-    [[ "$answer" == "RESTORE" ]] || {
-        echo "已取消。"
-        return 0
-    }
+然后执行：
 
-    # 恢复前再保存一份当前配置。
-    backup_xray || return 1
-    cp -a "$selected" "$XRAY_CONFIG"
+```bash
+chmod 700 /root/xiazheteng-node-manager.sh
+bash /root/xiazheteng-node-manager.sh
+```
 
-    if ! "$XRAY" run -test -config "$XRAY_CONFIG"; then
-        echo "恢复后的配置校验失败。请从备份目录手动恢复。"
-        return 1
-    fi
+## 五、菜单使用说明
 
-    echo "配置检查通过。现在重启独立 Xray 服务。"
-    systemctl restart "$XRAY_SERVICE"
-    systemctl --no-pager --full status "$XRAY_SERVICE"
-}
+启动脚本后，根据屏幕显示的菜单选择相应功能。
 
-show_menu() {
-    clear 2>/dev/null || true
-    line
-    printf '       %s\n' "$APP_NAME"
-    line
-    cat <<'MENU'
-1. 启动勇哥 Sing-box 多协议模块
-2. 下载/更新勇哥模块（只下载，不执行）
-3. 检查现有无证书 Xray 配置
-4. 查看现有 Xray / 订阅服务 / 端口状态
-5. 备份现有无证书 Xray 配置和订阅文件
-6. 查看备份文件
-7. 恢复一份无证书 Xray 配置备份
-8. 查看订阅文件与服务信息
-0. 退出
+当前管理入口涉及以下操作：
 
-说明：
-- 原有 Xray 与 Sing-box 使用独立配置和服务。
-- 勇哥模块的证书、五协议、Argo 等功能由上游脚本管理。
-- 本管理器不会自动合并两套订阅，也不会自动改写 Nginx。
-MENU
-    line
-}
+| 菜单项 | 用途 |
+|---|---|
+| 1 | 启动或调用勇哥 Sing-box 多协议脚本 |
+| 2 | 下载或更新上游 Sing-box 脚本 |
+| 3 | 检查指定的 Xray 配置 |
+| 4 | 查看相关服务状态 |
+| 5 | 备份指定配置 |
+| 6 | 查看现有备份 |
+| 7 | 恢复已有配置备份 |
+| 8 | 查看订阅信息 |
+| 0 | 退出管理菜单 |
 
-main() {
-    need_root
-    init_dirs
+**重要：** 菜单编号和具体操作以你实际安装的脚本版本为准。
 
-    while true; do
-        show_menu
-        read -r -p "请选择 [0-8]：" choice
+### 首次使用建议
 
-        case "$choice" in
-            1) run_upstream; pause ;;
-            2) update_upstream; pause ;;
-            3)
-                if check_xray_config; then
-                    echo "配置检查通过。"
-                else
-                    echo "配置检查失败，请保留输出以便排查。"
-                fi
-                pause
-                ;;
-            4) show_status; pause ;;
-            5) backup_xray; pause ;;
-            6) show_backups; pause ;;
-            7) restore_xray_backup; pause ;;
-            8) show_subscription_info; pause ;;
-            0) exit 0 ;;
-            *) echo "无效选项。"; sleep 1 ;;
-        esac
-    done
-}
+1. 先运行主脚本，查看当前菜单。
+2. 先检查现有 Xray 配置和服务状态。
+3. 对现有配置进行备份。
+4. 如果需要使用 Sing-box 多协议功能，再进入上游脚本。
+5. 按上游脚本提示选择所需的协议、部署方式及证书选项。
+6. 部署完成后，按照对应脚本输出的信息检查节点链接、服务状态和端口。
 
-main "$@"
+请不要在没有备份的情况下，直接对已有生产环境执行重装或覆盖操作。
+
+## 六、日常使用
+
+### 1. 再次打开管理菜单
+
+如果通过克隆方式安装：
+
+```bash
+cd /root/xiazheteng-node-manager
+bash xiazheteng-node-manager.sh
+```
+
+如果下载到 `/root` 目录：
+
+```bash
+bash /root/xiazheteng-node-manager.sh
+```
+
+如果仓库克隆到了其他目录，请使用实际保存路径。
+
+### 2. 更新主脚本
+
+使用 Git 克隆的方式安装时：
+
+```bash
+cd /root/xiazheteng-node-manager
+git pull
+bash xiazheteng-node-manager.sh
+```
+
+如果提示本地修改与远程版本冲突，请先备份本地修改，不要直接执行强制覆盖操作。
+
+### 3. 更新上游 Sing-box 脚本
+
+进入本项目管理菜单，选择对应的上游脚本下载或更新功能。
+
+也可以根据上游项目的官方说明更新：
+
+[勇哥 Sing-box 多协议脚本](https://github.com/yonggekkk/sing-box-yg)
+
+更新前建议阅读上游项目的更新说明，并备份当前配置。
+
+### 4. 查看 Xray 配置是否有效
+
+通过主菜单进入配置检查功能。
+
+如果需要手动检查指定配置，可参考：
+
+```bash
+/usr/local/bin/xray run -test \
+  -config /usr/local/etc/xray/node-manager-nocert.json
+```
+
+只有在你的服务器确实使用上述配置路径时，才执行这条命令。其他安装方式请替换成实际配置路径。
+
+## 七、配置备份与恢复
+
+如果当前版本提供备份与恢复菜单，可以通过菜单完成对应操作。
+
+建议备份以下内容：
+
+- Xray 配置文件。
+- 节点 UUID、REALITY 相关参数等必要配置。
+- 订阅文件及其访问令牌。
+- 自定义证书、域名及服务配置。
+- 自己修改过的脚本。
+
+备份文件可能包含私钥、UUID、订阅令牌等敏感信息。请妥善保管，不要直接上传到公开 GitHub 仓库。
+
+### 恢复前注意事项
+
+1. 确认备份来源和时间。
+2. 确认备份对应的服务及配置路径。
+3. 避免将旧配置直接覆盖到不兼容的新版本。
+4. 恢复后检查配置语法和服务状态。
+5. 如果涉及网站或邮件服务，确认相关端口和反向代理仍然正常。
+
+请注意：菜单中的备份和恢复功能只作用于脚本实际处理的文件，不能据此认为整个 VPS 已经完成系统级备份。
+
+## 八、端口与防火墙注意事项
+
+节点部署可能需要监听 TCP 或 UDP 端口。不同协议的端口要求并不相同。
+
+部署前请确认：
+
+- 端口没有被其他程序占用。
+- VPS 提供商的安全组允许所需流量。
+- 系统防火墙规则符合实际需求。
+- Nginx、网站、邮件服务和已有节点不会因端口变更而中断。
+- TCP 与 UDP 端口规则分别检查。
+
+不要直接清空现有防火墙规则。部分第三方脚本可能提供修改防火墙或开放端口的操作，这些操作可能影响 VPS 上运行的其他服务。
+
+**关于自动更换随机端口：** 只有当前脚本明确实现并确认更换成功后，才能认为该功能可用。不能仅凭项目目标推断所有部署模式都已经支持自动换端口。
+
+## 九、订阅与节点连接
+
+节点部署完成后，请以安装脚本实际输出的节点链接和订阅地址为准。
+
+需要注意：
+
+- 节点链接与订阅地址不是同一概念。
+- 不同协议的客户端兼容性可能不同。
+- 订阅服务需要正常运行，且访问路径、令牌和端口配置必须一致。
+- 如果订阅地址无法访问，应分别检查订阅服务、文件权限、访问路径和防火墙。
+- 请勿将包含访问令牌的完整订阅链接公开发布。
+
+本项目的统一管理入口不代表所有上游协议已经自动汇总成同一个订阅。
+
+## 十、常见问题
+
+### 1. 执行一条命令后无法下载
+
+检查 VPS 是否能够访问 GitHub：
+
+```bash
+curl -I https://raw.githubusercontent.com/
+```
+
+如果无法连接，请检查 DNS、网络出口或下载代理配置。
+
+### 2. 提示 Permission denied
+
+确认使用 root 权限，且脚本具备执行权限：
+
+```bash
+chmod 700 xiazheteng-node-manager.sh
+bash xiazheteng-node-manager.sh
+```
+
+使用 `bash` 运行时，通常不要求文件必须具有可执行权限，但设置合适的权限有助于避免误操作。
+
+### 3. Xray 配置检查失败
+
+先查看具体报错，再确认：
+
+- JSON 格式是否正确。
+- 配置路径是否正确。
+- 私钥、UUID 等参数是否完整。
+- 端口是否符合当前配置。
+- 配置是否与当前 Xray 版本兼容。
+
+不要仅因默认 `xray.service` 状态异常，就直接覆盖或重启其他独立运行的 Xray 实例。
+
+### 4. 节点部署后无法连接
+
+建议依次检查：
+
+1. 节点服务是否正在运行。
+2. 监听端口是否正确。
+3. VPS 安全组及系统防火墙是否放行。
+4. 域名解析、证书和客户端参数是否一致。
+5. 服务日志中是否存在启动或握手错误。
+
+不同协议的排查方法不同，请根据实际部署模式查看对应日志。
+
+### 5. 更新后原有节点异常
+
+先检查配置文件是否被修改，以及相关服务是否仍在运行。必要时恢复此前备份的配置。
+
+不要在没有确认服务名称和配置路径的情况下，盲目重启或覆盖系统内已有服务。
+
+## 十一、安全说明
+
+- 本项目主要用于 VPS 节点部署和管理。
+- 执行脚本前，请检查源码并确认操作范围。
+- 第三
