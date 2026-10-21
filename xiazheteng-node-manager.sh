@@ -2,17 +2,9 @@
 #!/usr/bin/env bash
 # ============================================================
 # 瞎折腾吧 | VPS 节点管理器 IPv4-only
-# GitHub:  https://github.com/xiazheteng8/xiazheteng-node-manager
-# YouTube: https://www.youtube.com/@xiazheteng8
+# GitHub:   https://github.com/xiazheteng8/xiazheteng-node-manager
+# YouTube:  https://www.youtube.com/@xiazheteng8
 # Telegram: https://t.me/xiazheteng8
-#
-# 功能：
-# 1. VLESS-REALITY 一键部署
-# 2. 可选 HTTPS 订阅 / 默认不使用域名
-# 3. 节点统一管理与订阅聚合
-# 4. SSH 输入 x 快速启动
-# 5. IPv4-only，不主动配置 IPv6 监听
-# 6. 不清空防火墙，不覆盖其他站点完整配置
 # ============================================================
 
 set -Eeuo pipefail
@@ -27,15 +19,16 @@ NODES_FILE="${DATA_DIR}/nodes.txt"
 SETTINGS_FILE="${BASE_DIR}/settings"
 TOKEN_FILE="${BASE_DIR}/subscription-token"
 SUB_ROOT_FILE="${BASE_DIR}/subscription-root"
+
 MANAGER_PATH="/usr/local/bin/${APP_NAME}.sh"
 SHORTCUT_PATH="/usr/local/bin/x"
 SERVICE_NAME="${APP_NAME}.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+
 NGINX_ROOT="/var/www/html"
 SUB_DIR="${NGINX_ROOT}/sub"
 NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}.conf"
 NGINX_LINK="/etc/nginx/sites-enabled/${APP_NAME}.conf"
-SNIPPET="/etc/nginx/snippets/${APP_NAME}-sub.conf"
 XRAY="/usr/local/bin/xray"
 
 GREEN='\033[0;32m'
@@ -55,7 +48,7 @@ pause() {
 }
 
 require_root() {
-    if [[ "${EUID}" -ne 0 ]]; then
+    if [[ "$EUID" -ne 0 ]]; then
         err "请使用 root 用户运行。"
         exit 1
     fi
@@ -68,13 +61,87 @@ init_dirs() {
     chmod 600 "$NODES_FILE"
 }
 
-install_packages() {
-    info "正在检查系统依赖……"
+# ------------------------------------------------------------
+# 启动自恢复
+# 解决 bash <(curl ...) 时 $0 指向 /dev/fd 的问题。
+# 使用 /proc/$$/fd/255 等特殊路径时不直接 install 该路径。
+# ------------------------------------------------------------
+bootstrap_script() {
+    local source="${BASH_SOURCE[0]}"
+    local temp
 
-    if ! command -v apt-get >/dev/null 2>&1; then
-        err "当前脚本仅支持 Debian / Ubuntu 系统。"
-        return 1
+    if [[ "$source" == "$MANAGER_PATH" ]]; then
+        return 0
     fi
+
+    if [[ -f "$source" && -r "$source" && "$source" != /dev/fd/* ]]; then
+        install -m 700 "$source" "$MANAGER_PATH"
+        return 0
+    fi
+
+    # Bash 通常会把脚本源文件保存在一个可读取的 FD 中。
+    # 不假设 FD 编号固定，遍历常见 FD，检查内容是否为本脚本。
+    for source in /proc/$$/fd/*; do
+        [[ -r "$source" ]] || continue
+        [[ -f "$source" ]] || continue
+
+        if grep -q '瞎折腾吧 | VPS 节点管理器 IPv4-only' "$source" 2>/dev/null; then
+            temp="$(mktemp "${BASE_DIR}.bootstrap.XXXXXX")"
+            if cat "$source" > "$temp" 2>/dev/null && [[ -s "$temp" ]]; then
+                install -m 700 "$temp" "$MANAGER_PATH"
+                rm -f "$temp"
+                return 0
+            fi
+            rm -f "$temp"
+        fi
+    done
+
+    # 最后使用网络重新获取当前 GitHub 主分支版本。
+    # 这避免把 /dev/fd 或 pipe 路径传给 install。
+    if command -v curl >/dev/null 2>&1; then
+        temp="$(mktemp "${BASE_DIR}.bootstrap.XXXXXX")"
+        if curl -4 -fsSL \
+            "https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazheteng-node-manager.sh" \
+            -o "$temp" &&
+            grep -q '^#!/usr/bin/env bash' "$temp" &&
+            grep -q '瞎折腾吧 | VPS 节点管理器 IPv4-only' "$temp"; then
+            install -m 700 "$temp" "$MANAGER_PATH"
+            rm -f "$temp"
+            return 0
+        fi
+        rm -f "$temp"
+    fi
+
+    warn "无法自动安装快捷入口，但仍尝试继续运行当前脚本。"
+    return 0
+}
+
+install_shortcut() {
+    mkdir -p /usr/local/bin
+
+    # 不再对 /dev/fd、pipe 或 /proc/.../fd 路径执行 install。
+    if [[ -f "$MANAGER_PATH" ]]; then
+        chmod 700 "$MANAGER_PATH"
+    else
+        warn "管理脚本尚未保存为真实文件，快捷入口暂时无法安装。"
+        return 0
+    fi
+
+    cat > "${SHORTCUT_PATH}.tmp" <<'SHORTCUT'
+#!/usr/bin/env bash
+exec /usr/local/bin/xiazheteng-node-manager.sh "$@"
+SHORTCUT
+
+    chmod 700 "${SHORTCUT_PATH}.tmp"
+    mv "${SHORTCUT_PATH}.tmp" "$SHORTCUT_PATH"
+    ok "快捷入口已安装：输入 x 即可启动。"
+}
+
+install_packages() {
+    command -v apt-get >/dev/null 2>&1 || {
+        err "当前脚本仅支持 Debian / Ubuntu。"
+        return 1
+    }
 
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
@@ -84,18 +151,13 @@ install_packages() {
 }
 
 get_public_ip() {
-    local ip=""
+    local ip
     ip="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
-
-    if [[ -z "$ip" ]]; then
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || \
         ip="$(curl -4 -fsS --max-time 8 https://ipv4.icanhazip.com 2>/dev/null || true)"
-    fi
 
-    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        printf '%s\n' "$ip"
-    else
-        return 1
-    fi
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    printf '%s\n' "$ip"
 }
 
 port_in_use() {
@@ -109,28 +171,25 @@ random_port() {
     for ((i=0; i<100; i++)); do
         port="$(shuf -i 20000-60000 -n 1)"
         if ! port_in_use "$port"; then
-            echo "$port"
+            printf '%s\n' "$port"
             return 0
         fi
     done
 
-    err "无法找到可用端口。"
+    err "未找到可用端口。"
     return 1
 }
 
 validate_domain() {
-    local domain="${1,,}"
-    domain="${domain%.}"
-
-    DOMAIN_TO_CHECK="$domain" python3 - <<'PY'
+    DOMAIN_TO_CHECK="${1,,}" python3 - <<'PY'
 import os, re, sys
-d = os.environ.get("DOMAIN_TO_CHECK", "")
-if len(d) > 253 or not d or "." not in d:
+d = os.environ.get("DOMAIN_TO_CHECK", "").rstrip(".")
+if len(d) > 253 or "." not in d:
     sys.exit(1)
 labels = d.split(".")
 if any(
+    len(x) > 63 or
     not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", x)
-    or len(x) > 63
     for x in labels
 ):
     sys.exit(1)
@@ -138,50 +197,29 @@ print(d)
 PY
 }
 
-install_shortcut() {
-    local source
-    source="$(readlink -f "$0")"
-
-    if [[ "$source" != "$MANAGER_PATH" ]]; then
-        install -m 700 "$source" "$MANAGER_PATH"
-    fi
-
-    cat > "$SHORTCUT_PATH" <<'SHORTCUT'
-#!/usr/bin/env bash
-exec /usr/local/bin/xiazheteng-node-manager.sh "$@"
-SHORTCUT
-
-    chmod 700 "$SHORTCUT_PATH"
-    ok "管理入口已安装：输入 x 即可打开菜单。"
-}
-
 install_xray() {
     if [[ -x "$XRAY" ]]; then
-        info "检测到已安装 Xray：$("$XRAY" version 2>/dev/null | head -n 1)"
+        info "Xray 已安装：$("$XRAY" version 2>/dev/null | head -n 1)"
         return 0
     fi
 
     info "正在安装 Xray……"
     bash -c "$(curl -4 -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-
     [[ -x "$XRAY" ]] || {
-        err "Xray 安装后未找到执行文件。"
+        err "未找到 Xray 执行文件。"
         return 1
     }
 }
 
 reality_keys() {
-    local output private_key public_key
-
+    local output
     output="$("$XRAY" x25519 2>&1)" || {
-        err "生成 REALITY 密钥失败。"
-        printf '%s\n' "$output"
+        printf '%s\n' "$output" >&2
         return 1
     }
 
-    read -r private_key public_key < <(
-        KEY_OUTPUT="$output" python3 - <<'PY'
-import os, re
+    KEY_OUTPUT="$output" python3 - <<'PY'
+import os, re, sys
 s = os.environ["KEY_OUTPUT"]
 fields = {}
 for line in s.splitlines():
@@ -189,42 +227,25 @@ for line in s.splitlines():
         k, v = line.split(":", 1)
         fields[k.strip().lower()] = v.strip()
 
-private = (
-    fields.get("privatekey")
-    or fields.get("private key")
-    or fields.get("private_key")
-)
-public = (
-    fields.get("password")
-    or fields.get("publickey")
-    or fields.get("public key")
-    or fields.get("public_key")
-)
+private = fields.get("privatekey") or fields.get("private key") or fields.get("private_key")
+public = fields.get("password") or fields.get("publickey") or fields.get("public key") or fields.get("public_key")
 
 if not private or not public:
-    values = re.findall(r"(?m)^\s*(?:Private key|Password \(Public key\)):\s*(\S+)", s)
-    if len(values) >= 2:
-        private, public = values[0], values[1]
+    vals = re.findall(r"(?m)^\s*(?:Private key|Password \(Public key\)):\s*(\S+)", s)
+    if len(vals) >= 2:
+        private, public = vals[0], vals[1]
 
-if private and public:
-    print(private, public)
+if not private or not public:
+    print("无法识别 Xray REALITY 密钥格式。", file=sys.stderr)
+    sys.exit(1)
+
+print(private)
+print(public)
 PY
-    )
-
-    if [[ -z "${private_key:-}" || -z "${public_key:-}" ]]; then
-        err "无法识别当前 Xray 的密钥输出格式。"
-        printf '%s\n' "$output"
-        return 1
-    fi
-
-    printf '%s\n%s\n' "$private_key" "$public_key"
 }
 
 make_reality_link() {
-    local uuid="$1" address="$2" port="$3" public_key="$4"
-    local short_id="$5" name="$6" sni="$7"
-
-    python3 - "$uuid" "$address" "$port" "$public_key" "$short_id" "$name" "$sni" <<'PY'
+    python3 - "$@" <<'PY'
 import sys, urllib.parse
 uuid, address, port, key, sid, name, sni = sys.argv[1:]
 params = {
@@ -245,14 +266,11 @@ print(
 PY
 }
 
-# 从 Nginx 配置中寻找精确匹配域名的 root。
-# 这里用于辅助判断，不直接修改第三方站点配置。
 find_existing_root() {
     local domain="$1"
 
     python3 - "$domain" <<'PY'
 import glob, os, re, sys
-
 domain = sys.argv[1].lower()
 files = []
 for pattern in (
@@ -263,42 +281,38 @@ for pattern in (
     files.extend(glob.glob(pattern))
 
 seen = set()
-
 for path in files:
     real = os.path.realpath(path)
     if real in seen or not os.path.isfile(real):
         continue
     seen.add(real)
-
     try:
         text = open(real, encoding="utf-8", errors="ignore").read()
     except OSError:
         continue
-
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
     text = re.sub(r"(?m)#.*$", "", text)
 
-    # 仅提取 server_name 和 root 供查找使用；
-    # 不依赖此简化解析器来改写原站点。
     names = re.findall(r"(?m)^\s*server_name\s+([^;]+);", text)
-    roots = re.findall(r"(?m)^\s*root\s+([^;]+);", text)
+    if not any(domain in [x.lower() for x in line.split()] for line in names):
+        continue
 
-    if any(domain in [x.lower() for x in line.split()] for line in names):
-        for root in reversed(roots):
-            root = root.strip().strip("\"'")
-            if root.startswith("/") and os.path.isdir(root):
-                print(root)
-                sys.exit(0)
+    roots = re.findall(r"(?m)^\s*root\s+([^;]+);", text)
+    for root in reversed(roots):
+        root = root.strip().strip("\"'")
+        if root.startswith("/") and os.path.isdir(root):
+            print(root)
+            sys.exit(0)
 
 print("")
 PY
 }
 
 configure_https_subscription() {
-    local domain email dns_ips existing_root cert_path token
+    local mode domain email root token cert_path dns_ips
 
     echo
-    echo "订阅模式："
+    echo "请选择订阅模式："
     echo "1. 域名 + HTTPS 订阅"
     echo "2. 不使用域名（默认）"
     read -r -p "请选择 [默认 2]：" mode
@@ -310,31 +324,30 @@ configure_https_subscription() {
         return 0
     fi
 
-    read -r -p "请输入已解析到本机 IPv4 的域名：" domain
+    read -r -p "请输入已解析到本机的域名：" domain
     domain="$(validate_domain "$domain")" || {
         err "域名格式不正确。"
         return 1
     }
 
     read -r -p "请输入证书申请邮箱：" email
-    if [[ ! "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+    [[ "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || {
         err "邮箱格式不正确。"
         return 1
-    fi
+    }
 
     dns_ips="$(dig +short A "$domain" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)"
-    if [[ -z "$dns_ips" ]]; then
-        err "域名没有有效的 IPv4 A 记录。"
+    [[ -n "$dns_ips" ]] || {
+        err "域名没有 IPv4 A 记录，请先配置 DNS。"
         return 1
-    fi
+    }
 
-    existing_root="$(find_existing_root "$domain" || true)"
-
-    if [[ -n "$existing_root" ]]; then
-        NGINX_ROOT="$existing_root"
-        SUB_DIR="${NGINX_ROOT}/sub"
-        info "检测到现有站点，复用其网站目录：$NGINX_ROOT"
-        warn "不会删除或覆盖原有 Nginx 站点配置。"
+    root="$(find_existing_root "$domain" || true)"
+    if [[ -n "$root" ]]; then
+        NGINX_ROOT="$root"
+        SUB_DIR="${root}/sub"
+        info "检测到现有站点，复用网站根目录：$root"
+        warn "不会删除或覆盖原站点的 Nginx 配置。"
     else
         NGINX_ROOT="/var/www/html"
         SUB_DIR="${NGINX_ROOT}/sub"
@@ -348,19 +361,16 @@ configure_https_subscription() {
         return 1
     }
 
-    info "正在申请或续用 HTTPS 证书……"
-    if ! certbot certonly \
-        --webroot -w "$NGINX_ROOT" \
-        -d "$domain" \
-        --non-interactive --agree-tos \
-        --email "$email"; then
-        err "证书申请失败。请检查 DNS、80 端口及现有站点的 ACME 路径。"
+    info "正在申请 HTTPS 证书……"
+    certbot certonly --webroot -w "$NGINX_ROOT" -d "$domain" \
+        --non-interactive --agree-tos --email "$email" || {
+        err "证书申请失败。请检查 DNS、80 端口、ACME 路径及云安全组。"
         return 1
-    fi
+    }
 
     cert_path="/etc/letsencrypt/live/${domain}"
     [[ -s "$cert_path/fullchain.pem" && -s "$cert_path/privkey.pem" ]] || {
-        err "证书文件不存在或不完整。"
+        err "证书文件不完整。"
         return 1
     }
 
@@ -372,21 +382,19 @@ configure_https_subscription() {
     printf '%s\n' "$NGINX_ROOT" > "${SUB_ROOT_FILE}.tmp"
     mv "${SUB_ROOT_FILE}.tmp" "$SUB_ROOT_FILE"
 
-    if [[ -n "$existing_root" ]]; then
-        # 不对未知结构的既有 server block 自动插入 location。
-        # 防止误改反向代理、多个 server_name、嵌套 location 或第三方站点。
-        warn "已复用现有站点目录，但现有 HTTPS 配置未被改写。"
-        warn "需要现有 HTTPS server 提供 /sub/ 路由，才能通过该路径访问订阅。"
-        warn "如当前站点没有 /sub/ 路由，部署会继续，但订阅链接可能暂时无法访问。"
+    if [[ -n "$(find_existing_root "$domain" || true)" ]]; then
+        # 保护现有站点，不进行不可靠的正则改写。
         nginx -t || {
-            err "现有 Nginx 配置测试失败。"
+            err "现有 Nginx 配置检查失败。"
             return 1
         }
+        warn "证书已就绪，现有站点配置未修改。"
+        warn "请确认该站点的 HTTPS server 已将 /sub/ 路由映射到：${NGINX_ROOT}/sub/"
         return 0
     fi
 
     if [[ -e "$NGINX_CONF" || -e "$NGINX_LINK" ]]; then
-        err "本项目的 Nginx 配置文件已存在，拒绝覆盖。"
+        err "本项目 Nginx 配置已存在，拒绝覆盖。"
         return 1
     fi
 
@@ -429,7 +437,7 @@ NGINX
 
     if ! nginx -t; then
         rm -f "$NGINX_LINK" "$NGINX_CONF"
-        err "新建 Nginx 配置检查失败，已撤销本次新增配置。"
+        err "Nginx 配置测试失败，已撤销本次新增配置。"
         return 1
     fi
 
@@ -440,25 +448,16 @@ NGINX
         return 1
     fi
 
-    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-    cat > "/etc/letsencrypt/renewal-hooks/deploy/${APP_NAME}.sh" <<'HOOK'
-#!/usr/bin/env bash
-nginx -t && systemctl reload nginx
-HOOK
-    chmod 755 "/etc/letsencrypt/renewal-hooks/deploy/${APP_NAME}.sh"
-
     ok "HTTPS 订阅站点已配置。"
 }
 
 write_subscription() {
     local token root output tmp
     [[ -s "$TOKEN_FILE" ]] || return 0
-    token="$(cat "$TOKEN_FILE")"
 
+    token="$(cat "$TOKEN_FILE")"
     root="$NGINX_ROOT"
-    if [[ -s "$SUB_ROOT_FILE" ]]; then
-        root="$(cat "$SUB_ROOT_FILE")"
-    fi
+    [[ -s "$SUB_ROOT_FILE" ]] && root="$(cat "$SUB_ROOT_FILE")"
 
     mkdir -p "${root}/sub"
     output="${root}/sub/${token}"
@@ -472,35 +471,29 @@ p = pathlib.Path(source)
 if p.exists():
     for line in p.read_text(errors="ignore").splitlines():
         line = line.strip()
-        if line.startswith("vless://"):
+        if line.startswith(("vless://", "vmess://", "trojan://", "ss://")):
             lines.append(line)
-data = "\n".join(lines)
+data = "\n".join(dict.fromkeys(lines))
 if data:
     data += "\n"
-encoded = base64.b64encode(data.encode()).decode()
-pathlib.Path(target).write_text(encoded + "\n")
+pathlib.Path(target).write_text(base64.b64encode(data.encode()).decode() + "\n")
 PY
 
     chmod 644 "$tmp"
     mv "$tmp" "$output"
-    ok "订阅文件已更新：$output"
 
     if [[ -s "$SETTINGS_FILE" ]]; then
-        local domain
-        domain="$(cat "$SETTINGS_FILE")"
-        echo "订阅地址：https://${domain}/sub/${token}"
+        echo "订阅地址：https://$(cat "$SETTINGS_FILE")/sub/${token}"
     fi
 }
 
 aggregate_nodes() {
-    local temp
-    temp="$(mktemp)"
+    local tmp
     touch "$NODES_FILE"
-
-    awk 'NF && !seen[$0]++' "$NODES_FILE" > "$temp"
-    install -m 600 "$temp" "$NODES_FILE"
-    rm -f "$temp"
-
+    tmp="$(mktemp)"
+    awk 'NF && !seen[$0]++' "$NODES_FILE" > "$tmp"
+    install -m 600 "$tmp" "$NODES_FILE"
+    rm -f "$tmp"
     write_subscription
 }
 
@@ -528,14 +521,12 @@ SERVICE
 }
 
 deploy_reality() {
-    local ip port uuid private_key public_key short_id name sni link
-    local keys
+    local ip port uuid private_key public_key short_id name sni keys link tmp
 
     init_dirs
     install_packages || return 1
     configure_https_subscription || return 1
     install_xray || return 1
-    install_shortcut
 
     ip="$(get_public_ip)" || {
         err "无法获取 VPS 公网 IPv4。"
@@ -553,36 +544,36 @@ deploy_reality() {
     public_key="$(printf '%s\n' "$keys" | sed -n '2p')"
 
     python3 - "$XRAY_CONFIG" "$port" "$uuid" "$private_key" "$short_id" "$sni" <<'PY'
-import json, sys, os
+import json, os, sys
 path, port, uuid, private_key, short_id, sni = sys.argv[1:]
 data = {
-  "log": {"loglevel": "warning"},
-  "inbounds": [{
-    "listen": "0.0.0.0",
-    "port": int(port),
-    "protocol": "vless",
-    "settings": {
-      "clients": [{"id": uuid, "flow": "xtls-rprx-vision"}],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "raw",
-      "security": "reality",
-      "realitySettings": {
-        "show": False,
-        "dest": sni + ":443",
-        "xver": 0,
-        "serverNames": [sni],
-        "privateKey": private_key,
-        "shortIds": [short_id]
-      }
-    },
-    "sniffing": {
-      "enabled": True,
-      "destOverride": ["http", "tls", "quic"]
-    }
-  }],
-  "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+    "log": {"loglevel": "warning"},
+    "inbounds": [{
+        "listen": "0.0.0.0",
+        "port": int(port),
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": uuid, "flow": "xtls-rprx-vision"}],
+            "decryption": "none"
+        },
+        "streamSettings": {
+            "network": "raw",
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "dest": sni + ":443",
+                "xver": 0,
+                "serverNames": [sni],
+                "privateKey": private_key,
+                "shortIds": [short_id]
+            }
+        },
+        "sniffing": {
+            "enabled": True,
+            "destOverride": ["http", "tls", "quic"]
+        }
+    }],
+    "outbounds": [{"protocol": "freedom", "tag": "direct"}]
 }
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
@@ -604,12 +595,13 @@ PY
     }
 
     link="$(make_reality_link "$uuid" "$ip" "$port" "$public_key" "$short_id" "$name" "$sni")"
-
-    grep -Fvx "$link" "$NODES_FILE" > "${NODES_FILE}.tmp" || true
-    printf '%s\n' "$link" >> "${NODES_FILE}.tmp"
-    awk 'NF && !seen[$0]++' "${NODES_FILE}.tmp" > "${NODES_FILE}.new"
-    install -m 600 "${NODES_FILE}.new" "$NODES_FILE"
-    rm -f "${NODES_FILE}.tmp" "${NODES_FILE}.new"
+    tmp="$(mktemp)"
+    {
+        cat "$NODES_FILE"
+        printf '%s\n' "$link"
+    } | awk 'NF && !seen[$0]++' > "$tmp"
+    install -m 600 "$tmp" "$NODES_FILE"
+    rm -f "$tmp"
 
     aggregate_nodes
 
@@ -626,26 +618,28 @@ PY
     echo "$link"
     echo
     warn "请在 VPS 云平台安全组中放行 TCP ${port}。"
-    warn "本脚本不会清空或重置系统防火墙。"
+    warn "脚本不会清空或重置系统防火墙。"
 }
 
 show_nodes() {
     echo
     if [[ ! -s "$NODES_FILE" ]]; then
         warn "当前没有已记录节点。"
-        return
+    else
+        nl -ba "$NODES_FILE"
     fi
-
-    nl -ba "$NODES_FILE"
 }
 
 add_node() {
     local link
     read -r -p "请粘贴完整节点链接：" link
-    if [[ "$link" != vless://* && "$link" != vmess://* && "$link" != trojan://* && "$link" != ss://* ]]; then
-        err "暂不支持该链接格式。"
-        return 1
-    fi
+    case "$link" in
+        vless://*|vmess://*|trojan://*|ss://*) ;;
+        *)
+            err "不支持的节点链接格式。"
+            return 1
+            ;;
+    esac
 
     printf '%s\n' "$link" >> "$NODES_FILE"
     aggregate_nodes
@@ -653,10 +647,10 @@ add_node() {
 }
 
 remove_node() {
-    local number total temp
+    local number total tmp
     show_nodes
     total="$(wc -l < "$NODES_FILE")"
-    [[ "$total" -gt 0 ]] || return 0
+    (( total > 0 )) || return 0
 
     read -r -p "请输入要删除的行号：" number
     [[ "$number" =~ ^[0-9]+$ ]] || {
@@ -668,10 +662,10 @@ remove_node() {
         return 1
     }
 
-    temp="$(mktemp)"
-    sed "${number}d" "$NODES_FILE" > "$temp"
-    install -m 600 "$temp" "$NODES_FILE"
-    rm -f "$temp"
+    tmp="$(mktemp)"
+    sed "${number}d" "$NODES_FILE" > "$tmp"
+    install -m 600 "$tmp" "$NODES_FILE"
+    rm -f "$tmp"
     aggregate_nodes
     ok "节点已删除。"
 }
@@ -684,7 +678,7 @@ service_menu() {
         echo "2. 重启 Xray"
         echo "3. 查看 Xray 日志"
         echo "4. 检查 Xray 配置"
-        echo "5. 显示监听端口"
+        echo "5. 查看监听端口"
         echo "0. 返回"
         read -r -p "请选择：" choice
 
@@ -735,7 +729,6 @@ manage_nodes_menu() {
 more_menu() {
     echo
     echo "===== 更多功能 ====="
-    echo "项目：${APP_NAME}"
     echo "GitHub：https://github.com/xiazheteng8/xiazheteng-node-manager"
     echo "YouTube：https://www.youtube.com/@xiazheteng8"
     echo "Telegram：https://t.me/xiazheteng8"
@@ -746,28 +739,24 @@ more_menu() {
 
 uninstall_project() {
     echo
-    warn "此操作会删除本项目管理的 Xray 节点服务、配置和节点记录。"
-    warn "不会清空系统防火墙，也不会主动删除其他网站配置。"
+    warn "将删除本项目的节点服务、配置和节点记录。"
+    warn "不会清空系统防火墙，也不会删除其他网站配置。"
     read -r -p "输入 YES 确认卸载：" confirm
     [[ "$confirm" == "YES" ]] || return 0
 
     systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload
-
     rm -rf "$BASE_DIR"
 
-    # 只删除本项目明确创建的 Nginx 配置链接和文件。
     if [[ -L "$NGINX_LINK" ]]; then
+        local target
         target="$(readlink -f "$NGINX_LINK" 2>/dev/null || true)"
-        if [[ "$target" == "$NGINX_CONF" ]]; then
-            rm -f "$NGINX_LINK"
-        fi
+        [[ "$target" == "$NGINX_CONF" ]] && rm -f "$NGINX_LINK"
     fi
 
     if [[ -f "$NGINX_CONF" ]] &&
-       grep -q "server_name" "$NGINX_CONF" &&
-       grep -q "/sub/" "$NGINX_CONF"; then
+       grep -q "$APP_NAME" "$NGINX_CONF"; then
         rm -f "$NGINX_CONF"
     fi
 
@@ -775,9 +764,8 @@ uninstall_project() {
     rm -f "$MANAGER_PATH" "$SHORTCUT_PATH"
 
     nginx -t && systemctl reload nginx || true
-
     ok "本项目服务与管理文件已清理。"
-    warn "为避免影响其他软件，本脚本不会自动卸载全局 Xray、Nginx 或 Certbot。"
+    warn "没有自动卸载系统级 Xray、Nginx 或 Certbot。"
 }
 
 main_menu() {
@@ -786,8 +774,8 @@ main_menu() {
         echo "============================================================"
         echo "             瞎折腾吧 | VPS 节点管理器"
         echo "============================================================"
-        echo "GitHub:  https://github.com/xiazheteng8/xiazheteng-node-manager"
-        echo "YouTube: https://www.youtube.com/@xiazheteng8"
+        echo "GitHub:   https://github.com/xiazheteng8/xiazheteng-node-manager"
+        echo "YouTube:  https://www.youtube.com/@xiazheteng8"
         echo "Telegram: https://t.me/xiazheteng8"
         echo
         echo "1. 一键部署 VLESS-REALITY"
@@ -798,13 +786,12 @@ main_menu() {
         echo "6. 卸载本项目节点服务"
         echo "0. 退出"
         echo
-        read -r -p "请选择（输入 x 也可返回主菜单）：" choice
+        read -r -p "请选择（输入 x 返回主菜单）：" choice
 
         case "$choice" in
             1) deploy_reality; pause ;;
             2)
                 warn "其他部署方式尚未集成。"
-                warn "本选项不会伪装成已实现的部署功能。"
                 pause
                 ;;
             3) init_dirs; manage_nodes_menu ;;
@@ -820,5 +807,8 @@ main_menu() {
 
 require_root
 init_dirs
+
+# 先把当前脚本保存到真实路径，随后再安装 x 快捷入口。
+bootstrap_script
 install_shortcut
 main_menu
