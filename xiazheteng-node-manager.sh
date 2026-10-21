@@ -1,328 +1,459 @@
-# 瞎折腾吧｜VPS 节点管理器
-
-一个面向 Linux VPS 的轻量级节点管理入口，旨在简化 Xray 无证书节点、有证书节点以及第三方 Sing-box 多协议脚本的使用和维护流程。
-
-<p align="center">
-
-**作者：瞎折腾吧**
-
-[YouTube 频道](https://www.youtube.com/@xiazheteng8) · [Telegram 频道](https://t.me/xiazheteng8) · [GitHub 项目](https://github.com/xiazheteng8/xiazheteng-node-manager)
-
-</p>
-
----
-
-## 一、项目介绍
-
-在 VPS 上部署和管理代理节点时，经常需要分别运行不同的安装脚本、查找配置文件、检查服务状态，以及处理端口冲突等问题。
-
-本项目希望提供一个统一的管理入口，将常用的管理操作集中起来，减少重复输入命令的麻烦。
-
-项目围绕以下方向进行设计：
-
-- **统一入口：** 通过一个 Shell 脚本进入管理菜单。
-- **现有 Xray 配置检查：** 检查指定的无证书 Xray 配置及其运行状态。
-- **上游脚本调用：** 下载、更新并调用勇哥的 Sing-box 多协议脚本。
-- **配置备份与恢复：** 为支持的配置文件提供备份和恢复入口。
-- **订阅信息管理：** 查看现有无证书节点管理模块的订阅信息。
-- **尽量减少操作：** 通过菜单完成常见管理任务。
-
-本项目仍在持续完善中。具体可用功能以当前版本脚本实际实现为准。
-
-## 二、功能说明
-
-| 功能 | 说明 |
-|---|---|
-| 统一管理菜单 | 从一个入口进入管理功能 |
-| 无证书 Xray 配置检查 | 检查指定配置文件及 Xray 配置语法 |
-| Xray 服务状态查看 | 查看指定独立 Xray 服务的运行情况 |
-| Sing-box 上游脚本 | 下载、更新并调用勇哥的多协议脚本 |
-| 配置备份 | 备份管理器指定的配置文件 |
-| 配置恢复 | 从已有备份中选择配置进行恢复 |
-| 订阅信息查看 | 查看现有订阅文件及相关信息 |
-
-### 关于多协议和证书模式
-
-本项目的设计目标是整合无证书、有证书及多协议节点管理。
-
-其中，勇哥的 Sing-box 脚本是一个独立的上游项目，拥有自己的安装流程、配置和菜单。通过本项目调用上游脚本，并不代表上游所有协议都已经合并到本项目的配置或订阅系统中。
-
-上游项目：
-
-- [yonggekkk/sing-box-yg](https://github.com/yonggekkk/sing-box-yg)
-
-请以本项目当前脚本及上游脚本实际提供的菜单为准。
-
-## 三、系统要求
-
-建议使用以下环境：
-
-- Linux VPS，具有 root 权限。
-- 支持 Bash 的 Linux 发行版，例如 Debian 或 Ubuntu。
-- 可正常访问 GitHub 或配置可用的下载代理。
-- 已安装或能够安装 `curl`、`git` 等常用工具。
-- 如果使用 Xray 检查、备份或恢复功能，服务器上需要存在相应的配置文件或服务。
-
-如果 VPS 上已经运行 Nginx、网站、邮件服务、Xray 或其他代理服务，请先备份数据，再使用涉及安装、端口和防火墙的功能。
-
-## 四、安装与启动
-
-### 方法一：一条命令启动
-
-以 root 用户登录 VPS 后执行：
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazheteng-node-manager.sh)
-```
-
-该命令会下载并执行 GitHub 仓库中的主脚本。
-
-**注意：** 这种方式适合快速启动，但执行远程脚本前，建议先查看源码，确认脚本内容符合预期。
-
-### 方法二：克隆仓库后运行
-
-先安装必要工具：
-
-```bash
-apt-get update
-apt-get install -y git curl
-```
-
-克隆项目：
-
-```bash
-git clone https://github.com/xiazheteng8/xiazheteng-node-manager.git
-```
-
-进入目录：
-
-```bash
-cd xiazheteng-node-manager
-```
-
-设置脚本权限：
-
-```bash
-chmod 700 xiazheteng-node-manager.sh
-```
-
-启动管理菜单：
-
-```bash
-bash xiazheteng-node-manager.sh
-```
-
-### 方法三：下载脚本后运行
-
-如果不想安装 Git，可以直接下载：
-
-```bash
-curl -fL \
-  https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazheteng-node-manager.sh \
-  -o /root/xiazheteng-node-manager.sh
-```
-
-然后执行：
-
-```bash
-chmod 700 /root/xiazheteng-node-manager.sh
-bash /root/xiazheteng-node-manager.sh
-```
-
-## 五、菜单使用说明
-
-启动脚本后，根据屏幕显示的菜单选择相应功能。
-
-当前管理入口涉及以下操作：
-
-| 菜单项 | 用途 |
-|---|---|
-| 1 | 启动或调用勇哥 Sing-box 多协议脚本 |
-| 2 | 下载或更新上游 Sing-box 脚本 |
-| 3 | 检查指定的 Xray 配置 |
-| 4 | 查看相关服务状态 |
-| 5 | 备份指定配置 |
-| 6 | 查看现有备份 |
-| 7 | 恢复已有配置备份 |
-| 8 | 查看订阅信息 |
-| 0 | 退出管理菜单 |
-
-**重要：** 菜单编号和具体操作以你实际安装的脚本版本为准。
-
-### 首次使用建议
-
-1. 先运行主脚本，查看当前菜单。
-2. 先检查现有 Xray 配置和服务状态。
-3. 对现有配置进行备份。
-4. 如果需要使用 Sing-box 多协议功能，再进入上游脚本。
-5. 按上游脚本提示选择所需的协议、部署方式及证书选项。
-6. 部署完成后，按照对应脚本输出的信息检查节点链接、服务状态和端口。
-
-请不要在没有备份的情况下，直接对已有生产环境执行重装或覆盖操作。
-
-## 六、日常使用
-
-### 1. 再次打开管理菜单
-
-如果通过克隆方式安装：
-
-```bash
-cd /root/xiazheteng-node-manager
-bash xiazheteng-node-manager.sh
-```
-
-如果下载到 `/root` 目录：
-
-```bash
-bash /root/xiazheteng-node-manager.sh
-```
-
-如果仓库克隆到了其他目录，请使用实际保存路径。
-
-### 2. 更新主脚本
-
-使用 Git 克隆的方式安装时：
-
-```bash
-cd /root/xiazheteng-node-manager
-git pull
-bash xiazheteng-node-manager.sh
-```
-
-如果提示本地修改与远程版本冲突，请先备份本地修改，不要直接执行强制覆盖操作。
-
-### 3. 更新上游 Sing-box 脚本
-
-进入本项目管理菜单，选择对应的上游脚本下载或更新功能。
-
-也可以根据上游项目的官方说明更新：
-
-[勇哥 Sing-box 多协议脚本](https://github.com/yonggekkk/sing-box-yg)
-
-更新前建议阅读上游项目的更新说明，并备份当前配置。
-
-### 4. 查看 Xray 配置是否有效
-
-通过主菜单进入配置检查功能。
-
-如果需要手动检查指定配置，可参考：
-
-```bash
-/usr/local/bin/xray run -test \
-  -config /usr/local/etc/xray/node-manager-nocert.json
-```
-
-只有在你的服务器确实使用上述配置路径时，才执行这条命令。其他安装方式请替换成实际配置路径。
-
-## 七、配置备份与恢复
-
-如果当前版本提供备份与恢复菜单，可以通过菜单完成对应操作。
-
-建议备份以下内容：
-
-- Xray 配置文件。
-- 节点 UUID、REALITY 相关参数等必要配置。
-- 订阅文件及其访问令牌。
-- 自定义证书、域名及服务配置。
-- 自己修改过的脚本。
-
-备份文件可能包含私钥、UUID、订阅令牌等敏感信息。请妥善保管，不要直接上传到公开 GitHub 仓库。
-
-### 恢复前注意事项
-
-1. 确认备份来源和时间。
-2. 确认备份对应的服务及配置路径。
-3. 避免将旧配置直接覆盖到不兼容的新版本。
-4. 恢复后检查配置语法和服务状态。
-5. 如果涉及网站或邮件服务，确认相关端口和反向代理仍然正常。
-
-请注意：菜单中的备份和恢复功能只作用于脚本实际处理的文件，不能据此认为整个 VPS 已经完成系统级备份。
-
-## 八、端口与防火墙注意事项
-
-节点部署可能需要监听 TCP 或 UDP 端口。不同协议的端口要求并不相同。
-
-部署前请确认：
-
-- 端口没有被其他程序占用。
-- VPS 提供商的安全组允许所需流量。
-- 系统防火墙规则符合实际需求。
-- Nginx、网站、邮件服务和已有节点不会因端口变更而中断。
-- TCP 与 UDP 端口规则分别检查。
-
-不要直接清空现有防火墙规则。部分第三方脚本可能提供修改防火墙或开放端口的操作，这些操作可能影响 VPS 上运行的其他服务。
-
-**关于自动更换随机端口：** 只有当前脚本明确实现并确认更换成功后，才能认为该功能可用。不能仅凭项目目标推断所有部署模式都已经支持自动换端口。
-
-## 九、订阅与节点连接
-
-节点部署完成后，请以安装脚本实际输出的节点链接和订阅地址为准。
-
-需要注意：
-
-- 节点链接与订阅地址不是同一概念。
-- 不同协议的客户端兼容性可能不同。
-- 订阅服务需要正常运行，且访问路径、令牌和端口配置必须一致。
-- 如果订阅地址无法访问，应分别检查订阅服务、文件权限、访问路径和防火墙。
-- 请勿将包含访问令牌的完整订阅链接公开发布。
-
-本项目的统一管理入口不代表所有上游协议已经自动汇总成同一个订阅。
-
-## 十、常见问题
-
-### 1. 执行一条命令后无法下载
-
-检查 VPS 是否能够访问 GitHub：
-
-```bash
-curl -I https://raw.githubusercontent.com/
-```
-
-如果无法连接，请检查 DNS、网络出口或下载代理配置。
-
-### 2. 提示 Permission denied
-
-确认使用 root 权限，且脚本具备执行权限：
-
-```bash
-chmod 700 xiazheteng-node-manager.sh
-bash xiazheteng-node-manager.sh
-```
-
-使用 `bash` 运行时，通常不要求文件必须具有可执行权限，但设置合适的权限有助于避免误操作。
-
-### 3. Xray 配置检查失败
-
-先查看具体报错，再确认：
-
-- JSON 格式是否正确。
-- 配置路径是否正确。
-- 私钥、UUID 等参数是否完整。
-- 端口是否符合当前配置。
-- 配置是否与当前 Xray 版本兼容。
-
-不要仅因默认 `xray.service` 状态异常，就直接覆盖或重启其他独立运行的 Xray 实例。
-
-### 4. 节点部署后无法连接
-
-建议依次检查：
-
-1. 节点服务是否正在运行。
-2. 监听端口是否正确。
-3. VPS 安全组及系统防火墙是否放行。
-4. 域名解析、证书和客户端参数是否一致。
-5. 服务日志中是否存在启动或握手错误。
-
-不同协议的排查方法不同，请根据实际部署模式查看对应日志。
-
-### 5. 更新后原有节点异常
-
-先检查配置文件是否被修改，以及相关服务是否仍在运行。必要时恢复此前备份的配置。
-
-不要在没有确认服务名称和配置路径的情况下，盲目重启或覆盖系统内已有服务。
-
-## 十一、安全说明
-
-- 本项目主要用于 VPS 节点部署和管理。
-- 执行脚本前，请检查源码并确认操作范围。
-- 第三
+#!/usr/bin/env bash
+# ============================================================
+# 瞎折腾吧 | VPS 节点管理器
+# GitHub: https://github.com/xiazheteng8/xiazheteng-node-manager
+# YouTube: https://www.youtube.com/@xiazheteng8
+# Telegram: https://t.me/xiazheteng8
+#
+# 本脚本为管理入口，不会清空防火墙或覆盖系统默认 Xray 配置。
+# ============================================================
+
+set -o pipefail
+umask 077
+
+APP_NAME="瞎折腾吧 VPS 节点管理器"
+
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_CONFIG="/usr/local/etc/xray/node-manager-nocert.json"
+XRAY_SERVICE="xray-node-manager-nocert.service"
+
+SUB_SERVICE="node-manager-nocert-subscription.service"
+SUB_FILE="/var/lib/node-manager-nocert/subscription.txt"
+
+UPSTREAM_URL="https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh"
+UPSTREAM_FILE="/root/sing-box-yg-sb.sh"
+
+BACKUP_ROOT="/root/xiazheteng-node-manager-backups"
+
+# 备份仅处理明确列出的文件，不扫描或覆盖整个系统。
+BACKUP_PATHS=(
+    "/usr/local/etc/xray/node-manager-nocert.json"
+    "/var/lib/node-manager-nocert/subscription.txt"
+    "/usr/local/bin/node-manager-nocert-subscription.py"
+)
+
+RED=''
+GREEN=''
+YELLOW=''
+BLUE=''
+RESET=''
+
+if [[ -t 1 ]]; then
+    RED=$'\033[31m'
+    GREEN=$'\033[32m'
+    YELLOW=$'\033[33m'
+    BLUE=$'\033[36m'
+    RESET=$'\033[0m'
+fi
+
+info() { printf '%s[信息]%s %s\n' "$BLUE" "$RESET" "$*"; }
+ok()   { printf '%s[成功]%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '%s[注意]%s %s\n' "$YELLOW" "$RESET" "$*"; }
+err()  { printf '%s[错误]%s %s\n' "$RED" "$RESET" "$*" >&2; }
+
+pause() {
+    echo
+    read -r -p "按 Enter 返回菜单..." _
+}
+
+require_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        err "请使用 root 用户运行本脚本。"
+        exit 1
+    fi
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+show_header() {
+    clear 2>/dev/null || true
+    echo "============================================================"
+    echo "  ${APP_NAME}"
+    echo "============================================================"
+    echo "  GitHub:  https://github.com/xiazheteng8/xiazheteng-node-manager"
+    echo "  YouTube: https://www.youtube.com/@xiazheteng8"
+    echo "  Telegram: https://t.me/xiazheteng8"
+    echo "------------------------------------------------------------"
+}
+
+check_xray_config() {
+    echo
+    echo "========== Xray 配置检查 =========="
+
+    if [[ ! -x "$XRAY_BIN" ]]; then
+        warn "未找到 Xray 程序：$XRAY_BIN"
+        pause
+        return
+    fi
+
+    if [[ ! -f "$XRAY_CONFIG" ]]; then
+        warn "未找到指定配置：$XRAY_CONFIG"
+        echo "本脚本不会自动创建或覆盖其他 Xray 配置。"
+        pause
+        return
+    fi
+
+    "$XRAY_BIN" run -test -config "$XRAY_CONFIG"
+    local rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+        ok "Xray 配置语法检查通过。"
+    else
+        err "配置检查失败，请根据上方错误信息排查。"
+    fi
+
+    pause
+}
+
+show_service_status() {
+    echo
+    echo "========== 指定服务状态 =========="
+
+    local services=(
+        "$XRAY_SERVICE"
+        "$SUB_SERVICE"
+    )
+
+    for service in "${services[@]}"; do
+        echo
+        echo "----- $service -----"
+
+        if systemctl cat "$service" >/dev/null 2>&1; then
+            systemctl --no-pager --full status "$service" || true
+        else
+            warn "系统中不存在此服务：$service"
+        fi
+    done
+
+    echo
+    echo "========== 相关文件 =========="
+
+    for path in "$XRAY_CONFIG" "$SUB_FILE"; do
+        if [[ -f "$path" ]]; then
+            ls -lh "$path"
+            stat -c '权限：%a  所有者：%U:%G' "$path" 2>/dev/null || true
+        else
+            warn "文件不存在：$path"
+        fi
+    done
+
+    pause
+}
+
+backup_configs() {
+    echo
+    echo "========== 备份配置 =========="
+
+    local timestamp backup_dir
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    backup_dir="${BACKUP_ROOT}/${timestamp}"
+
+    mkdir -p "$backup_dir" || {
+        err "无法创建备份目录。"
+        pause
+        return
+    }
+
+    chmod 700 "$BACKUP_ROOT" "$backup_dir" 2>/dev/null || true
+    local copied=0
+
+    for path in "${BACKUP_PATHS[@]}"; do
+        if [[ -f "$path" ]]; then
+            local dest="${backup_dir}${path}"
+            mkdir -p "$(dirname "$dest")"
+            if cp -a "$path" "$dest"; then
+                printf '已备份：%s\n' "$path"
+                copied=$((copied + 1))
+            else
+                warn "备份失败：$path"
+            fi
+        else
+            printf '跳过不存在的文件：%s\n' "$path"
+        fi
+    done
+
+    if [[ $copied -gt 0 ]]; then
+        ok "备份完成：$backup_dir"
+        echo "共备份 $copied 个文件。"
+        echo "请妥善保管备份，里面可能包含敏感信息。"
+    else
+        warn "没有找到可备份的文件。"
+        rmdir "$backup_dir" 2>/dev/null || true
+    fi
+
+    pause
+}
+
+list_backups() {
+    echo
+    echo "========== 现有备份 =========="
+
+    if [[ ! -d "$BACKUP_ROOT" ]]; then
+        warn "尚未创建备份。"
+        pause
+        return
+    fi
+
+    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d \
+        -printf '%f\n' 2>/dev/null | sort -r
+
+    pause
+}
+
+restore_backup() {
+    echo
+    echo "========== 恢复配置 =========="
+    warn "恢复操作会覆盖对应的现有文件。"
+    warn "本功能只恢复本脚本列出的文件，不会自动重启服务。"
+    echo
+
+    if [[ ! -d "$BACKUP_ROOT" ]]; then
+        err "备份目录不存在：$BACKUP_ROOT"
+        pause
+        return
+    fi
+
+    mapfile -t backups < <(
+        find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d \
+            -printf '%f\n' 2>/dev/null | sort -r
+    )
+
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        warn "没有可用备份。"
+        pause
+        return
+    fi
+
+    local i
+    for i in "${!backups[@]}"; do
+        printf '%d) %s\n' "$((i + 1))" "${backups[$i]}"
+    done
+    echo "0) 取消"
+
+    local choice
+    read -r -p "选择要恢复的备份编号：" choice
+
+    [[ "$choice" == "0" ]] && return
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] ||
+       (( choice < 1 || choice > ${#backups[@]} )); then
+        err "选择无效。"
+        pause
+        return
+    fi
+
+    local backup_dir="${BACKUP_ROOT}/${backups[$((choice - 1))]}"
+
+    echo
+    echo "即将从以下目录恢复："
+    echo "$backup_dir"
+    echo
+    read -r -p "确认覆盖对应文件？输入 YES 继续：" confirm
+
+    if [[ "$confirm" != "YES" ]]; then
+        warn "已取消恢复。"
+        pause
+        return
+    fi
+
+    for path in "${BACKUP_PATHS[@]}"; do
+        local source="${backup_dir}${path}"
+
+        if [[ -f "$source" ]]; then
+            mkdir -p "$(dirname "$path")"
+            if cp -a "$source" "$path"; then
+                ok "已恢复：$path"
+            else
+                err "恢复失败：$path"
+            fi
+        fi
+    done
+
+    warn "恢复结束。请检查配置语法和服务状态，再决定是否重启相关服务。"
+    pause
+}
+
+show_subscription_info() {
+    echo
+    echo "========== 订阅信息 =========="
+
+    if [[ -f "$SUB_FILE" ]]; then
+        ls -lh "$SUB_FILE"
+        stat -c '权限：%a  所有者：%U:%G' "$SUB_FILE" 2>/dev/null || true
+        echo
+        echo "出于安全考虑，不直接显示订阅文件中的令牌或节点链接。"
+        echo "订阅文件路径：$SUB_FILE"
+    else
+        warn "订阅文件不存在：$SUB_FILE"
+    fi
+
+    echo
+    echo "========== 订阅服务状态 =========="
+
+    if systemctl cat "$SUB_SERVICE" >/dev/null 2>&1; then
+        systemctl --no-pager --full status "$SUB_SERVICE" || true
+    else
+        warn "未找到订阅服务：$SUB_SERVICE"
+    fi
+
+    pause
+}
+
+download_upstream() {
+    echo
+    echo "========== 下载 / 更新勇哥 Sing-box 脚本 =========="
+
+    if ! need_cmd curl; then
+        err "未安装 curl。请先安装 curl 后重试。"
+        pause
+        return 1
+    fi
+
+    local tmp_file
+    tmp_file="$(mktemp)" || {
+        err "无法创建临时文件。"
+        pause
+        return 1
+    }
+
+    if ! curl -fL --connect-timeout 15 --max-time 180 \
+        "$UPSTREAM_URL" -o "$tmp_file"; then
+        rm -f "$tmp_file"
+        err "下载失败，请检查 VPS 网络或 GitHub 访问情况。"
+        pause
+        return 1
+    fi
+
+    if ! head -n 1 "$tmp_file" | grep -q '^#!'; then
+        rm -f "$tmp_file"
+        err "下载内容不像 Shell 脚本，已拒绝覆盖本地文件。"
+        pause
+        return 1
+    fi
+
+    if grep -Eq '<p[[:space:]>]|^# 瞎折腾吧｜VPS 节点管理器' "$tmp_file"; then
+        rm -f "$tmp_file"
+        err "下载内容疑似 Markdown 文档，已拒绝执行。"
+        pause
+        return 1
+    fi
+
+    install -m 700 "$tmp_file" "$UPSTREAM_FILE"
+    rm -f "$tmp_file"
+
+    ok "上游脚本已保存到：$UPSTREAM_FILE"
+    echo "上游项目：https://github.com/yonggekkk/sing-box-yg"
+    pause
+}
+
+run_upstream() {
+    echo
+    echo "========== 勇哥 Sing-box 多协议脚本 =========="
+    warn "这是独立的第三方脚本，可能会安装软件、修改服务、端口或防火墙规则。"
+    warn "执行前请备份，并确认其操作不会影响网站、邮件及已有节点。"
+    echo
+
+    read -r -p "是否先下载/更新上游脚本？[Y/n]：" answer
+    answer="${answer:-Y}"
+
+    case "$answer" in
+        Y|y|YES|yes)
+            download_upstream
+            ;;
+        N|n|NO|no)
+            ;;
+        *)
+            warn "输入无效，已取消。"
+            pause
+            return
+            ;;
+    esac
+
+    if [[ ! -s "$UPSTREAM_FILE" ]]; then
+        err "上游脚本不存在，请先执行下载/更新。"
+        pause
+        return
+    fi
+
+    if ! head -n 1 "$UPSTREAM_FILE" | grep -q '^#!'; then
+        err "上游文件格式异常，拒绝执行。"
+        pause
+        return
+    fi
+
+    echo
+    read -r -p "确认执行上游脚本？输入 YES 继续：" confirm
+
+    if [[ "$confirm" != "YES" ]]; then
+        warn "已取消。"
+        pause
+        return
+    fi
+
+    bash "$UPSTREAM_FILE"
+    local rc=$?
+
+    echo
+    if [[ $rc -eq 0 ]]; then
+        ok "上游脚本已退出。"
+    else
+        warn "上游脚本退出码：$rc"
+    fi
+
+    pause
+}
+
+show_menu() {
+    show_header
+    cat <<'MENU'
+  1. 启动勇哥 Sing-box 多协议脚本
+  2. 下载 / 更新勇哥 Sing-box 脚本
+  3. 检查指定的 Xray 配置
+  4. 查看相关服务状态
+  5. 备份配置
+  6. 查看现有备份
+  7. 恢复配置备份
+  8. 查看订阅信息
+  0. 退出
+
+------------------------------------------------------------
+注意：本脚本不会自动清空防火墙，也不会操作系统默认
+      /usr/local/etc/xray/config.json 或 xray.service。
+------------------------------------------------------------
+MENU
+}
+
+main() {
+    require_root
+    mkdir -p "$BACKUP_ROOT"
+    chmod 700 "$BACKUP_ROOT" 2>/dev/null || true
+
+    while true; do
+        show_menu
+        local choice
+        read -r -p "请输入选项 [0-8]：" choice
+
+        case "$choice" in
+            1) run_upstream ;;
+            2) download_upstream ;;
+            3) check_xray_config ;;
+            4) show_service_status ;;
+            5) backup_configs ;;
+            6) list_backups ;;
+            7) restore_backup ;;
+            8) show_subscription_info ;;
+            0)
+                echo "感谢使用「瞎折腾吧｜VPS 节点管理器」。"
+                exit 0
+                ;;
+            *)
+                warn "无效选项，请输入 0-8。"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+main "$@"
