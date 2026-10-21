@@ -1,459 +1,564 @@
 #!/usr/bin/env bash
 # ============================================================
-# 瞎折腾吧 | VPS 节点管理器
-# GitHub: https://github.com/xiazheteng8/xiazheteng-node-manager
-# YouTube: https://www.youtube.com/@xiazheteng8
+# 瞎折腾吧 | VPS 多协议节点管理器
+# GitHub:   https://github.com/xiazheteng8/xiazheteng-node-manager
+# YouTube:  https://www.youtube.com/@xiazheteng8
 # Telegram: https://t.me/xiazheteng8
 #
-# 本脚本为管理入口，不会清空防火墙或覆盖系统默认 Xray 配置。
+# 设计目标：
+#   1. 一键部署入口
+#   2. 无域名 / 域名已解析两种模式
+#   3. 保留现有独立 Xray 服务与订阅服务
+#   4. 不清空防火墙，不覆盖系统默认 Xray 配置
+#   5. SSH 快捷命令 X
+#
+# 注意：本版本提供管理框架和安全检查入口，
+# 不代表所有第三方协议均已实现部署。
 # ============================================================
 
-set -o pipefail
+set -Eeuo pipefail
 umask 077
 
-APP_NAME="瞎折腾吧 VPS 节点管理器"
+readonly APP_NAME="xiazheteng-node-manager"
+readonly APP_VERSION="0.1.0"
+readonly GITHUB_URL="https://github.com/xiazheteng8/xiazheteng-node-manager"
+readonly YOUTUBE_URL="https://www.youtube.com/@xiazheteng8"
+readonly TELEGRAM_URL="https://t.me/xiazheteng8"
 
-XRAY_BIN="/usr/local/bin/xray"
-XRAY_CONFIG="/usr/local/etc/xray/node-manager-nocert.json"
-XRAY_SERVICE="xray-node-manager-nocert.service"
+# 已有无证书节点：严禁随意覆盖或删除
+readonly XRAY_BIN="/usr/local/bin/xray"
+readonly XRAY_CONFIG="/usr/local/etc/xray/node-manager-nocert.json"
+readonly XRAY_SERVICE="xray-node-manager-nocert.service"
+readonly SUB_SERVICE="node-manager-nocert-subscription.service"
+readonly SUB_FILE="/var/lib/node-manager-nocert/subscription.txt"
 
-SUB_SERVICE="node-manager-nocert-subscription.service"
-SUB_FILE="/var/lib/node-manager-nocert/subscription.txt"
+readonly DATA_DIR="/var/lib/xiazheteng-node-manager"
+readonly BACKUP_DIR="/root/xiazheteng-node-manager-backups"
+readonly LOG_FILE="/var/log/xiazheteng-node-manager.log"
+readonly COMMAND_PATH="/usr/local/bin/X"
 
-UPSTREAM_URL="https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh"
-UPSTREAM_FILE="/root/sing-box-yg-sb.sh"
+mkdir -p "$DATA_DIR" "$BACKUP_DIR"
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
 
-BACKUP_ROOT="/root/xiazheteng-node-manager-backups"
+log() {
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"
+}
 
-# 备份仅处理明确列出的文件，不扫描或覆盖整个系统。
-BACKUP_PATHS=(
-    "/usr/local/etc/xray/node-manager-nocert.json"
-    "/var/lib/node-manager-nocert/subscription.txt"
-    "/usr/local/bin/node-manager-nocert-subscription.py"
-)
+info() {
+    printf '\033[36m[信息]\033[0m %s\n' "$*"
+}
 
-RED=''
-GREEN=''
-YELLOW=''
-BLUE=''
-RESET=''
+success() {
+    printf '\033[32m[成功]\033[0m %s\n' "$*"
+}
 
-if [[ -t 1 ]]; then
-    RED=$'\033[31m'
-    GREEN=$'\033[32m'
-    YELLOW=$'\033[33m'
-    BLUE=$'\033[36m'
-    RESET=$'\033[0m'
-fi
+warn() {
+    printf '\033[33m[警告]\033[0m %s\n' "$*" >&2
+}
 
-info() { printf '%s[信息]%s %s\n' "$BLUE" "$RESET" "$*"; }
-ok()   { printf '%s[成功]%s %s\n' "$GREEN" "$RESET" "$*"; }
-warn() { printf '%s[注意]%s %s\n' "$YELLOW" "$RESET" "$*"; }
-err()  { printf '%s[错误]%s %s\n' "$RED" "$RESET" "$*" >&2; }
+error() {
+    printf '\033[31m[错误]\033[0m %s\n' "$*" >&2
+}
 
 pause() {
-    echo
-    read -r -p "按 Enter 返回菜单..." _
+    printf '\n按 Enter 返回菜单...'
+    read -r _ || true
 }
 
 require_root() {
     if [[ "${EUID}" -ne 0 ]]; then
-        err "请使用 root 用户运行本脚本。"
+        error "请使用 root 运行此脚本。"
         exit 1
     fi
 }
 
-need_cmd() {
+command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-show_header() {
-    clear 2>/dev/null || true
-    echo "============================================================"
-    echo "  ${APP_NAME}"
-    echo "============================================================"
-    echo "  GitHub:  https://github.com/xiazheteng8/xiazheteng-node-manager"
-    echo "  YouTube: https://www.youtube.com/@xiazheteng8"
-    echo "  Telegram: https://t.me/xiazheteng8"
-    echo "------------------------------------------------------------"
+# 只读取公网 IP，不修改网络配置。
+# 多个检测源失败时返回空字符串，不使用内网地址冒充公网地址。
+detect_public_ipv4() {
+    local ip=""
+    local url
+
+    for url in \
+        "https://api.ipify.org" \
+        "https://ipv4.icanhazip.com" \
+        "https://checkip.amazonaws.com"
+    do
+        ip="$(curl -4 -fsS --connect-timeout 3 --max-time 6 "$url" 2>/dev/null \
+            | tr -d '[:space:]' || true)"
+
+        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            if python3 - "$ip" <<'PY' >/dev/null 2>&1
+import ipaddress, sys
+ip = ipaddress.ip_address(sys.argv[1])
+assert ip.version == 4 and ip.is_global
+PY
+            then
+                printf '%s\n' "$ip"
+                return 0
+            fi
+        fi
+    done
+
+    return 1
 }
 
-check_xray_config() {
-    echo
-    echo "========== Xray 配置检查 =========="
+detect_public_ipv6() {
+    local ip=""
+
+    ip="$(curl -6 -fsS --connect-timeout 3 --max-time 6 \
+        https://api64.ipify.org 2>/dev/null | tr -d '[:space:]' || true)"
+
+    if [[ "$ip" == *:* ]]; then
+        printf '%s\n' "$ip"
+        return 0
+    fi
+
+    return 1
+}
+
+service_exists() {
+    systemctl cat "$1" >/dev/null 2>&1
+}
+
+service_state() {
+    local service="$1"
+
+    if ! service_exists "$service"; then
+        printf '未安装'
+        return
+    fi
+
+    if systemctl is-active --quiet "$service"; then
+        printf '运行中'
+    else
+        printf '未运行'
+    fi
+}
+
+# 只检查现有服务和配置，不执行重置或覆盖操作。
+show_existing_services() {
+    printf '\n========== 现有服务检查 ==========\n'
+
+    printf 'Xray 程序：'
+    if [[ -x "$XRAY_BIN" ]]; then
+        "$XRAY_BIN" version 2>/dev/null | head -n 1 || true
+    else
+        printf '未找到\n'
+    fi
+
+    printf '无证书配置：%s\n' \
+        "$([[ -f "$XRAY_CONFIG" ]] && echo 存在 || echo 不存在)"
+
+    printf '无证书服务：%s\n' "$(service_state "$XRAY_SERVICE")"
+    printf '订阅服务：%s\n' "$(service_state "$SUB_SERVICE")"
+
+    printf '订阅文件：%s\n' \
+        "$([[ -f "$SUB_FILE" ]] && echo 存在 || echo 不存在)"
+
+    # 明确说明：不操作系统默认 Xray 服务
+    printf '系统默认 xray.service：不修改\n'
+    printf '系统默认 Xray 配置：不修改\n'
+}
+
+# 使用只读的 Xray test 检查已有配置。
+check_existing_xray() {
+    printf '\n========== 无证书 Xray 配置检查 ==========\n'
 
     if [[ ! -x "$XRAY_BIN" ]]; then
-        warn "未找到 Xray 程序：$XRAY_BIN"
-        pause
-        return
+        warn "未找到 $XRAY_BIN"
+        return 1
     fi
 
     if [[ ! -f "$XRAY_CONFIG" ]]; then
-        warn "未找到指定配置：$XRAY_CONFIG"
-        echo "本脚本不会自动创建或覆盖其他 Xray 配置。"
-        pause
+        warn "未找到 $XRAY_CONFIG；不会创建或覆盖现有配置。"
+        return 1
+    fi
+
+    if "$XRAY_BIN" run -test -config "$XRAY_CONFIG"; then
+        success "现有无证书 Xray 配置校验通过。"
+    else
+        error "现有配置校验失败；没有自动修改配置。"
+        return 1
+    fi
+}
+
+show_subscription() {
+    printf '\n========== 现有订阅信息 ==========\n'
+
+    if [[ ! -f "$SUB_FILE" ]]; then
+        warn "订阅文件不存在：$SUB_FILE"
         return
     fi
 
-    "$XRAY_BIN" run -test -config "$XRAY_CONFIG"
-    local rc=$?
+    printf '订阅文件：%s\n' "$SUB_FILE"
+    printf '订阅服务：%s\n' "$(service_state "$SUB_SERVICE")"
 
-    if [[ $rc -eq 0 ]]; then
-        ok "Xray 配置语法检查通过。"
-    else
-        err "配置检查失败，请根据上方错误信息排查。"
+    if command_exists grep; then
+        if grep -Eq '^https?://' "$SUB_FILE"; then
+            printf '\n文件中的 URL：\n'
+            grep -E '^https?://' "$SUB_FILE" || true
+        else
+            printf '\n订阅文件内容：\n'
+            cat "$SUB_FILE"
+        fi
     fi
-
-    pause
-}
-
-show_service_status() {
-    echo
-    echo "========== 指定服务状态 =========="
-
-    local services=(
-        "$XRAY_SERVICE"
-        "$SUB_SERVICE"
-    )
-
-    for service in "${services[@]}"; do
-        echo
-        echo "----- $service -----"
-
-        if systemctl cat "$service" >/dev/null 2>&1; then
-            systemctl --no-pager --full status "$service" || true
-        else
-            warn "系统中不存在此服务：$service"
-        fi
-    done
-
-    echo
-    echo "========== 相关文件 =========="
-
-    for path in "$XRAY_CONFIG" "$SUB_FILE"; do
-        if [[ -f "$path" ]]; then
-            ls -lh "$path"
-            stat -c '权限：%a  所有者：%U:%G' "$path" 2>/dev/null || true
-        else
-            warn "文件不存在：$path"
-        fi
-    done
-
-    pause
 }
 
 backup_configs() {
-    echo
-    echo "========== 备份配置 =========="
+    local dest
+    dest="$BACKUP_DIR/backup-$(date '+%Y%m%d-%H%M%S')"
 
-    local timestamp backup_dir
-    timestamp="$(date +%Y%m%d-%H%M%S)"
-    backup_dir="${BACKUP_ROOT}/${timestamp}"
+    mkdir -p "$dest"
 
-    mkdir -p "$backup_dir" || {
-        err "无法创建备份目录。"
-        pause
-        return
-    }
+    local found=0
+    local path
 
-    chmod 700 "$BACKUP_ROOT" "$backup_dir" 2>/dev/null || true
-    local copied=0
-
-    for path in "${BACKUP_PATHS[@]}"; do
+    for path in "$XRAY_CONFIG" "$SUB_FILE"; do
         if [[ -f "$path" ]]; then
-            local dest="${backup_dir}${path}"
-            mkdir -p "$(dirname "$dest")"
-            if cp -a "$path" "$dest"; then
-                printf '已备份：%s\n' "$path"
-                copied=$((copied + 1))
-            else
-                warn "备份失败：$path"
-            fi
-        else
-            printf '跳过不存在的文件：%s\n' "$path"
+            mkdir -p "$dest$(dirname "$path")"
+            cp -a "$path" "$dest$path"
+            found=1
         fi
     done
 
-    if [[ $copied -gt 0 ]]; then
-        ok "备份完成：$backup_dir"
-        echo "共备份 $copied 个文件。"
-        echo "请妥善保管备份，里面可能包含敏感信息。"
-    else
-        warn "没有找到可备份的文件。"
-        rmdir "$backup_dir" 2>/dev/null || true
+    if [[ -d /etc/systemd/system ]]; then
+        mkdir -p "$dest/etc/systemd/system"
+
+        if [[ -f "/etc/systemd/system/$XRAY_SERVICE" ]]; then
+            cp -a "/etc/systemd/system/$XRAY_SERVICE" \
+                "$dest/etc/systemd/system/"
+            found=1
+        fi
+
+        if [[ -f "/etc/systemd/system/$SUB_SERVICE" ]]; then
+            cp -a "/etc/systemd/system/$SUB_SERVICE" \
+                "$dest/etc/systemd/system/"
+            found=1
+        fi
     fi
 
-    pause
+    if [[ "$found" -eq 1 ]]; then
+        success "备份完成：$dest"
+    else
+        warn "未找到可备份的现有配置。备份目录：$dest"
+    fi
 }
 
 list_backups() {
-    echo
-    echo "========== 现有备份 =========="
+    printf '\n========== 备份列表 ==========\n'
 
-    if [[ ! -d "$BACKUP_ROOT" ]]; then
-        warn "尚未创建备份。"
-        pause
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        printf '暂无备份。\n'
         return
     fi
 
-    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d \
-        -printf '%f\n' 2>/dev/null | sort -r
-
-    pause
+    find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d \
+        -printf '%TY-%Tm-%Td %TH:%TM  %f\n' 2>/dev/null \
+        | sort -r || true
 }
 
-restore_backup() {
-    echo
-    echo "========== 恢复配置 =========="
-    warn "恢复操作会覆盖对应的现有文件。"
-    warn "本功能只恢复本脚本列出的文件，不会自动重启服务。"
-    echo
-
-    if [[ ! -d "$BACKUP_ROOT" ]]; then
-        err "备份目录不存在：$BACKUP_ROOT"
-        pause
-        return
-    fi
-
-    mapfile -t backups < <(
-        find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d \
-            -printf '%f\n' 2>/dev/null | sort -r
+# 查找现有配置中可能出现的域名。
+# 不根据公网 IP 猜测域名，不把 IP 当作域名。
+discover_configured_domains() {
+    local files=(
+        "$XRAY_CONFIG"
+        "/etc/nginx/sites-enabled/default"
+        "/etc/nginx/nginx.conf"
     )
 
-    if [[ ${#backups[@]} -eq 0 ]]; then
-        warn "没有可用备份。"
-        pause
-        return
-    fi
+    local file
+    for file in "${files[@]}"; do
+        [[ -f "$file" ]] || continue
 
-    local i
-    for i in "${!backups[@]}"; do
-        printf '%d) %s\n' "$((i + 1))" "${backups[$i]}"
+        grep -Eho \
+            'server_name[[:space:]]+[^;]+' "$file" 2>/dev/null \
+            | sed -E 's/server_name[[:space:]]+//' \
+            | tr ' ' '\n' \
+            | grep -E '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' \
+            | sort -u || true
     done
-    echo "0) 取消"
-
-    local choice
-    read -r -p "选择要恢复的备份编号：" choice
-
-    [[ "$choice" == "0" ]] && return
-
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] ||
-       (( choice < 1 || choice > ${#backups[@]} )); then
-        err "选择无效。"
-        pause
-        return
-    fi
-
-    local backup_dir="${BACKUP_ROOT}/${backups[$((choice - 1))]}"
-
-    echo
-    echo "即将从以下目录恢复："
-    echo "$backup_dir"
-    echo
-    read -r -p "确认覆盖对应文件？输入 YES 继续：" confirm
-
-    if [[ "$confirm" != "YES" ]]; then
-        warn "已取消恢复。"
-        pause
-        return
-    fi
-
-    for path in "${BACKUP_PATHS[@]}"; do
-        local source="${backup_dir}${path}"
-
-        if [[ -f "$source" ]]; then
-            mkdir -p "$(dirname "$path")"
-            if cp -a "$source" "$path"; then
-                ok "已恢复：$path"
-            else
-                err "恢复失败：$path"
-            fi
-        fi
-    done
-
-    warn "恢复结束。请检查配置语法和服务状态，再决定是否重启相关服务。"
-    pause
 }
 
-show_subscription_info() {
-    echo
-    echo "========== 订阅信息 =========="
+# 当前版本不自动申请证书、不擅自更改 DNS。
+# 只检测现有证书信息，避免误改网站证书。
+show_certificate_status() {
+    printf '\n========== 证书检查 ==========\n'
 
-    if [[ -f "$SUB_FILE" ]]; then
-        ls -lh "$SUB_FILE"
-        stat -c '权限：%a  所有者：%U:%G' "$SUB_FILE" 2>/dev/null || true
-        echo
-        echo "出于安全考虑，不直接显示订阅文件中的令牌或节点链接。"
-        echo "订阅文件路径：$SUB_FILE"
+    if command_exists certbot; then
+        certbot certificates 2>/dev/null || true
     else
-        warn "订阅文件不存在：$SUB_FILE"
+        info "未检测到 Certbot。"
     fi
 
-    echo
-    echo "========== 订阅服务状态 =========="
-
-    if systemctl cat "$SUB_SERVICE" >/dev/null 2>&1; then
-        systemctl --no-pager --full status "$SUB_SERVICE" || true
+    if [[ -d /etc/letsencrypt/live ]]; then
+        printf '\n现有 Let's Encrypt 证书目录：\n'
+        find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 \
+            -type d -printf '%f\n' 2>/dev/null || true
     else
-        warn "未找到订阅服务：$SUB_SERVICE"
+        info "未检测到 Let's Encrypt live 目录。"
     fi
-
-    pause
 }
 
-download_upstream() {
-    echo
-    echo "========== 下载 / 更新勇哥 Sing-box 脚本 =========="
+deployment_no_domain() {
+    printf '\n========== 一键部署：没有域名 ==========\n'
+    warn "当前脚本版本不会自动安装或覆盖节点服务。"
 
-    if ! need_cmd curl; then
-        err "未安装 curl。请先安装 curl 后重试。"
-        pause
-        return 1
-    fi
-
-    local tmp_file
-    tmp_file="$(mktemp)" || {
-        err "无法创建临时文件。"
-        pause
-        return 1
-    }
-
-    if ! curl -fL --connect-timeout 15 --max-time 180 \
-        "$UPSTREAM_URL" -o "$tmp_file"; then
-        rm -f "$tmp_file"
-        err "下载失败，请检查 VPS 网络或 GitHub 访问情况。"
-        pause
-        return 1
-    fi
-
-    if ! head -n 1 "$tmp_file" | grep -q '^#!'; then
-        rm -f "$tmp_file"
-        err "下载内容不像 Shell 脚本，已拒绝覆盖本地文件。"
-        pause
-        return 1
-    fi
-
-    if grep -Eq '<p[[:space:]>]|^# 瞎折腾吧｜VPS 节点管理器' "$tmp_file"; then
-        rm -f "$tmp_file"
-        err "下载内容疑似 Markdown 文档，已拒绝执行。"
-        pause
-        return 1
-    fi
-
-    install -m 700 "$tmp_file" "$UPSTREAM_FILE"
-    rm -f "$tmp_file"
-
-    ok "上游脚本已保存到：$UPSTREAM_FILE"
-    echo "上游项目：https://github.com/yonggekkk/sing-box-yg"
-    pause
-}
-
-run_upstream() {
-    echo
-    echo "========== 勇哥 Sing-box 多协议脚本 =========="
-    warn "这是独立的第三方脚本，可能会安装软件、修改服务、端口或防火墙规则。"
-    warn "执行前请备份，并确认其操作不会影响网站、邮件及已有节点。"
-    echo
-
-    read -r -p "是否先下载/更新上游脚本？[Y/n]：" answer
-    answer="${answer:-Y}"
-
-    case "$answer" in
-        Y|y|YES|yes)
-            download_upstream
-            ;;
-        N|n|NO|no)
-            ;;
-        *)
-            warn "输入无效，已取消。"
-            pause
-            return
-            ;;
-    esac
-
-    if [[ ! -s "$UPSTREAM_FILE" ]]; then
-        err "上游脚本不存在，请先执行下载/更新。"
-        pause
-        return
-    fi
-
-    if ! head -n 1 "$UPSTREAM_FILE" | grep -q '^#!'; then
-        err "上游文件格式异常，拒绝执行。"
-        pause
-        return
-    fi
-
-    echo
-    read -r -p "确认执行上游脚本？输入 YES 继续：" confirm
-
-    if [[ "$confirm" != "YES" ]]; then
-        warn "已取消。"
-        pause
-        return
-    fi
-
-    bash "$UPSTREAM_FILE"
-    local rc=$?
-
-    echo
-    if [[ $rc -eq 0 ]]; then
-        ok "上游脚本已退出。"
+    local ip=""
+    if ip="$(detect_public_ipv4)"; then
+        printf '检测到的 VPS 公网 IPv4：%s\n' "$ip"
     else
-        warn "上游脚本退出码：$rc"
+        warn "无法自动检测公网 IPv4。请检查 VPS 网络连接。"
     fi
 
-    pause
+    if ip="$(detect_public_ipv6)"; then
+        printf '检测到的 VPS 公网 IPv6：%s\n' "$ip"
+    fi
+
+    printf '\n检查现有无证书节点：\n'
+    check_existing_xray || true
+
+    printf '\n说明：\n'
+    printf '  - 现有 REALITY 和 Shadowsocks 配置不会被覆盖。\n'
+    printf '  - 此版本尚未实现完整的多协议自动部署。\n'
+    printf '  - 不会输出虚假的订阅地址。\n'
 }
 
-show_menu() {
-    show_header
-    cat <<'MENU'
-  1. 启动勇哥 Sing-box 多协议脚本
-  2. 下载 / 更新勇哥 Sing-box 脚本
-  3. 检查指定的 Xray 配置
-  4. 查看相关服务状态
-  5. 备份配置
-  6. 查看现有备份
-  7. 恢复配置备份
-  8. 查看订阅信息
+deployment_domain() {
+    printf '\n========== 一键部署：域名已解析到 VPS 的 IP ==========\n'
+
+    local ip=""
+    if ! ip="$(detect_public_ipv4)"; then
+        error "无法检测公网 IPv4，不能验证域名解析目标。"
+        return 1
+    fi
+
+    printf '检测到的 VPS 公网 IPv4：%s\n' "$ip"
+
+    printf '\n从现有配置中发现的域名：\n'
+    local domains
+    domains="$(discover_configured_domains || true)"
+
+    if [[ -n "$domains" ]]; then
+        printf '%s\n' "$domains"
+    else
+        warn "未从当前检查的配置中发现可复用域名。"
+        warn "仅凭 VPS 公网 IP 无法推断你的域名。"
+    fi
+
+    show_certificate_status
+
+    printf '\n检查现有无证书节点：\n'
+    check_existing_xray || true
+
+    printf '\n说明：\n'
+    printf '  - 不会自动覆盖网站证书或 Nginx 配置。\n'
+    printf '  - 不会将未验证的域名写入订阅。\n'
+    printf '  - 此版本尚未实现完整的多协议自动部署。\n'
+}
+
+install_shortcut() {
+    local target
+
+    target="$(readlink -f "$0")"
+
+    if [[ ! -f "$target" ]]; then
+        error "无法确定脚本真实路径，不能安装快捷命令。"
+        return 1
+    fi
+
+    cat > "$COMMAND_PATH" <<EOF
+#!/usr/bin/env bash
+exec bash "$target" "\$@"
+EOF
+
+    chmod 755 "$COMMAND_PATH"
+    success "已安装 SSH 快捷命令：X"
+    printf '以后可在 SSH 中输入大写 X 启动管理器。\n'
+}
+
+show_diagnostics() {
+    printf '\n========== 服务与诊断 ==========\n'
+    show_existing_services
+
+    printf '\n========== 端口监听 ==========\n'
+    if command_exists ss; then
+        ss -lntup 2>/dev/null || true
+    else
+        warn "未安装 ss 命令。"
+    fi
+
+    printf '\n========== 最近日志 ==========\n'
+    tail -n 40 "$LOG_FILE" 2>/dev/null || true
+
+    printf '\n========== 域名与证书 ==========\n'
+    discover_configured_domains || true
+    show_certificate_status
+}
+
+update_manager() {
+    warn "更新功能需要先完成仓库版本和下载校验逻辑。"
+    warn "当前不会自动覆盖本地脚本。"
+}
+
+main_menu() {
+    while true; do
+        clear 2>/dev/null || true
+
+        local ip_display="无法检测"
+        ip_display="$(detect_public_ipv4 2>/dev/null || printf '无法检测')"
+
+        cat <<EOF
+====================================================
+       瞎折腾吧 | VPS 多协议节点管理器
+====================================================
+版本：$APP_VERSION
+VPS 公网 IPv4：$ip_display
+
+  1. 一键部署节点
+  2. 节点管理与配置检查
+  3. 订阅管理
+  4. 服务状态与故障诊断
+  5. 备份与恢复
+  6. 安装 SSH 快捷命令 X
+  7. 更新管理器
   0. 退出
 
-------------------------------------------------------------
-注意：本脚本不会自动清空防火墙，也不会操作系统默认
-      /usr/local/etc/xray/config.json 或 xray.service。
-------------------------------------------------------------
-MENU
-}
+====================================================
+EOF
 
-main() {
-    require_root
-    mkdir -p "$BACKUP_ROOT"
-    chmod 700 "$BACKUP_ROOT" 2>/dev/null || true
-
-    while true; do
-        show_menu
+        printf '请选择：'
         local choice
-        read -r -p "请输入选项 [0-8]：" choice
+        read -r choice || return 0
 
         case "$choice" in
-            1) run_upstream ;;
-            2) download_upstream ;;
-            3) check_xray_config ;;
-            4) show_service_status ;;
-            5) backup_configs ;;
-            6) list_backups ;;
-            7) restore_backup ;;
-            8) show_subscription_info ;;
+            1)
+                deployment_menu
+                ;;
+            2)
+                show_existing_services
+                check_existing_xray || true
+                pause
+                ;;
+            3)
+                show_subscription
+                pause
+                ;;
+            4)
+                show_diagnostics
+                pause
+                ;;
+            5)
+                backup_menu
+                ;;
+            6)
+                install_shortcut
+                pause
+                ;;
+            7)
+                update_manager
+                pause
+                ;;
             0)
-                echo "感谢使用「瞎折腾吧｜VPS 节点管理器」。"
                 exit 0
                 ;;
             *)
-                warn "无效选项，请输入 0-8。"
+                warn "无效选项。"
                 sleep 1
                 ;;
         esac
     done
+}
+
+deployment_menu() {
+    while true; do
+        clear 2>/dev/null || true
+
+        local ip_display="无法检测"
+        ip_display="$(detect_public_ipv4 2>/dev/null || printf '无法检测')"
+
+        cat <<EOF
+============== 一键部署节点 ==============
+
+  1. 没有域名
+  2. 域名已解析到 $ip_display
+  0. 返回主菜单
+
+==========================================
+EOF
+
+        printf '请选择：'
+        local choice
+        read -r choice || return 0
+
+        case "$choice" in
+            1)
+                deployment_no_domain
+                pause
+                ;;
+            2)
+                deployment_domain || true
+                pause
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                warn "无效选项。"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+backup_menu() {
+    while true; do
+        clear 2>/dev/null || true
+
+        cat <<'EOF'
+============== 备份与恢复 ==============
+
+  1. 备份现有节点配置
+  2. 查看备份列表
+  0. 返回主菜单
+
+========================================
+EOF
+
+        printf '请选择：'
+        local choice
+        read -r choice || return 0
+
+        case "$choice" in
+            1)
+                backup_configs
+                pause
+                ;;
+            2)
+                list_backups
+                pause
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                warn "无效选项。"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+main() {
+    require_root
+
+    log "启动 $APP_NAME v$APP_VERSION"
+
+    main_menu
 }
 
 main "$@"
