@@ -7,8 +7,9 @@
 # YouTube: https://www.youtube.com/@xiazheteng8
 # Telegram: https://t.me/xiazheteng8
 #
-# 默认无域名；选项 5 合并可识别的节点分享链接。
-# SSH 登录后直接输入 x，即可启动管理器。
+# 默认无域名
+# 输入 x 即可快速启动
+# 菜单 5：合并已识别的节点分享链接
 # ============================================================
 
 set -Eeuo pipefail
@@ -74,11 +75,8 @@ install_deps(){
 }
 
 # ============================================================
-# SSH 快捷启动
-# 自动创建：
-#   /usr/local/bin/x
-#   /usr/local/bin/xiazheteng-node-manager.sh
-#   /etc/profile.d/xiazheteng-node-manager.sh
+# SSH 快捷命令
+# SSH 登录后直接输入 x
 # ============================================================
 
 install_shortcut(){
@@ -89,26 +87,25 @@ install_shortcut(){
 
     install -d -m 755 /usr/local/bin /etc/profile.d
 
-    # 如果当前脚本是普通本地文件，优先安装当前文件。
     if [[ -f "$source" && "$source" != /dev/fd/* ]]; then
         if ! install -m 755 "$source" "$target"; then
-            warn "无法复制当前脚本到 $target"
+            warn "无法安装管理器入口：$target"
             return 1
         fi
     else
-        # bash <(curl ...) 方式运行时，从仓库下载持久脚本。
         tmp="$(mktemp)"
+
         if ! curl -fsSL --retry 3 --connect-timeout 10 \
             "$GITHUB_RAW" -o "$tmp"; then
             rm -f "$tmp"
-            warn "无法下载 GitHub 脚本，未能安装持久入口。"
-            warn "请先将完整脚本提交到指定 GitHub 仓库后重新运行。"
+            warn "无法从 GitHub 下载持久脚本。"
+            warn "请先将完整脚本提交到指定仓库。"
             return 1
         fi
 
         if ! bash -n "$tmp"; then
             rm -f "$tmp"
-            warn "下载的脚本语法检查失败，取消安装快捷入口。"
+            warn "下载的脚本语法检查失败。"
             return 1
         fi
 
@@ -127,18 +124,17 @@ fi
 
 exec /usr/bin/env bash "$SCRIPT" "$@"
 EOF
+
     chmod 755 "$shortcut"
 
-    # 登录 Shell 的 PATH 兜底配置。
     cat > /etc/profile.d/xiazheteng-node-manager.sh <<'EOF'
 case ":$PATH:" in
     *:/usr/local/bin:*) ;;
     *) export PATH="/usr/local/bin:$PATH" ;;
 esac
 EOF
-    chmod 644 /etc/profile.d/xiazheteng-node-manager.sh
 
-    # 当前 Shell 也立即生效。
+    chmod 644 /etc/profile.d/xiazheteng-node-manager.sh
     export PATH="/usr/local/bin:$PATH"
 
     ok "SSH 快捷命令 x 已安装。"
@@ -147,14 +143,17 @@ EOF
 public_ip(){
     local ip=""
     ip="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+
     if [[ -z "$ip" ]]; then
         ip="$(curl -4 -fsS --max-time 8 https://ifconfig.me/ip 2>/dev/null || true)"
     fi
+
     printf '%s' "$ip"
 }
 
 port_used(){
     local p="$1"
+
     if has ss; then
         ss -H -lntu 2>/dev/null |
             awk '{print $5}' |
@@ -173,13 +172,16 @@ PY
 
 free_port(){
     local i p
+
     for i in $(seq 1 100); do
         p="$(random_port)"
+
         if ! port_used "$p"; then
             printf '%s\n' "$p"
             return 0
         fi
     done
+
     err "无法找到未被本机监听的端口。"
     return 1
 }
@@ -210,45 +212,105 @@ install_xray(){
     rm -f "$tmp"
 
     if [[ ! -x "$XRAY" ]]; then
-        err "安装结束，但未找到 $XRAY"
+        err "安装后没有找到 $XRAY"
         return 1
     fi
 }
 
-# 兼容常见 Xray 密钥输出字段。
-# 无法可靠提取时停止，不把私钥冒充公钥。
+# ============================================================
+# REALITY 密钥解析
+#
+# 兼容常见输出：
+# PrivateKey: ...
+# Private key: ...
+# Password: ...
+# PublicKey: ...
+# Public key: ...
+#
+# 不将私钥当作公钥。
+# ============================================================
+
 reality_keys(){
-    local output priv pub
+    local output
+    local parsed
 
     output="$("$XRAY" x25519 2>&1)" || {
         err "Xray x25519 执行失败："
-        printf '%s\n' "$output"
+        printf '%s\n' "$output" >&2
         return 1
     }
 
-    priv="$(printf '%s\n' "$output" |
-        awk -F': *' '
-        tolower($1) ~ /privatekey|private key/ {
-            print $2; exit
-        }')"
+    parsed="$(
+        printf '%s\n' "$output" |
+        python3 -c '
+import re
+import sys
 
-    pub="$(printf '%s\n' "$output" |
-        awk -F': *' '
-        tolower($1) ~ /^(password|publickey|public key)$/ {
-            print $2; exit
-        }')"
+text = sys.stdin.read()
 
-    if [[ -z "$priv" || -z "$pub" ]]; then
+def normalize(label):
+    return re.sub(r"[^a-z]", "", label.lower())
+
+values = {}
+
+for line in text.splitlines():
+    if ":" not in line:
+        continue
+
+    label, value = line.split(":", 1)
+    label = normalize(label)
+    value = value.strip()
+
+    if value:
+        values[label] = value
+
+private_key = ""
+public_key = ""
+
+for key in ("privatekey", "private"):
+    if values.get(key):
+        private_key = values[key]
+        break
+
+# Xray 某些版本将公钥称为 Password。
+# 优先读取明确的 PublicKey 字段。
+for key in ("publickey", "public"):
+    if values.get(key):
+        public_key = values[key]
+        break
+
+if not public_key and values.get("password"):
+    public_key = values["password"]
+
+if not private_key or not public_key:
+    print("无法识别密钥输出格式。", file=sys.stderr)
+    print("识别到的字段：" + ", ".join(sorted(values.keys())), file=sys.stderr)
+    print("原始输出如下：", file=sys.stderr)
+    print(text, file=sys.stderr)
+    sys.exit(1)
+
+if private_key == public_key:
+    print("私钥和公钥字段相同，拒绝继续。", file=sys.stderr)
+    sys.exit(1)
+
+print(private_key)
+print(public_key)
+'
+    )" || {
         err "无法识别当前 Xray 的密钥输出格式。"
-        printf '%s\n' "$output"
+        printf '%s\n' "$output" >&2
         return 1
-    fi
+    }
 
-    printf '%s\n%s\n' "$priv" "$pub"
+    printf '%s\n' "$parsed"
 }
 
 make_vless(){
-    local uuid="$1" host="$2" port="$3" pub="$4" sid="$5"
+    local uuid="$1"
+    local host="$2"
+    local port="$3"
+    local pub="$4"
+    local sid="$5"
 
     python3 - "$uuid" "$host" "$port" "$pub" "$sid" <<'PY'
 import sys
@@ -272,14 +334,21 @@ PY
 }
 
 write_xray_config(){
-    local uuid="$1" port="$2" priv="$3" sid="$4"
+    local uuid="$1"
+    local port="$2"
+    local priv="$3"
+    local sid="$4"
 
     python3 - "$XRAY_CONFIG" "$uuid" "$port" "$priv" "$sid" <<'PY'
-import json, sys
+import json
+import sys
 
 path, uid, port, private_key, short_id = sys.argv[1:]
+
 cfg = {
-    "log": {"loglevel": "warning"},
+    "log": {
+        "loglevel": "warning"
+    },
     "inbounds": [{
         "listen": "0.0.0.0",
         "port": int(port),
@@ -318,6 +387,7 @@ with open(path, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")
 PY
+
     chmod 600 "$XRAY_CONFIG"
 }
 
@@ -344,7 +414,8 @@ EOF
 }
 
 encode_file(){
-    local source="$1" destination="$2"
+    local source="$1"
+    local destination="$2"
 
     if [[ ! -s "$source" ]]; then
         err "订阅源文件为空：$source"
@@ -368,7 +439,7 @@ open_local_port(){
         info "未自动修改本机防火墙。"
     fi
 
-    warn "还需检查云厂商安全组是否放行 TCP $p。"
+    warn "请检查云厂商安全组是否放行 TCP $p。"
 }
 
 validate_domain(){
@@ -376,7 +447,9 @@ validate_domain(){
 }
 
 setup_nginx_packages(){
-    if has nginx; then return 0; fi
+    if has nginx; then
+        return 0
+    fi
 
     if has apt-get; then
         apt-get install -y nginx
@@ -391,7 +464,9 @@ setup_nginx_packages(){
 }
 
 setup_certbot(){
-    if has certbot; then return 0; fi
+    if has certbot; then
+        return 0
+    fi
 
     if has apt-get; then
         apt-get install -y certbot python3-certbot-nginx
@@ -430,7 +505,7 @@ publish_subscription(){
     fi
 
     if [[ -e "$NGINX_SITE" ]]; then
-        err "已有管理器 Nginx 配置，拒绝覆盖：$NGINX_SITE"
+        err "已存在管理器 Nginx 配置，拒绝覆盖：$NGINX_SITE"
         return 1
     fi
 
@@ -481,13 +556,14 @@ EOF
 
     if ! curl -fsS --connect-timeout 8 --max-time 15 \
         "$url" -o /dev/null; then
-        err "订阅 URL 未通过 HTTPS 可访问性检查。"
+        err "HTTPS 订阅 URL 检查失败。"
         return 1
     fi
 
     printf '%s\n' "$token" > "$TOKEN_FILE"
     printf '%s\n' "$domain" > "$DOMAIN_FILE"
     printf '%s\n' "$url" > "$SUB_URL_FILE"
+
     chmod 600 "$TOKEN_FILE" "$DOMAIN_FILE" "$SUB_URL_FILE"
 
     printf '%s\n' "$url"
@@ -557,12 +633,13 @@ install_node(){
     }
 
     uri="$(make_vless "$uuid" "$host" "$port" "$pub" "$sid")"
+
     printf '%s\n' "$uri" > "$NODE_FILE"
     encode_file "$NODE_FILE" "$SUB_FILE"
     open_local_port "$port"
 
     echo
-    ok "节点配置检查通过，服务正在运行。"
+    ok "Xray 配置校验通过，服务已启动。"
     echo "节点连接："
     cat "$NODE_FILE"
     echo
@@ -570,12 +647,13 @@ install_node(){
 
     if [[ "$mode" == 1 ]]; then
         local url
+
         if url="$(publish_subscription "$domain")"; then
             echo
             ok "HTTPS 订阅地址："
             echo "$url"
         else
-            warn "公网订阅未验证成功，请检查 DNS、80/443 端口及证书。"
+            warn "公网订阅未验证成功，请检查 DNS、80/443 端口和证书。"
         fi
     else
         echo
@@ -585,13 +663,11 @@ install_node(){
 
     echo
     warn "请在云厂商安全组中放行 TCP $port。"
-    warn "本机服务正常不代表公网端口一定可达。"
+    warn "服务启动成功不代表公网端口一定可达。"
 }
 
 # ============================================================
 # 订阅扫描
-# 扫描常见目录中的分享链接，并尝试转换部分 Xray 配置。
-# 无法确认公钥或连接参数的配置会跳过，避免生成伪链接。
 # ============================================================
 
 scan_share_file(){
@@ -627,7 +703,6 @@ for ib in cfg.get("inbounds", []):
         security = stream.get("security", "none")
         host = ib.get("listen", "")
 
-        # 监听地址不是客户端公网地址时，不能拿来生成连接链接。
         if not host or host in (
             "0.0.0.0", "::", "[::]", "localhost", "127.0.0.1"
         ):
@@ -668,6 +743,7 @@ for ib in cfg.get("inbounds", []):
                     continue
 
                 params = {"type": network, "security": security}
+
                 if security == "tls":
                     tls = stream.get("tlsSettings", {})
                     if tls.get("serverName"):
@@ -696,6 +772,7 @@ discover_files(){
     local d
     for d in "${roots[@]}"; do
         [[ -d "$d" ]] || continue
+
         find "$d" -maxdepth 5 -type f \
             \( -name '*.json' -o -name '*.txt' -o -name '*.conf' \) \
             -not -path "$BASE/*" -print 2>/dev/null || true
@@ -721,6 +798,7 @@ subscribe_all(){
     local domain=""
     if [[ "$mode" == 1 ]]; then
         read -r -p "请输入已解析到本机的域名：" domain
+
         [[ -n "$domain" ]] && validate_domain "$domain" || {
             err "域名为空或格式错误。"
             return 1
@@ -731,10 +809,8 @@ subscribe_all(){
     tmp="$(mktemp)"
     merged="$DATA/all-nodes.txt"
 
-    # 本管理器生成的节点。
     [[ -r "$NODE_FILE" ]] && cat "$NODE_FILE" >> "$tmp"
 
-    # 从常见配置目录扫描分享链接。
     while IFS= read -r f; do
         case "$f" in
             *.txt|*.conf)
@@ -757,7 +833,7 @@ subscribe_all(){
 
     if [[ "$count" -eq 0 ]]; then
         err "没有发现可直接导入的节点分享链接。"
-        warn "某些服务端配置缺少客户端地址或公钥，不能仅凭配置文件可靠生成分享链接。"
+        warn "无法确认公钥或客户端参数的服务端配置会被跳过。"
         return 1
     fi
 
@@ -769,6 +845,7 @@ subscribe_all(){
 
     if [[ "$mode" == 1 ]]; then
         local url
+
         if url="$(publish_subscription "$domain")"; then
             echo
             ok "HTTPS 订阅地址："
@@ -789,6 +866,7 @@ subscribe_all(){
 show_status(){
     echo
     systemctl --no-pager -l status "$SERVICE" 2>/dev/null || true
+
     if [[ -x "$XRAY" ]]; then
         "$XRAY" version 2>/dev/null | head -n 3
     fi
@@ -819,17 +897,23 @@ update_xray(){
         return 1
     fi
 
-    bash "$tmp" install
-    rc=$?
+    if bash "$tmp" install; then
+        rc=0
+    else
+        rc=$?
+    fi
+
     rm -f "$tmp"
     return "$rc"
 }
 
 backup_config(){
     dirs
+
     local file="$BACKUP/backup-$(date +%Y%m%d-%H%M%S).tar.gz"
     tar -czf "$file" -C "$BASE" config data
     chmod 600 "$file"
+
     ok "备份完成：$file"
 }
 
@@ -863,6 +947,7 @@ kernel_menu(){
         echo "0. 返回主菜单"
 
         read -r -p "请选择：" c
+
         case "$c" in
             1) show_status; pause ;;
             2) restart_xray; pause ;;
@@ -897,6 +982,7 @@ install_upstream(){
 
     install -m 700 "$tmp" "$UPSTREAM"
     rm -f "$tmp"
+
     ok "已保存上游脚本：$UPSTREAM"
 }
 
@@ -966,6 +1052,7 @@ update_manager(){
 
     install -m 755 "$tmp" "/usr/local/bin/$SCRIPT_NAME"
     rm -f "$tmp"
+
     ok "管理器已更新。"
 }
 
@@ -982,6 +1069,7 @@ more_menu(){
         echo "0. 返回主菜单"
 
         read -r -p "请选择：" c
+
         case "$c" in
             1) run_upstream; pause ;;
             2) install_upstream; pause ;;
@@ -1010,6 +1098,7 @@ uninstall_manager(){
 
     if [[ -f "$NGINX_SITE" ]] && grep -q "$WEB_ROOT" "$NGINX_SITE"; then
         rm -f "$NGINX_SITE"
+
         if nginx -t >/dev/null 2>&1; then
             systemctl reload nginx >/dev/null 2>&1 || true
         fi
@@ -1018,7 +1107,7 @@ uninstall_manager(){
     rm -rf "$BASE" "$WEB_ROOT" "/opt/$APP"
     systemctl daemon-reload
 
-    warn "不会自动删除系统中其他站点或证书。"
+    warn "不会自动删除系统中的其他站点或证书。"
     read -r -p "是否删除快捷命令 x 和管理器入口？[y/N]：" c
 
     if [[ "$c" == y || "$c" == Y ]]; then
@@ -1043,7 +1132,7 @@ main_menu(){
         echo "4. 更多功能"
         echo "5. 一键订阅所有已安装节点"
         echo
-        echo "输入 x / X：启动管理器快捷入口"
+        echo "输入 x / X：安装快捷入口并返回菜单"
         echo "输入 q / Q：退出"
         echo "=================================================="
 
@@ -1057,9 +1146,7 @@ main_menu(){
             5) subscribe_all; pause ;;
             x|X)
                 install_shortcut || true
-                echo
-                info "当前已经在管理器中。"
-                info "以后 SSH 登录后，可直接输入 x 启动。"
+                info "以后 SSH 登录后可直接输入 x 启动。"
                 pause
                 ;;
             q|Q) exit 0 ;;
@@ -1072,9 +1159,7 @@ main(){
     require_root
     dirs
 
-    # 每次启动都检查快捷命令，避免入口丢失。
-    install_shortcut || warn "快捷命令自动安装失败；主菜单仍可继续使用。"
-
+    install_shortcut || warn "快捷命令安装失败，主菜单仍可继续使用。"
     main_menu
 }
 
