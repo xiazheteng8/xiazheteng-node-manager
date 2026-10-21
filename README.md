@@ -56,18 +56,13 @@
 登录 VPS 后执行：
 
 ```bash
+apt update
+apt install -y curl
 curl -4 -fsSL \
   https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazheteng-node-manager.sh \
   -o /root/xiazheteng-node-manager.sh \
 && chmod 700 /root/xiazheteng-node-manager.sh \
 && bash /root/xiazheteng-node-manager.sh
-```
-
-如果系统没有安装 `curl`，请先安装：
-
-```bash
-apt update
-apt install -y curl
 ```
 
 执行安装命令后，根据菜单提示操作即可。
