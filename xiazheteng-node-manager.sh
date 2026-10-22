@@ -1,7 +1,7 @@
 
 #!/usr/bin/env bash
 # ============================================================
-# 瞎折腾吧 | VPS 节点管理器（兼容修复版）
+# 瞎折腾吧 | VPS 节点管理器
 # Ubuntu / Debian
 # VLESS REALITY + VLESS TLS + VMess TCP + Shadowsocks
 # 自动检测、故障隔离、订阅检查、TLS 证书管理
@@ -580,7 +580,7 @@ create_reality() {
         --arg stream "$stream" \
         --arg sniff "$sniff" \
         '{
-          enable:true,remark:$remark,port:$port,protocol:"vless",
+          enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"vless",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
           total:0,expiryTime:0
         }')" || return 1
@@ -633,7 +633,7 @@ create_tls() {
         --arg stream "$stream" \
         --arg sniff "$sniff" \
         '{
-          enable:true,remark:$remark,port:$port,protocol:"vless",
+          enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"vless",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
           total:0,expiryTime:0
         }')" || return 1
@@ -669,7 +669,7 @@ create_vmess() {
         --arg stream "$stream" \
         --arg sniff "$sniff" \
         '{
-          enable:true,remark:$remark,port:$port,protocol:"vmess",
+          enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"vmess",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
           total:0,expiryTime:0
         }')" || return 1
@@ -711,7 +711,7 @@ create_shadowsocks() {
         --arg stream "$stream" \
         --arg sniff "$sniff" \
         '{
-          enable:true,remark:$remark,port:$port,protocol:"shadowsocks",
+          enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"shadowsocks",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
           total:0,expiryTime:0
         }')" || return 1
@@ -888,23 +888,43 @@ remove_last_generated_node() {
 
 verify_inbound_port() {
     local port="$1"
-    local i
+    local i tcp_found=0 udp_found=0
 
-    for i in 1 2 3 4 5; do
-        if ss -H -lnt 2>/dev/null |
-            awk -v p=":$port" '$4 ~ (p "$") {found=1} END {exit !found}'; then
+    # 3x-ui 的 API 返回成功后，Xray 重载配置可能仍需要数秒。
+    # 最多等待 20 秒，避免重载窗口内过早判定失败。
+    for i in $(seq 1 20); do
+        if ss -H -lnt 2>/dev/null | awk -v p=":$port" '$4 ~ (p "$") {found=1} END {exit !found}'; then
             log "[成功] TCP 端口 $port 正在监听。"
             return 0
         fi
         sleep 1
     done
 
-    log "[失败] TCP 端口 $port 未检测到监听。"
-    log "[诊断] 为避免中断 VPS 上已有节点，脚本不会自动重启整个 3x-ui 服务。"
-    log "[诊断] 请检查 3x-ui 入站列表、Xray 日志、端口冲突和云厂商安全组。"
-    journalctl -u x-ui -n 30 --no-pager 2>/dev/null | while IFS= read -r line; do
-        log "[x-ui] $line"
-    done
+    if ss -H -lnu 2>/dev/null | awk -v p=":$port" '$4 ~ (p "$") {found=1} END {exit !found}'; then
+        udp_found=1
+    fi
+
+    log "[失败] 等待 20 秒后，仍未检测到 TCP 端口 $port 监听。"
+    (( udp_found == 1 )) && log "[诊断] 发现 UDP $port，但该节点还需要 TCP 监听；UDP 存在不能视为节点可用。"
+    log "[诊断] 当前相关监听："
+    ss -H -lntup 2>/dev/null | awk -v p=":$port" '$0 ~ p {print "[端口] " $0}' | while IFS= read -r line; do log "$line"; done
+    log "[诊断] 3x-ui 入站列表中对应端口/协议："
+    if [[ -s "$COOKIE" && -s "$API_ROOT_FILE" ]]; then
+        local root list
+        root="$(cat "$API_ROOT_FILE")"
+        list="$(curl -fsS --max-time 10 -b "$COOKIE" "${root}panel/api/inbounds/list" 2>/dev/null || true)"
+        if jq -e '.success == true' >/dev/null 2>&1 <<< "$list"; then
+            jq -r --argjson p "$port" '.obj[]? | select((.port|tonumber)==$p) | "[入站] id=\(.id // "?") protocol=\(.protocol // "?") enable=\(.enable // false) remark=\(.remark // "")"' <<< "$list" | while IFS= read -r line; do log "$line"; done
+            if ! jq -e --argjson p "$port" '.obj[]? | select((.port|tonumber)==$p)' >/dev/null <<< "$list"; then
+                log "[诊断] API 入站列表中未找到端口 $port；请检查 API 写入结果。"
+            fi
+        else
+            log "[诊断] 无法读取 API 入站列表。"
+        fi
+    fi
+    log "[诊断] 最近 60 行 x-ui 日志："
+    journalctl -u x-ui -n 60 --no-pager 2>/dev/null | while IFS= read -r line; do log "[x-ui] $line"; done
+    log "[诊断] 不自动重启 x-ui，以免中断服务器上已有节点。"
     return 1
 }
 
