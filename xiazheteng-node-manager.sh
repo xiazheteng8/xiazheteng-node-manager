@@ -1,662 +1,580 @@
-```bash
-cat > /usr/local/bin/xiazheteng-node-manager.sh <<'BASH'
+
+cat > /root/xiazheteng-node-manager.sh <<'SCRIPT_EOF'
 #!/usr/bin/env bash
 # ============================================================
-# 瞎折腾吧 | 3x-ui / Xray 节点管理器
-# 单文件版
+# 瞎折腾吧 | X-UI / 3X-UI 节点管理器
+# Ubuntu 22.04 | 单文件 Bash
 # ============================================================
 
 set -uo pipefail
 umask 077
 
-CONFIG_FILE="/etc/x-ui/node-manager.env"
-INSTALL_RESULT="/etc/x-ui/install-result.env"
+APP_NAME="瞎折腾吧 | X-UI 节点管理器"
+CONFIG_DIR="/etc/x-ui"
+CONFIG_FILE="${CONFIG_DIR}/node-manager.env"
 DB_FILE="/etc/x-ui/x-ui.db"
+COOKIE_FILE="/tmp/xiazheteng-xui-cookie.$$"
+HTTP_BODY="/tmp/xiazheteng-xui-body.$$"
 
-PANEL_PORT="22682"
-BASE_PATH="/DzFtThyY0rcdykt4CC/"
-USERNAME=""
-PASSWORD=""
-PANEL_ROOT=""
-LOGIN_URL=""
-CSRF_URL=""
-API_PREFIX=""
-CSRF_TOKEN=""
-COOKIE=""
-WORK=""
-BODY=""
-CURL_ERROR=""
+trap 'rm -f "$COOKIE_FILE" "$HTTP_BODY"' EXIT
 
-info() { printf '\033[36m[信息]\033[0m %s\n' "$*"; }
-ok()   { printf '\033[32m[成功]\033[0m %s\n' "$*"; }
-warn() { printf '\033[33m[警告]\033[0m %s\n' "$*"; }
-err()  { printf '\033[31m[错误]\033[0m %s\n' "$*" >&2; }
+RED='\033[31m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+BLUE='\033[36m'
+RESET='\033[0m'
+
+info() { echo -e "${BLUE}[信息]${RESET} $*"; }
+ok()   { echo -e "${GREEN}[成功]${RESET} $*"; }
+warn() { echo -e "${YELLOW}[警告]${RESET} $*"; }
+err()  { echo -e "${RED}[错误]${RESET} $*" >&2; }
 
 pause() {
     echo
-    read -r -p "按回车键继续..." _
+    read -r -p "按回车键返回菜单..." _
 }
-
-cleanup() {
-    if [[ -n "${WORK:-}" && -d "$WORK" ]]; then
-        rm -rf -- "$WORK"
-    fi
-}
-trap cleanup EXIT
 
 need_root() {
-    if [[ "$(id -u)" -ne 0 ]]; then
-        err "请使用 root 用户运行。"
+    if [[ "${EUID}" -ne 0 ]]; then
+        err "请使用 root 运行此脚本。"
         exit 1
     fi
 }
 
-check_dependencies() {
+install_deps() {
     local missing=()
     local cmd
-    for cmd in curl jq openssl sed grep systemctl; do
+
+    for cmd in curl jq openssl sed grep awk; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
 
     if ((${#missing[@]})); then
-        err "缺少依赖：${missing[*]}"
-        echo "Debian/Ubuntu 安装命令："
-        echo "apt-get update && apt-get install -y curl jq openssl"
-        exit 1
+        info "正在安装依赖：${missing[*]}"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update || {
+            err "apt-get update 失败。"
+            return 1
+        }
+        apt-get install -y curl jq openssl ca-certificates || {
+            err "依赖安装失败。"
+            return 1
+        }
     fi
+
+    ok "依赖检查完成。"
 }
 
-# 只读取简单 KEY='VALUE' 配置，不执行配置文件
-read_value() {
-    local file="$1" key="$2"
-    [[ -f "$file" ]] || return 0
+normalize_path() {
+    local p="${1:-/}"
 
-    sed -nE \
-      "s/^[[:space:]]*${key}=['\"]?(.*)['\"]?[[:space:]]*$/\1/p" \
-      "$file" | head -n 1
-}
+    [[ -z "$p" ]] && p="/"
+    [[ "$p" == /* ]] || p="/$p"
 
-normalize_config() {
-    # 合并重复斜杠
-    BASE_PATH="$(printf '%s' "$BASE_PATH" | sed -E 's#/{2,}#/#g')"
+    while [[ "$p" == *//* ]]; do
+        p="${p//\/\//\/}"
+    done
 
-    # 统一为以一个斜杠开头、一个斜杠结尾
-    BASE_PATH="/${BASE_PATH#/}"
-    BASE_PATH="${BASE_PATH%/}/"
-
-    if [[ ! "$PANEL_PORT" =~ ^[0-9]{1,5}$ ]] ||
-       ((10#$PANEL_PORT < 1 || 10#$PANEL_PORT > 65535)); then
-        warn "面板端口无效，改用 22682。"
-        PANEL_PORT="22682"
+    if [[ "$p" != "/" ]]; then
+        p="${p%/}/"
     fi
+
+    printf '%s' "$p"
 }
 
 load_config() {
-    local value
-
-    if [[ -f "$INSTALL_RESULT" ]]; then
-        value="$(read_value "$INSTALL_RESULT" XUI_PANEL_PORT)"
-        [[ -n "$value" ]] && PANEL_PORT="$value"
-
-        value="$(read_value "$INSTALL_RESULT" XUI_WEB_BASE_PATH)"
-        [[ -n "$value" ]] && BASE_PATH="$value"
-    fi
+    XUI_HOST="${XUI_HOST:-127.0.0.1}"
+    XUI_PANEL_PORT="${XUI_PANEL_PORT:-22682}"
+    XUI_BASE_PATH="${XUI_BASE_PATH:-/}"
+    XUI_USERNAME="${XUI_USERNAME:-}"
+    XUI_PASSWORD="${XUI_PASSWORD:-}"
 
     if [[ -f "$CONFIG_FILE" ]]; then
-        value="$(read_value "$CONFIG_FILE" XUI_USERNAME)"
-        [[ -n "$value" ]] && USERNAME="$value"
-
-        value="$(read_value "$CONFIG_FILE" XUI_PASSWORD)"
-        [[ -n "$value" ]] && PASSWORD="$value"
-
-        value="$(read_value "$CONFIG_FILE" XUI_PANEL_PORT)"
-        [[ -n "$value" ]] && PANEL_PORT="$value"
-
-        value="$(read_value "$CONFIG_FILE" PANEL_PORT)"
-        [[ -n "$value" ]] && PANEL_PORT="$value"
-
-        value="$(read_value "$CONFIG_FILE" XUI_BASE_PATH)"
-        [[ -n "$value" ]] && BASE_PATH="$value"
-
-        value="$(read_value "$CONFIG_FILE" BASE_PATH)"
-        [[ -n "$value" ]] && BASE_PATH="$value"
+        # 配置文件由本脚本生成，权限应限制为 root 可读写。
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE"
     fi
 
-    normalize_config
+    XUI_HOST="${XUI_HOST:-127.0.0.1}"
+    XUI_PANEL_PORT="${XUI_PANEL_PORT:-22682}"
+    XUI_BASE_PATH="$(normalize_path "${XUI_BASE_PATH:-/}")"
+    XUI_USERNAME="${XUI_USERNAME:-}"
+    XUI_PASSWORD="${XUI_PASSWORD:-}"
+
+    PANEL_ROOT="http://${XUI_HOST}:${XUI_PANEL_PORT}${XUI_BASE_PATH}"
 }
 
 save_config() {
-    install -d -m 700 /etc/x-ui
-    local tmp
-    tmp="$(mktemp /etc/x-ui/node-manager.env.XXXXXX)" || return 1
+    install -d -m 700 "$CONFIG_DIR"
 
-    {
-        printf "XUI_USERNAME='%s'\n" "${USERNAME//\'/}"
-        printf "XUI_PASSWORD='%s'\n" "${PASSWORD//\'/}"
-        printf "XUI_PANEL_PORT='%s'\n" "$PANEL_PORT"
-        printf "XUI_BASE_PATH='%s'\n" "$BASE_PATH"
-    } > "$tmp"
+    cat > "$CONFIG_FILE" <<EOF
+XUI_HOST=$(printf '%q' "$XUI_HOST")
+XUI_PANEL_PORT=$(printf '%q' "$XUI_PANEL_PORT")
+XUI_BASE_PATH=$(printf '%q' "$XUI_BASE_PATH")
+XUI_USERNAME=$(printf '%q' "$XUI_USERNAME")
+XUI_PASSWORD=$(printf '%q' "$XUI_PASSWORD")
+EOF
 
-    chmod 600 "$tmp"
-    mv -f "$tmp" "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+    ok "配置已保存：$CONFIG_FILE"
 }
 
-setup_urls() {
-    load_config
-
-    # 再次规范化，防止配置中的 // 进入请求 URL
-    BASE_PATH="$(printf '%s' "$BASE_PATH" | sed -E 's#/{2,}#/#g')"
-    BASE_PATH="/${BASE_PATH#/}"
-    BASE_PATH="${BASE_PATH%/}/"
-
-    PANEL_ROOT="http://127.0.0.1:${PANEL_PORT}${BASE_PATH%/}"
-    LOGIN_URL="${PANEL_ROOT}/login"
-    CSRF_URL="${PANEL_ROOT}/csrf-token"
-    API_PREFIX="${PANEL_ROOT}/panel/api"
-
-    info "面板端口：$PANEL_PORT"
-    info "Base Path：$BASE_PATH"
-    info "面板地址：$PANEL_ROOT"
-}
-
-# 返回 HTTP 状态码；失败时返回 000，并创建响应文件
-http_request() {
-    local method="$1" url="$2"
-    shift 2
-
-    : > "$BODY"
-    : > "$CURL_ERROR"
-
-    local status rc
-    status="$(
-        curl -sS \
-          --connect-timeout 5 \
-          --max-time 30 \
-          -X "$method" \
-          -b "$COOKIE" \
-          -c "$COOKIE" \
-          -o "$BODY" \
-          -w '%{http_code}' \
-          "$url" "$@" \
-          2>"$CURL_ERROR"
-    )"
-    rc=$?
-
-    [[ -f "$BODY" ]] || : > "$BODY"
-
-    if [[ -z "$status" ]]; then
-        status="000"
-    fi
-
-    if ((rc != 0)); then
-        warn "curl 请求失败，退出码：$rc"
-        [[ -s "$CURL_ERROR" ]] && sed -n '1,5p' "$CURL_ERROR" >&2
-        status="000"
-    fi
-
-    printf '%s' "$status"
-}
-
-prompt_credentials() {
+configure_panel() {
     echo
-    echo "===== 面板账号 ====="
+    echo "===== 配置面板连接信息 ====="
+    echo "当前地址：${PANEL_ROOT}"
 
-    if [[ -z "$USERNAME" ]]; then
-        read -r -p "请输入 3x-ui 用户名：" USERNAME
-    else
-        read -r -p "当前用户名为 ${USERNAME}，回车使用该用户名，或输入新用户名：" value
-        [[ -n "${value:-}" ]] && USERNAME="$value"
-    fi
+    read -r -p "面板主机/IP [${XUI_HOST}]: " value
+    [[ -n "$value" ]] && XUI_HOST="$value"
 
-    if [[ -z "$PASSWORD" ]]; then
-        read -r -s -p "请输入 3x-ui 密码：" PASSWORD
-        echo
-    else
-        read -r -s -p "回车使用保存的密码，或输入新密码：" value
-        echo
-        [[ -n "${value:-}" ]] && PASSWORD="$value"
-    fi
+    read -r -p "面板端口 [${XUI_PANEL_PORT}]: " value
+    [[ -n "$value" ]] && XUI_PANEL_PORT="$value"
 
-    if [[ -z "$USERNAME" || -z "$PASSWORD" ]]; then
-        err "用户名或密码为空。"
+    if [[ ! "$XUI_PANEL_PORT" =~ ^[0-9]{1,5}$ ]] ||
+       ((10#$XUI_PANEL_PORT < 1 || 10#$XUI_PANEL_PORT > 65535)); then
+        err "端口无效。"
         return 1
     fi
 
+    read -r -p "面板基础路径 [${XUI_BASE_PATH}]: " value
+    [[ -n "$value" ]] && XUI_BASE_PATH="$value"
+    XUI_BASE_PATH="$(normalize_path "$XUI_BASE_PATH")"
+
+    read -r -p "面板用户名 [${XUI_USERNAME}]: " value
+    [[ -n "$value" ]] && XUI_USERNAME="$value"
+
+    read -r -s -p "面板密码（留空保持不变）: " value
+    echo
+    [[ -n "$value" ]] && XUI_PASSWORD="$value"
+
+    PANEL_ROOT="http://${XUI_HOST}:${XUI_PANEL_PORT}${XUI_BASE_PATH}"
     save_config
 }
 
-get_csrf_token() {
-    local status
+check_config() {
+    echo
+    echo "===== 面板连接配置 ====="
+    printf '主机：%s\n' "$XUI_HOST"
+    printf '端口：%s\n' "$XUI_PANEL_PORT"
+    printf '基础路径：%s\n' "$XUI_BASE_PATH"
+    printf '用户名：%s\n' "${XUI_USERNAME:-未设置}"
+    printf '密码：%s\n' "$([[ -n "$XUI_PASSWORD" ]] && echo '已设置（隐藏）' || echo '未设置')"
+    printf '面板 URL：%s\n' "$PANEL_ROOT"
 
-    info "正在请求 CSRF Token……"
-    status="$(http_request GET "$CSRF_URL")"
+    echo
+    echo "===== 服务状态 ====="
+    systemctl --no-pager --full status x-ui 2>&1 | head -n 18 || true
 
-    if [[ "$status" != "200" ]]; then
-        err "CSRF 接口 HTTP 状态：$status"
-        [[ -s "$BODY" ]] && head -c 500 "$BODY" && echo
-        return 1
+    echo
+    echo "===== 数据库文件 ====="
+    if [[ -f "$DB_FILE" ]]; then
+        ls -lh "$DB_FILE"
+    else
+        warn "未找到 $DB_FILE"
     fi
 
-    # 你的接口实际返回：
-    # {"obj":"TOKEN","success":true}
-    # 因此必须读取 .obj。
-    CSRF_TOKEN="$(jq -r '
-        if (.success == true) then
-            (.obj // .token // .csrfToken // .csrf_token // .data.token // empty)
-        else
-            empty
-        end
-    ' "$BODY" 2>/dev/null || true)"
+    echo
+    echo "===== 根路径 HTTP 状态 ====="
+    curl -sS -o /dev/null -w 'HTTP %{http_code}\n' \
+        --connect-timeout 5 --max-time 10 \
+        "http://${XUI_HOST}:${XUI_PANEL_PORT}/" || true
 
-    if [[ -z "$CSRF_TOKEN" || "$CSRF_TOKEN" == "null" ]]; then
-        err "接口返回 HTTP 200，但 JSON 中没有可用的 CSRF Token。"
-        echo "响应内容："
-        head -c 500 "$BODY"
+    echo
+    echo "===== 面板基础路径 HTTP 状态 ====="
+    curl -sS -o /dev/null -w 'HTTP %{http_code}\n' \
+        --connect-timeout 5 --max-time 10 \
+        "$PANEL_ROOT" || true
+
+    echo
+    echo "===== CSRF 接口 ====="
+    local code
+    code="$(curl -sS -o "$HTTP_BODY" -w '%{http_code}' \
+        --connect-timeout 5 --max-time 10 \
+        "${PANEL_ROOT}csrf-token" 2>/dev/null || true)"
+
+    echo "HTTP ${code:-连接失败}"
+    if [[ -s "$HTTP_BODY" ]]; then
+        jq . "$HTTP_BODY" 2>/dev/null || head -c 500 "$HTTP_BODY"
         echo
-        return 1
     fi
+}
 
-    ok "CSRF Token 获取成功。"
+get_csrf() {
+    local response
+    response="$(curl -fsS --connect-timeout 5 --max-time 15 \
+        -c "$COOKIE_FILE" -b "$COOKIE_FILE" \
+        "${PANEL_ROOT}csrf-token" 2>/dev/null)" || return 1
+
+    printf '%s' "$response" | jq -r '.obj // .token // empty' 2>/dev/null
 }
 
 api_login() {
-    setup_urls
-
-    if [[ -z "$USERNAME" || -z "$PASSWORD" ]]; then
-        prompt_credentials || return 1
-    fi
-
-    COOKIE="$WORK/cookies.txt"
-    BODY="$WORK/response.json"
-    CURL_ERROR="$WORK/curl-error.txt"
-    : > "$COOKIE"
-
-    if ! get_csrf_token; then
-        err "CSRF 获取失败，请检查 Base Path 和面板服务。"
+    if [[ -z "$XUI_USERNAME" || -z "$XUI_PASSWORD" ]]; then
+        err "请先配置面板用户名和密码。"
         return 1
     fi
 
-    info "正在提交登录请求……"
+    PANEL_ROOT="http://${XUI_HOST}:${XUI_PANEL_PORT}${XUI_BASE_PATH}"
+    : > "$COOKIE_FILE"
 
-    local status
-    status="$(
-        http_request POST "$LOGIN_URL" \
-          -H "Content-Type: application/json" \
-          -H "Accept: application/json" \
-          -H "X-CSRF-Token: $CSRF_TOKEN" \
-          --data "$(jq -cn \
-            --arg username "$USERNAME" \
-            --arg password "$PASSWORD" \
-            '{username:$username,password:$password}')"
-    )"
+    local csrf login_code
+    csrf="$(get_csrf)" || {
+        err "无法获取 CSRF Token，请检查面板地址、路径及网络。"
+        return 1
+    }
 
-    if [[ "$status" != "200" ]]; then
-        err "登录 HTTP 状态：$status"
-        [[ -s "$BODY" ]] && head -c 500 "$BODY" && echo
+    if [[ -z "$csrf" ]]; then
+        err "CSRF Token 为空。"
         return 1
     fi
 
-    if jq -e '
-        .success == true or
-        .success == "true" or
-        .success == 1
-    ' "$BODY" >/dev/null 2>&1; then
-        ok "面板登录成功。"
-        return 0
-    fi
-
-    err "面板没有确认登录成功。"
-    head -c 500 "$BODY"
-    echo
-    return 1
-}
-
-api_get() {
-    local endpoint="$1" status
-    status="$(http_request GET "${API_PREFIX}${endpoint}")"
-
-    if [[ "$status" != "200" ]]; then
-        err "API 请求失败：$endpoint，HTTP $status"
-        [[ -s "$BODY" ]] && head -c 500 "$BODY" && echo
+    login_code="$(curl -sS -o "$HTTP_BODY" -w '%{http_code}' \
+        --connect-timeout 5 --max-time 20 \
+        -c "$COOKIE_FILE" -b "$COOKIE_FILE" \
+        -H 'Content-Type: application/json' \
+        -H "X-CSRF-Token: ${csrf}" \
+        -X POST \
+        --data "$(jq -cn --arg u "$XUI_USERNAME" --arg p "$XUI_PASSWORD" \
+            '{username:$u,password:$p}')" \
+        "${PANEL_ROOT}login" 2>/dev/null)" || {
+        err "登录请求失败。"
         return 1
-    fi
+    }
 
-    if ! jq -e . "$BODY" >/dev/null 2>&1; then
-        err "API 返回的不是有效 JSON。"
-        head -c 500 "$BODY"
+    if [[ "$login_code" != "200" ]]; then
+        err "登录 HTTP 状态：$login_code"
+        cat "$HTTP_BODY"
         echo
         return 1
     fi
 
-    if ! jq -e '
-        .success == true or
-        .success == "true" or
-        .success == 1
-    ' "$BODY" >/dev/null 2>&1; then
-        err "API 返回失败：$(jq -r '.msg // .message // "未知错误"' "$BODY")"
+    if ! jq -e '.success == true' "$HTTP_BODY" >/dev/null 2>&1; then
+        err "面板未确认登录成功，响应如下："
+        jq . "$HTTP_BODY" 2>/dev/null || cat "$HTTP_BODY"
+        echo
         return 1
     fi
+
+    ok "面板登录成功。"
 }
 
-list_nodes() {
-    api_login || return 1
-    api_get "/inbounds/list" || return 1
+api_get() {
+    local endpoint="$1"
+    local csrf code
 
-    echo
-    echo "================ 节点列表 ================"
+    csrf="$(get_csrf 2>/dev/null || true)"
 
-    jq -r '
-      (.obj // .data // [])[] |
-      "ID: \(.id // "-") | 备注: \(.remark // "-") | 协议: \(.protocol // "-") | 端口: \(.port // "-") | 启用: \(.enable // false)"
-    ' "$BODY" 2>/dev/null || {
-        warn "无法解析节点列表，显示原始响应："
-        jq . "$BODY"
+    code="$(curl -sS -o "$HTTP_BODY" -w '%{http_code}' \
+        --connect-timeout 5 --max-time 25 \
+        -c "$COOKIE_FILE" -b "$COOKIE_FILE" \
+        -H "X-CSRF-Token: ${csrf}" \
+        "${PANEL_ROOT}${endpoint}" 2>/dev/null)" || {
+        err "API 请求失败：$endpoint"
+        return 1
     }
 
-    echo "=========================================="
+    if [[ "$code" != "200" ]]; then
+        err "API HTTP 状态：$code"
+        cat "$HTTP_BODY"
+        echo
+        return 1
+    fi
+
+    if ! jq -e '.success == true' "$HTTP_BODY" >/dev/null 2>&1; then
+        err "API 返回失败或登录状态失效：$endpoint"
+        jq . "$HTTP_BODY" 2>/dev/null || cat "$HTTP_BODY"
+        echo
+        return 1
+    fi
+
+    return 0
 }
 
-create_reality_node() {
+list_inbounds() {
+    echo
+    echo "===== 登录面板并读取入站 ====="
+
+    api_login || return 1
+    api_get "panel/api/inbounds/list" || return 1
+
+    jq -r '
+      if (.obj | type) == "array" then
+        .obj[] |
+        [
+          ("ID: " + ((.id // "")|tostring)),
+          ("备注: " + (.remark // "")),
+          ("协议: " + (.protocol // "")),
+          ("端口: " + ((.port // "")|tostring)),
+          ("启用: " + ((.enable // false)|tostring)),
+          ("流量: " + ((.totalGB // 0)|tostring) + " GB")
+        ] | join(" | ")
+      else
+        "面板返回的数据结构与预期不同：\(.obj|type)"
+      end
+    ' "$HTTP_BODY" || {
+        err "无法解析入站列表。"
+        return 1
+    }
+}
+
+find_xray() {
+    local candidate
+    for candidate in \
+        "$(command -v xray 2>/dev/null || true)" \
+        "/usr/local/x-ui/bin/xray-linux-amd64" \
+        "/usr/local/x-ui/bin/xray" \
+        "/usr/bin/xray"; do
+        if [[ -n "$candidate" && -x "$candidate" ]]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+create_reality() {
+    echo
+    echo "===== 创建 VLESS + REALITY 入站 ====="
+
     api_login || return 1
 
-    local remark port sni uuid short_id xray_bin key_output private_key public_key
-    local settings stream_settings sniffing status confirm
+    local xray
+    xray="$(find_xray)" || {
+        err "找不到 Xray 可执行文件，无法生成 REALITY 密钥。"
+        return 1
+    }
 
-    echo
-    echo "===== 创建 VLESS + REALITY 节点 ====="
-    read -r -p "节点备注：" remark
-    remark="${remark:-VLESS-REALITY}"
+    local remark port target server_name uuid key_output private_key public_key short_id
+    read -r -p "入站备注 [瞎折腾吧-REALITY]: " remark
+    remark="${remark:-瞎折腾吧-REALITY}"
 
-    while true; do
-        read -r -p "监听端口（1024-65535）：" port
-        if [[ "$port" =~ ^[0-9]+$ ]] &&
-           ((port >= 1024 && port <= 65535)); then
-            break
-        fi
-        warn "请输入有效端口。"
-    done
+    read -r -p "监听端口 [随机 20000-50000]: " port
+    if [[ -z "$port" ]]; then
+        port=$((20000 + RANDOM % 30001))
+    fi
 
-    read -r -p "REALITY SNI [www.microsoft.com]：" sni
-    sni="${sni:-www.microsoft.com}"
-
-    if [[ ! "$sni" =~ ^[a-zA-Z0-9.-]+$ ]]; then
-        err "SNI 格式无效。"
+    if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] ||
+       ((10#$port < 1 || 10#$port > 65535)); then
+        err "端口无效。"
         return 1
     fi
 
-    uuid="$(cat /proc/sys/kernel/random/uuid)"
-    short_id="$(openssl rand -hex 8)" || return 1
+    read -r -p "REALITY 目标域名 [www.microsoft.com]: " target
+    target="${target:-www.microsoft.com}"
+    target="${target#http://}"
+    target="${target#https://}"
+    target="${target%%/*}"
+    target="${target%%:*}"
 
-    for xray_bin in \
-        /usr/local/x-ui/bin/xray-linux-amd64 \
-        /usr/local/x-ui/bin/xray \
-        /usr/local/bin/xray \
-        /usr/bin/xray; do
-        [[ -x "$xray_bin" ]] && break
-    done
+    read -r -p "ServerName [${target}]: " server_name
+    server_name="${server_name:-$target}"
 
-    if [[ ! -x "${xray_bin:-}" ]]; then
-        xray_bin="$(command -v xray 2>/dev/null || true)"
-    fi
-
-    if [[ -z "${xray_bin:-}" || ! -x "$xray_bin" ]]; then
-        err "找不到 Xray 可执行文件。"
+    if [[ ! "$target" =~ ^[A-Za-z0-9.-]+$ ||
+          ! "$server_name" =~ ^[A-Za-z0-9.-]+$ ]]; then
+        err "域名格式无效。"
         return 1
     fi
 
-    key_output="$("$xray_bin" x25519 2>&1)" || {
-        err "生成 REALITY 密钥失败："
+    if ! command -v uuidgen >/dev/null 2>&1; then
+        apt-get install -y uuid-runtime >/dev/null 2>&1 || true
+    fi
+
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuid="$(uuidgen)"
+    else
+        uuid="$(cat /proc/sys/kernel/random/uuid)"
+    fi
+
+    key_output="$("$xray" x25519 2>&1)" || {
+        err "Xray 生成 REALITY 密钥失败："
         echo "$key_output"
         return 1
     }
 
     private_key="$(printf '%s\n' "$key_output" |
-        sed -nE 's/^[[:space:]]*Private[[:space:]_-]*Key:[[:space:]]*//Ip' |
+        sed -nE 's/^[[:space:]]*(PrivateKey|Private key):[[:space:]]*([^[:space:]]+).*/\2/p' |
         head -n 1)"
 
+    # 不同 Xray 版本曾使用 Password 表示公钥。
     public_key="$(printf '%s\n' "$key_output" |
-        sed -nE 's/^[[:space:]]*(Password|Public[[:space:]_-]*Key):[[:space:]]*//Ip' |
+        sed -nE 's/^[[:space:]]*(Password|PublicKey|Public key):[[:space:]]*([^[:space:]]+).*/\2/p' |
         head -n 1)"
 
     if [[ -z "$private_key" || -z "$public_key" ]]; then
-        err "无法识别当前 Xray 的 x25519 输出格式："
+        err "无法识别 Xray 密钥输出格式，未创建入站。"
         echo "$key_output"
         return 1
     fi
 
-    settings="$(
-        jq -cn --arg uuid "$uuid" --arg remark "$remark" '{
-          clients:[{
-            id:$uuid,
-            flow:"xtls-rprx-vision",
-            email:$remark,
-            enable:true,
-            limitIp:0,
-            totalGB:0,
-            expiryTime:0,
-            tgId:"",
-            subId:""
-          }],
-          decryption:"none",
-          encryption:"none"
-        }'
-    )"
+    short_id="$(openssl rand -hex 8)" || return 1
 
-    stream_settings="$(
-        jq -cn \
-          --arg sni "$sni" \
-          --arg privateKey "$private_key" \
-          --arg shortId "$short_id" '{
-            network:"tcp",
-            security:"reality",
-            realitySettings:{
-              show:false,
-              xver:0,
-              dest:($sni + ":443"),
-              serverNames:[$sni],
-              privateKey:$privateKey,
-              shortIds:[$shortId]
-            }
-          }'
-    )"
+    local settings stream sniffing payload
+    settings="$(jq -cn --arg id "$uuid" '{
+      clients:[{id:$id,flow:"xtls-rprx-vision",email:"",limitIp:0,totalGB:0,expiryTime:0,enable:true}],
+      decryption:"none",
+      fallbacks:[]
+    }')"
+
+    stream="$(jq -cn \
+        --arg dest "${target}:443" \
+        --arg server "$server_name" \
+        --arg private "$private_key" \
+        --arg sid "$short_id" '{
+          network:"tcp",
+          security:"reality",
+          externalProxy:[],
+          realitySettings:{
+            show:false,
+            xver:0,
+            dest:$dest,
+            serverNames:[$server],
+            privateKey:$private,
+            minClientVer:"",
+            maxClientVer:"",
+            maxTimeDiff:0,
+            shortIds:[$sid]
+          },
+          tcpSettings:{acceptProxyProtocol:false,header:{type:"none"}}
+        }')"
 
     sniffing='{"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false,"routeOnly":false}'
 
-    echo
-    echo "备注：$remark"
-    echo "协议：VLESS + REALITY"
-    echo "端口：$port"
-    echo "SNI：$sni"
-    echo "UUID：$uuid"
-    echo "shortId：$short_id"
-    echo
+    payload="$(jq -cn \
+        --arg remark "$remark" \
+        --argjson port "$port" \
+        --arg settings "$settings" \
+        --arg stream "$stream" \
+        --arg sniff "$sniffing" '{
+          remark:$remark,
+          enable:true,
+          listen:"",
+          port:$port,
+          protocol:"vless",
+          settings:$settings,
+          streamSettings:$stream,
+          tag:"",
+          sniffing:$sniff
+        }')"
 
-    read -r -p "确认提交创建请求？[y/N]：" confirm
-    case "$confirm" in
-        y|Y|yes|YES) ;;
-        *) info "已取消。"; return 0 ;;
-    esac
+    api_get "panel/api/inbounds/list" || return 1
 
-    status="$(
-        http_request POST "${API_PREFIX}/inbounds/add" \
-          -H "X-CSRF-Token: $CSRF_TOKEN" \
-          --data-urlencode "remark=$remark" \
-          --data-urlencode "enable=true" \
-          --data-urlencode "listen=" \
-          --data-urlencode "port=$port" \
-          --data-urlencode "protocol=vless" \
-          --data-urlencode "settings=$settings" \
-          --data-urlencode "streamSettings=$stream_settings" \
-          --data-urlencode "sniffing=$sniffing" \
-          --data-urlencode "expiryTime=0" \
-          --data-urlencode "total=0" \
-          --data-urlencode "up=0" \
-          --data-urlencode "down=0"
-    )"
-
-    if [[ "$status" != "200" ]]; then
-        err "创建请求失败，HTTP $status"
-        [[ -s "$BODY" ]] && head -c 800 "$BODY" && echo
+    local code
+    code="$(curl -sS -o "$HTTP_BODY" -w '%{http_code}' \
+        --connect-timeout 5 --max-time 30 \
+        -c "$COOKIE_FILE" -b "$COOKIE_FILE" \
+        -H 'Content-Type: application/json' \
+        -H 'Accept: application/json' \
+        -X POST \
+        --data "$payload" \
+        "${PANEL_ROOT}panel/api/inbounds/add" 2>/dev/null)" || {
+        err "创建入站请求失败。"
         return 1
-    fi
+    }
 
-    if ! jq -e '
-        .success == true or
-        .success == "true" or
-        .success == 1
-    ' "$BODY" >/dev/null 2>&1; then
-        err "面板未确认创建成功："
-        jq . "$BODY" 2>/dev/null || cat "$BODY"
+    if [[ "$code" != "200" ]] ||
+       ! jq -e '.success == true' "$HTTP_BODY" >/dev/null 2>&1; then
+        err "面板拒绝创建入站，HTTP $code。"
+        jq . "$HTTP_BODY" 2>/dev/null || cat "$HTTP_BODY"
+        echo
         return 1
     fi
 
     ok "面板已接受创建请求。"
-    echo "UUID：$uuid"
+    echo
+    echo "===== 本次生成的连接参数 ====="
+    echo "协议：VLESS"
+    echo "地址：请填写本机公网 IPv4 或已解析域名"
     echo "端口：$port"
-    echo "SNI：$sni"
-    echo "公钥：$public_key"
-    echo "shortId：$short_id"
-    warn "请在面板确认入站配置有效后再使用。"
+    echo "UUID：$uuid"
+    echo "传输：TCP"
+    echo "安全：REALITY"
+    echo "Flow：xtls-rprx-vision"
+    echo "SNI：$server_name"
+    echo "Public Key：$public_key"
+    echo "Short ID：$short_id"
+    echo "Fingerprint：chrome"
+    echo
+    warn "请确认面板中该入站已出现，并确认端口可从公网访问。"
+    warn "若面板版本不接受该 API 数据结构，请检查面板返回内容及版本对应的 API 格式。"
 }
 
-check_config() {
-    setup_urls
-
+service_menu() {
     echo
-    echo "===== 配置文件 ====="
-    ls -l "$CONFIG_FILE" "$INSTALL_RESULT" "$DB_FILE" 2>/dev/null || true
+    echo "===== X-UI 服务管理 ====="
+    echo "1. 查看服务状态"
+    echo "2. 查看最近 100 行日志"
+    echo "3. 重启 X-UI"
+    echo "4. 返回"
+    read -r -p "请选择 [1-4]: " choice
 
-    echo
-    echo "===== 服务状态 ====="
-    systemctl is-active x-ui 2>/dev/null || true
-
-    echo
-    echo "===== 面板首页测试 ====="
-    curl -sS --connect-timeout 3 --max-time 5 \
-      -o /dev/null -w 'HTTP_CODE=%{http_code}\n' \
-      "${PANEL_ROOT}/" 2>&1 || true
-
-    echo
-    echo "===== CSRF 接口测试 ====="
-    curl -sS --connect-timeout 3 --max-time 5 \
-      -w '\nHTTP_CODE=%{http_code}\n' \
-      "${CSRF_URL}" 2>&1 || true
-}
-
-show_status() {
-    echo
-    systemctl status x-ui --no-pager -l 2>&1 | head -n 40 || true
-
-    echo
-    echo "===== 最近 60 行日志 ====="
-    journalctl -u x-ui -n 60 --no-pager 2>&1 || true
-}
-
-restart_service() {
-    local answer
-    read -r -p "确认重启 x-ui？[y/N]：" answer
-
-    case "$answer" in
-        y|Y|yes|YES)
+    case "$choice" in
+        1)
+            systemctl --no-pager --full status x-ui || true
+            ;;
+        2)
+            journalctl -u x-ui -n 100 --no-pager || true
+            ;;
+        3)
             if systemctl restart x-ui; then
-                sleep 2
-                systemctl is-active --quiet x-ui &&
-                    ok "x-ui 正在运行。" ||
-                    err "服务未处于 active 状态，请检查日志。"
+                ok "重启命令已执行。"
+                systemctl --no-pager --full status x-ui | head -n 18 || true
             else
-                err "重启失败。"
+                err "重启失败，请检查日志。"
             fi
             ;;
-        *) info "已取消。" ;;
+        4) return ;;
+        *) warn "无效选项。" ;;
     esac
 }
 
 main_menu() {
     while true; do
-        echo
-        echo "================================================"
-        echo "       瞎折腾吧 | 3x-ui 节点管理器"
-        echo "================================================"
-        echo "面板端口：$PANEL_PORT"
-        echo "Base Path：$BASE_PATH"
-        echo "------------------------------------------------"
-        echo "1. 检查配置与 CSRF 接口"
-        echo "2. 登录并列出节点"
-        echo "3. 创建 VLESS + REALITY 节点"
-        echo "4. 查看服务状态与日志"
-        echo "5. 重启 x-ui"
-        echo "6. 更换本次使用的面板账号"
-        echo "7. 退出"
-        echo "------------------------------------------------"
+        clear 2>/dev/null || true
+        echo "============================================================"
+        echo "  $APP_NAME"
+        echo "============================================================"
+        echo "面板：${PANEL_ROOT}"
+        echo "------------------------------------------------------------"
+        echo "  1. 配置面板连接信息"
+        echo "  2. 检查配置、HTTP 与 CSRF"
+        echo "  3. 登录面板并列出入站"
+        echo "  4. 创建 VLESS + REALITY 入站"
+        echo "  5. 服务状态、日志与重启"
+        echo "  6. 保存当前配置"
+        echo "  0. 退出"
+        echo "============================================================"
 
-        local choice
-        read -r -p "请选择：" choice
+        read -r -p "请选择 [0-6]: " choice || break
 
         case "$choice" in
-            1) check_config; pause ;;
-            2) list_nodes; pause ;;
-            3) create_reality_node; pause ;;
-            4) show_status; pause ;;
-            5) restart_service; pause ;;
-            6)
-                USERNAME=""
-                PASSWORD=""
-                prompt_credentials
-                pause
-                ;;
-            7) info "已退出。"; return 0 ;;
-            *) warn "无效选项。" ;;
+            1) configure_panel; pause ;;
+            2) check_config; pause ;;
+            3) list_inbounds; pause ;;
+            4) create_reality; pause ;;
+            5) service_menu; pause ;;
+            6) save_config; pause ;;
+            0) echo "已退出。"; break ;;
+            *) warn "无效选项。"; pause ;;
         esac
     done
 }
 
 main() {
     need_root
-    check_dependencies
-
-    if ! command -v x-ui >/dev/null 2>&1; then
-        err "没有找到 x-ui 命令。请先安装 3x-ui。"
-        exit 1
-    fi
-
-    WORK="$(mktemp -d /tmp/xui-manager.XXXXXX)"
-    chmod 700 "$WORK"
-    BODY="$WORK/response.json"
-    COOKIE="$WORK/cookies.txt"
-    CURL_ERROR="$WORK/curl-error.txt"
-
+    install_deps || exit 1
     load_config
-    setup_urls
 
-    if [[ -z "$USERNAME" || -z "$PASSWORD" ]]; then
-        prompt_credentials || exit 1
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo
+        warn "首次运行：请先进入菜单 1 配置面板连接信息。"
     fi
 
     main_menu
 }
 
 main "$@"
-BASH
+SCRIPT_EOF
 
-chmod 700 /usr/local/bin/xiazheteng-node-manager.sh
-bash -n /usr/local/bin/xiazheteng-node-manager.sh &&
-echo '[成功] Bash 语法检查通过'
-```
-
-运行：
-
-```bash
-/usr/local/bin/xiazheteng-node-manager.sh
-```
-
-如果需要让 `x` 直接打开管理器：
-
-```bash
-cat > /usr/local/bin/x <<'EOF'
-#!/usr/bin/env bash
-exec /usr/local/bin/xiazheteng-node-manager.sh "$@"
-EOF
-chmod 700 /usr/local/bin/x
-```
-
-注意：这份脚本的 CSRF 解析已包含你实际接口返回的 `.obj` 字段。节点创建 API 的字段兼容性仍需以你安装的 3x-ui 版本实际响应验证；首次建议先用菜单 1 测试配置，再用菜单 2 测试登录和读取节点，确认正常后再创建节点。
+chmod 700 /root/xiazheteng-node-manager.sh
+bash -n /root/xiazheteng-node-manager.sh || exit 1
+exec bash /root/xiazheteng-node-manager.sh
