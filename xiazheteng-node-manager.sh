@@ -296,6 +296,15 @@ api_login() {
     log "[成功] 3x-ui API 登录成功。"
 }
 
+api_response_summary() {
+    local response="${1:-}" summary
+    summary="$(jq -c '{success,msg,errmsg,code,obj:(if (.obj|type)=="object" then {id:.obj.id,port:.obj.port,protocol:.obj.protocol,remark:.obj.remark} else .obj end)}' <<< "$response" 2>/dev/null || true)"
+    if [[ -z "$summary" ]]; then
+        if [[ -z "$response" ]]; then summary='(空响应)'; else summary='(响应不是有效 JSON 或没有可显示内容)'; fi
+    fi
+    printf '%s' "$summary"
+}
+
 api_post() {
     local endpoint="$1" body="$2"
     local root csrf response
@@ -325,11 +334,11 @@ api_post() {
     if ! jq -e '.success == true' >/dev/null 2>&1 <<< "$response"; then
         log "[失败] 3x-ui API 操作失败：$endpoint"
         # Avoid printing the full payload: some responses may contain client secrets.
-        log "[诊断] API 响应摘要：$(jq -c '{success,msg,errmsg,code,obj:(if (.obj|type)=="object" then {id:.obj.id,port:.obj.port,protocol:.obj.protocol,remark:.obj.remark} else .obj end)}' <<< "$response" 2>/dev/null || printf '%s' '响应不是有效 JSON')"
+        log "[诊断] API 响应摘要：$(api_response_summary "$response")"
         return 1
     fi
 
-    log "[诊断] API 响应摘要：$(jq -c '{success,msg,errmsg,code,obj:(if (.obj|type)=="object" then {id:.obj.id,port:.obj.port,protocol:.obj.protocol,remark:.obj.remark} else .obj end)}' <<< "$response" 2>/dev/null || printf '%s' '响应不是有效 JSON')"
+    log "[诊断] API 响应摘要：$(api_response_summary "$response")"
     printf '%s' "$response"
 }
 
@@ -348,7 +357,7 @@ verify_inbound_saved() {
 
     if ! jq -e '.success == true' >/dev/null 2>&1 <<< "$list"; then
         log "[失败] API 已返回成功，但创建后无法读取入站列表。"
-        log "[诊断] 入站列表响应摘要：$(jq -c '{success,msg,errmsg,code}' <<< "$list" 2>/dev/null || printf '%s' '响应不是有效 JSON')"
+        log "[诊断] 入站列表响应摘要：$(api_response_summary "$list")"
         return 1
     fi
 
@@ -362,7 +371,7 @@ verify_inbound_saved() {
     fi
 
     log "[失败] API 返回 success=true，但入站列表中不存在 $protocol / $port。"
-    log "[诊断] 创建响应摘要：$(jq -c '{success,msg,errmsg,code,obj:(if (.obj|type)=="object" then {id:.obj.id,port:.obj.port,protocol:.obj.protocol,remark:.obj.remark} else .obj end)}' <<< "$API_LAST_RESPONSE" 2>/dev/null || printf '%s' '响应不是有效 JSON')"
+    log "[诊断] 创建响应摘要：$(api_response_summary "$API_LAST_RESPONSE")"
     log "[诊断] 当前入站列表中相关协议/端口："
     jq -r --argjson p "$port" --arg proto "$protocol" \
         '.obj[]? | select((.port|tonumber)==$p or .protocol==$proto) | "[入站] id=\(.id // "?") protocol=\(.protocol // "?") port=\(.port // "?") enable=\(.enable // false) remark=\(.remark // "")"' \
@@ -621,9 +630,9 @@ create_reality() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --arg settings "$settings" \
-        --arg stream "$stream" \
-        --arg sniff "$sniff" \
+        --argjson settings "$settings" \
+        --argjson stream "$stream" \
+        --argjson sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",port:$port,protocol:"vless",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
@@ -675,9 +684,9 @@ create_tls() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --arg settings "$settings" \
-        --arg stream "$stream" \
-        --arg sniff "$sniff" \
+        --argjson settings "$settings" \
+        --argjson stream "$stream" \
+        --argjson sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",port:$port,protocol:"vless",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
@@ -712,9 +721,9 @@ create_vmess() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --arg settings "$settings" \
-        --arg stream "$stream" \
-        --arg sniff "$sniff" \
+        --argjson settings "$settings" \
+        --argjson stream "$stream" \
+        --argjson sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",port:$port,protocol:"vmess",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
@@ -755,9 +764,9 @@ create_shadowsocks() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --arg settings "$settings" \
-        --arg stream "$stream" \
-        --arg sniff "$sniff" \
+        --argjson settings "$settings" \
+        --argjson stream "$stream" \
+        --argjson sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",port:$port,protocol:"shadowsocks",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
