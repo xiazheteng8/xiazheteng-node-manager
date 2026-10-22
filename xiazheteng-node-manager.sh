@@ -886,44 +886,6 @@ remove_last_generated_node() {
     fi
 }
 
-# 当新建入站端口迟迟未监听时，通过 3x-ui API 仅重载 Xray 核心一次。
-# 不重启 x-ui 服务本身；重载 Xray 时现有节点可能短暂中断。
-XRAY_RECOVERY_ATTEMPTED=0
-recover_xray_if_inactive() {
-    local root csrf response
-    (( XRAY_RECOVERY_ATTEMPTED == 0 )) || return 1
-    XRAY_RECOVERY_ATTEMPTED=1
-
-    [[ -s "$COOKIE" && -s "$API_ROOT_FILE" ]] || {
-        log "[警告] API 会话不可用，无法自动尝试恢复 Xray 核心。"
-        return 1
-    }
-
-    root="$(cat "$API_ROOT_FILE")"
-    csrf="$(curl -fsS --max-time 8 -b "$COOKIE" \
-        "${root}csrf-token" 2>/dev/null | jq -r '.obj // empty' 2>/dev/null || true)"
-
-    log "[修复] 新建入站端口未监听，尝试通过 3x-ui API 重载 Xray 核心（可能短暂影响现有节点）。"
-    if [[ -n "$csrf" ]]; then
-        response="$(curl -sS --max-time 20 -X POST \
-            -b "$COOKIE" -c "$COOKIE" -H "X-CSRF-Token: $csrf" \
-            "${root}panel/api/server/restartXrayService" 2>&1 || true)"
-    else
-        response="$(curl -sS --max-time 20 -X POST \
-            -b "$COOKIE" -c "$COOKIE" \
-            "${root}panel/api/server/restartXrayService" 2>&1 || true)"
-    fi
-
-    if jq -e '.success == true' >/dev/null 2>&1 <<< "$response"; then
-        log "[修复] 3x-ui 已接受 Xray 核心重启请求。"
-        sleep 5
-        return 0
-    fi
-
-    log "[警告] 3x-ui 未确认 Xray 核心重启成功：$response"
-    return 1
-}
-
 verify_inbound_port() {
     local port="$1"
     local i tcp_found=0 udp_found=0
@@ -931,29 +893,18 @@ verify_inbound_port() {
     # 3x-ui 的 API 返回成功后，Xray 重载配置可能仍需要数秒。
     # 最多等待 20 秒，避免重载窗口内过早判定失败。
     for i in $(seq 1 20); do
-        if ss -H -lnt 2>/dev/null | awk -v p=":$port" '$4 ~ (p "$" ) {found=1} END {exit !found}'; then
+        if ss -H -lnt 2>/dev/null | awk -v p=":$port" '$4 ~ (p "$") {found=1} END {exit !found}'; then
             log "[成功] TCP 端口 $port 正在监听。"
             return 0
         fi
         sleep 1
     done
 
-    # 如果 Xray 完全没有监听，自动尝试一次核心恢复，然后再次验证目标端口。
-    if recover_xray_if_inactive; then
-        for i in $(seq 1 15); do
-            if ss -H -lnt 2>/dev/null | awk -v p=":$port" '$4 ~ (p "$" ) {found=1} END {exit !found}'; then
-                log "[成功] Xray 核心恢复后，TCP 端口 $port 已开始监听。"
-                return 0
-            fi
-            sleep 1
-        done
-    fi
-
     if ss -H -lnu 2>/dev/null | awk -v p=":$port" '$4 ~ (p "$") {found=1} END {exit !found}'; then
         udp_found=1
     fi
 
-    log "[失败] 等待自动恢复流程结束后，仍未检测到 TCP 端口 $port 监听。"
+    log "[失败] 等待 20 秒后，仍未检测到 TCP 端口 $port 监听。"
     (( udp_found == 1 )) && log "[诊断] 发现 UDP $port，但该节点还需要 TCP 监听；UDP 存在不能视为节点可用。"
     log "[诊断] 当前相关监听："
     ss -H -lntup 2>/dev/null | awk -v p=":$port" '$0 ~ p {print "[端口] " $0}' | while IFS= read -r line; do log "$line"; done
