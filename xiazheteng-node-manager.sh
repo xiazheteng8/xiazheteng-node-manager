@@ -2,295 +2,452 @@
 #!/usr/bin/env bash
 # ============================================================
 # 瞎折腾吧 | 3x-ui 节点管理器
-# 单文件版：复用已有 3x-ui，保留现有数据库和节点
-# 修复：先获取 CSRF Token，再登录；POST 请求携带 CSRF Header
+# 功能：自动识别配置、CSRF 登录、列出节点、创建 REALITY 节点
+#       查看日志、重启 x-ui
+# 数据库：只读读取配置，不删除或重建数据库
 # ============================================================
 
-set -Eeuo pipefail
+set -uo pipefail
 umask 077
 
+APP_NAME="瞎折腾吧 | 3x-ui 节点管理器"
 DB="/etc/x-ui/x-ui.db"
-WORK="/tmp/xiazheteng-node-manager"
-mkdir -p "$WORK"
-chmod 700 "$WORK"
-
+CONFIG_FILE="/etc/x-ui/node-manager.env"
+WORK="/tmp/xui-node-manager-$$"
 COOKIE="$WORK/cookies.txt"
 BODY="$WORK/response.json"
 LOGIN_JSON="$WORK/login.json"
 INBOUND_JSON="$WORK/inbound.json"
 
-RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'
-BLUE='\033[36m'; RESET='\033[0m'
+PANEL_PORT="22682"
+BASE_PATH=""
+PANEL_ORIGIN=""
+PANEL_ROOT=""
+LOGIN_URL=""
+CSRF_URL=""
+API_PREFIX=""
+USERNAME=""
+PASSWORD=""
+CSRF_TOKEN=""
+LOGIN_OK=0
 
-info(){ echo -e "${BLUE}[信息]${RESET} $*"; }
-ok(){ echo -e "${GREEN}[成功]${RESET} $*"; }
-warn(){ echo -e "${YELLOW}[警告]${RESET} $*"; }
-err(){ echo -e "${RED}[错误]${RESET} $*" >&2; }
+mkdir -p "$WORK"
+chmod 700 "$WORK"
+touch "$COOKIE" "$BODY"
+trap 'rm -rf "$WORK"' EXIT
 
-[[ $EUID -eq 0 ]] || { err "请使用 root 运行。"; exit 1; }
+# ---------- 基础工具 ----------
 
-for c in curl python3 openssl sqlite3; do
-    command -v "$c" >/dev/null 2>&1 || {
-        err "缺少依赖：$c"
-        echo "Debian/Ubuntu：apt-get update && apt-get install -y curl python3 openssl sqlite3"
-        exit 1
-    }
-done
+info() { printf '\033[36m[信息]\033[0m %s\n' "$*"; }
+ok()   { printf '\033[32m[成功]\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m[提示]\033[0m %s\n' "$*"; }
+err()  { printf '\033[31m[错误]\033[0m %s\n' "$*" >&2; }
 
-# 从 settings 表读取配置；只读访问数据库
-db_setting() {
-    local key="$1"
-    [[ -f "$DB" ]] || return 1
-
-    python3 - "$DB" "$key" <<'PY'
-import sqlite3, sys
-db, wanted = sys.argv[1:]
-aliases = {
-    "username": ["username", "webUser", "webUsername"],
-    "password": ["password", "webPass", "webPassword"],
-    "webPort": ["webPort", "port"],
-    "webBasePath": ["webBasePath", "basePath", "webPath"],
+pause() {
+    echo
+    read -r -p "按回车键继续……" _
 }
+
+need_commands() {
+    local missing=()
+    for c in curl python3; do
+        command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+    done
+
+    if ((${#missing[@]})); then
+        err "缺少依赖：${missing[*]}"
+        echo "Debian/Ubuntu 可执行：apt-get update && apt-get install -y curl python3"
+        return 1
+    fi
+    return 0
+}
+
+json_get() {
+    # 用法：json_get 文件 字段
+    python3 - "$1" "$2" <<'PY'
+import json,sys
 try:
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    tables = [r[0] for r in con.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    )]
-    for table in tables:
-        cols = [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
-        if "key" in cols and "value" in cols:
-            for key in aliases.get(wanted, [wanted]):
-                row = con.execute(
-                    f'SELECT value FROM "{table}" WHERE key=? LIMIT 1',
-                    (key,)
-                ).fetchone()
-                if row and row[0] is not None and str(row[0]):
-                    print(str(row[0]))
-                    sys.exit(0)
-    con.close()
+    with open(sys.argv[1], encoding="utf-8") as f:
+        obj=json.load(f)
+    value=obj
+    for part in sys.argv[2].split("."):
+        if isinstance(value, dict):
+            value=value.get(part)
+        else:
+            value=None
+            break
+    if isinstance(value, (dict,list)):
+        print(json.dumps(value, ensure_ascii=False))
+    elif value is not None:
+        print(value)
 except Exception:
     pass
-sys.exit(1)
 PY
 }
 
-normalise_path() {
-    local p="${1:-/}"
+is_true_json() {
+    [[ "$(json_get "$1" success)" == "True" ||
+       "$(json_get "$1" success)" == "true" ]]
+}
+
+valid_base_path() {
+    local p="$1"
     [[ "$p" == /* ]] || p="/$p"
     [[ "$p" == */ ]] || p="$p/"
     printf '%s' "$p"
 }
 
-discover_panel() {
-    PANEL_PORT="$(db_setting webPort 2>/dev/null || true)"
-    PANEL_BASE="$(db_setting webBasePath 2>/dev/null || true)"
-    PANEL_USER="$(db_setting username 2>/dev/null || true)"
-    PANEL_PASS="$(db_setting password 2>/dev/null || true)"
+# ---------- 从数据库只读发现配置 ----------
+# 仅读取 settings 表中的键值配置。
+# 不会将 users 表里的密码哈希当成明文密码。
 
-    if [[ ! "$PANEL_PORT" =~ ^[0-9]{1,5}$ ]]; then
-        err "无法从数据库识别面板端口。请检查 x-ui setting -show。"
-        return 1
+read_db_settings() {
+    [[ -f "$DB" ]] || return 0
+
+    python3 - "$DB" <<'PY'
+import sqlite3,sys
+db=sys.argv[1]
+try:
+    uri="file:"+db+"?mode=ro"
+    con=sqlite3.connect(uri, uri=True, timeout=3)
+    tables={r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    if "settings" not in tables:
+        sys.exit(0)
+
+    cols=[r[1] for r in con.execute("PRAGMA table_info(settings)")]
+    lower={c.lower():c for c in cols}
+    keycol=next((lower[k] for k in ("key","name","setting") if k in lower),None)
+    valcol=next((lower[k] for k in ("value","val","setting_value") if k in lower),None)
+    if not keycol or not valcol:
+        sys.exit(0)
+
+    rows=con.execute(
+        'SELECT "'+keycol+'","'+valcol+'" FROM settings'
+    ).fetchall()
+
+    wanted={
+        "webuser":"username", "webusername":"username",
+        "username":"username", "web_user":"username",
+        "webpass":"password", "webpassword":"password",
+        "password":"password", "web_pass":"password",
+        "webport":"port", "web_port":"port",
+        "webbasepath":"basepath", "web_base_path":"basepath",
+        "webpath":"basepath", "web_path":"basepath",
+    }
+    result={}
+    for k,v in rows:
+        if k is None or v is None:
+            continue
+        norm=str(k).strip().lower()
+        dest=wanted.get(norm)
+        if dest and str(v).strip():
+            result[dest]=str(v).strip()
+
+    # 只输出端口、路径和用户名；绝不输出密码。
+    for k in ("port","basepath","username"):
+        if result.get(k):
+            print(k+"="+result[k])
+
+    # 仅在本机 settings 明确保存了疑似明文值时输出给父进程。
+    # 哈希形式的值一律跳过。
+    pw=result.get("password","")
+    if pw:
+        low=pw.lower()
+        hashed=(
+            pw.startswith(("$2a$","$2b$","$2y$","$argon2","$scrypt$")) or
+            low.startswith(("pbkdf2:","sha256:","sha512:")) or
+            len(pw) >= 60 and all(c.isalnum() or c in "./$" for c in pw)
+        )
+        if not hashed:
+            # Base64 编码的多行内容也不适合作为密码自动提交。
+            if "\n" not in pw and "\r" not in pw:
+                print("password="+pw)
+
+    con.close()
+except Exception:
+    pass
+PY
+}
+
+# ---------- 可选凭据文件 ----------
+# 如需自行保存凭据，可建立：
+# /etc/x-ui/node-manager.env
+# 内容格式：
+# XUI_USERNAME='你的用户名'
+# XUI_PASSWORD='你的密码'
+# XUI_PANEL_PORT='22682'
+# XUI_BASE_PATH='/你的BasePath/'
+#
+# 文件权限必须为 600。脚本不会创建或覆盖这个文件。
+
+read_env_config() {
+    local f="$1"
+    [[ -f "$f" ]] || return 0
+
+    if [[ "$(stat -c '%a' "$f" 2>/dev/null || echo 777)" != "600" ]]; then
+        warn "凭据文件 $f 权限不是 600，跳过读取以避免泄露。"
+        return 0
     fi
 
-    PANEL_BASE="$(normalise_path "${PANEL_BASE:-/}")"
+    # 不 source 外部脚本；只读取简单 KEY=VALUE 行。
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*# || -z "$line" ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*(XUI_USERNAME|XUI_PASSWORD|XUI_PANEL_PORT|XUI_BASE_PATH)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local val="${BASH_REMATCH[2]}"
+            val="${val%\"}"; val="${val#\"}"
+            val="${val%\'}"; val="${val#\'}"
+            case "$key" in
+                XUI_USERNAME) [[ -n "$USERNAME" ]] || USERNAME="$val" ;;
+                XUI_PASSWORD) [[ -n "$PASSWORD" ]] || PASSWORD="$val" ;;
+                XUI_PANEL_PORT) [[ "$PANEL_PORT" != "22682" ]] || PANEL_PORT="$val" ;;
+                XUI_BASE_PATH) [[ -n "$BASE_PATH" ]] || BASE_PATH="$val" ;;
+            esac
+        fi
+    done < "$f"
+}
+
+discover_config() {
+    info "正在识别 3x-ui 配置……"
+
+    local dbout
+    dbout="$(read_db_settings 2>/dev/null || true)"
+
+    while IFS='=' read -r key val; do
+        case "$key" in
+            port) [[ "$PANEL_PORT" != "22682" ]] || PANEL_PORT="$val" ;;
+            basepath) [[ -n "$BASE_PATH" ]] || BASE_PATH="$val" ;;
+            username) [[ -n "$USERNAME" ]] || USERNAME="$val" ;;
+            password) [[ -n "$PASSWORD" ]] || PASSWORD="$val" ;;
+        esac
+    done <<< "$dbout"
+
+    read_env_config "$CONFIG_FILE"
+    read_env_config "/root/.config/x-ui-node-manager.env"
+    read_env_config "/root/.x-ui-credentials"
+
+    # 默认尝试从 3x-ui 数据库设置中读取 Base Path/端口；
+    # 如果没有取到，使用本次已知环境的端口与路径。
+    [[ "$PANEL_PORT" =~ ^[0-9]{1,5}$ ]] || PANEL_PORT="22682"
+    [[ -n "$BASE_PATH" ]] || BASE_PATH="/DzFtThyY0rcdykt4CC/"
+    BASE_PATH="$(valid_base_path "$BASE_PATH")"
+
     PANEL_ORIGIN="http://127.0.0.1:${PANEL_PORT}"
-    PANEL_ROOT="${PANEL_ORIGIN}${PANEL_BASE%/}"
+    PANEL_ROOT="${PANEL_ORIGIN}${BASE_PATH%/}"
     LOGIN_URL="${PANEL_ROOT}/login"
     CSRF_URL="${PANEL_ROOT}/csrf-token"
     API_PREFIX="${PANEL_ROOT}/panel/api"
 
-    info "面板端口：$PANEL_PORT"
-    info "Base Path：$PANEL_BASE"
+    echo "面板端口：$PANEL_PORT"
+    echo "Base Path：$BASE_PATH"
+    echo "用户名：$([[ -n "$USERNAME" ]] && echo "已识别（$USERNAME）" || echo "未识别")"
+    echo "密码：$([[ -n "$PASSWORD" ]] && echo "检测到可尝试的本机凭据" || echo "未发现可直接使用的明文密码")"
 }
 
-# 保存服务器返回内容并输出 HTTP 状态码
+# ---------- HTTP 请求 ----------
+# HTTP 状态码写入标准输出；响应体写入 BODY。
 request() {
-    local method="$1" url="$2"
+    local method="$1"
+    local url="$2"
     shift 2
-    curl -sS --connect-timeout 4 --max-time 20 \
-        -X "$method" -b "$COOKIE" -c "$COOKIE" \
-        -o "$BODY" -w '%{http_code}' "$url" "$@" \
-        2>"$WORK/curl-error.txt" || true
+
+    curl -sS --connect-timeout 4 --max-time 25 \
+        -X "$method" \
+        -b "$COOKIE" -c "$COOKIE" \
+        -o "$BODY" -w '%{http_code}' \
+        "$url" "$@" 2>"$WORK/curl-error.txt" || true
 }
 
-# 从响应 JSON 提取 obj；成功时打印令牌
-extract_csrf() {
-    python3 - "$BODY" <<'PY'
-import json, sys
-try:
-    d = json.load(open(sys.argv[1], encoding="utf-8"))
-    token = d.get("obj")
-    if d.get("success") and isinstance(token, str) and token:
-        print(token)
-        sys.exit(0)
-except Exception:
-    pass
-sys.exit(1)
-PY
-}
-
-# 统一验证 API JSON 响应中的 success 字段
-json_success() {
-    python3 - "$BODY" <<'PY'
-import json, sys
-try:
-    d = json.load(open(sys.argv[1], encoding="utf-8"))
-    sys.exit(0 if d.get("success") is True else 1)
-except Exception:
-    sys.exit(1)
-PY
-}
-
-show_response() {
-    python3 - "$BODY" <<'PY'
-import sys
-try:
-    s = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-    print(s[:1600] if s else "(空响应)")
-except Exception:
-    print("(无法读取响应)")
-PY
-}
-
-# 先获取 CSRF Token，再使用同一 Cookie Jar 登录
-api_login() {
-    discover_panel || return 1
-
-    if [[ -z "${PANEL_USER:-}" ]]; then
-        read -r -p "3x-ui 用户名：" PANEL_USER
-    else
-        info "已识别用户名字段。"
-    fi
-
-    if [[ -z "${PANEL_PASS:-}" ]]; then
-        read -r -s -p "3x-ui 密码：" PANEL_PASS
-        echo
-    else
-        info "已识别密码字段。"
-    fi
-
-    [[ -n "$PANEL_USER" && -n "$PANEL_PASS" ]] || {
-        err "用户名或密码为空。"
-        return 1
-    }
-
-    : > "$COOKIE"
-
+get_csrf() {
     info "正在获取 CSRF Token……"
+
     local status
-    status="$(request GET "$CSRF_URL")"
+    status="$(request GET "$CSRF_URL" -H 'Accept: application/json')"
 
     if [[ "$status" != "200" ]]; then
         err "获取 CSRF Token 失败，HTTP：$status"
-        show_response
-        [[ -s "$WORK/curl-error.txt" ]] && cat "$WORK/curl-error.txt"
+        cat "$WORK/curl-error.txt" 2>/dev/null
+        [[ -s "$BODY" ]] && cat "$BODY"
         return 1
     fi
 
-    CSRF_TOKEN="$(extract_csrf)" || {
-        err "响应中没有有效 CSRF Token："
-        show_response
+    CSRF_TOKEN="$(json_get "$BODY" obj)"
+    if [[ -z "$CSRF_TOKEN" || "$CSRF_TOKEN" == "null" ]]; then
+        err "响应中没有 CSRF Token。请检查 Base Path、端口和面板状态。"
+        cat "$BODY"
         return 1
-    }
+    fi
 
     ok "CSRF Token 获取成功。"
+    return 0
+}
 
-    python3 - "$LOGIN_JSON" "$PANEL_USER" "$PANEL_PASS" <<'PY'
-import json, sys
-path, user, password = sys.argv[1:]
-with open(path, "w", encoding="utf-8") as f:
-    json.dump({
-        "username": user,
-        "password": password
-    }, f)
+api_login() {
+    LOGIN_OK=0
+    discover_config
+
+    if [[ -z "$USERNAME" ]]; then
+        read -r -p "3x-ui 用户名：" USERNAME
+    fi
+
+    if [[ -z "$PASSWORD" ]]; then
+        read -r -s -p "3x-ui 密码：" PASSWORD
+        echo
+    else
+        info "将尝试本机已识别的凭据。"
+    fi
+
+    if [[ -z "$USERNAME" || -z "$PASSWORD" ]]; then
+        err "用户名或密码为空。"
+        return 1
+    fi
+
+    # 每次登录使用新的 Cookie 文件，避免旧会话干扰。
+    : > "$COOKIE"
+
+    get_csrf || return 1
+
+    python3 - "$LOGIN_JSON" "$USERNAME" "$PASSWORD" <<'PY'
+import json,sys
+with open(sys.argv[1],"w",encoding="utf-8") as f:
+    json.dump({"username":sys.argv[2],"password":sys.argv[3]},f)
 PY
     chmod 600 "$LOGIN_JSON"
 
     info "正在提交登录请求……"
+    local status
     status="$(request POST "$LOGIN_URL" \
         -H 'Content-Type: application/json' \
         -H 'Accept: application/json' \
         -H "X-CSRF-Token: $CSRF_TOKEN" \
         --data-binary "@$LOGIN_JSON")"
-    rm -f "$LOGIN_JSON"
 
-    if [[ "$status" == "200" ]] && json_success; then
+    if [[ "$status" == "200" ]] && is_true_json "$BODY"; then
+        LOGIN_OK=1
         ok "面板登录成功。"
         return 0
     fi
 
     err "面板登录失败，HTTP：$status"
-    show_response
+    local msg
+    msg="$(json_get "$BODY" msg)"
+    [[ -n "$msg" && "$msg" != "null" ]] && echo "原因：$msg"
 
-    if [[ "$status" == "403" ]]; then
-        warn "仍然返回 403：请检查登录限流、二步验证和 x-ui 日志。"
-        warn "本脚本不会重置密码、修改数据库或反复尝试登录。"
+    if grep -qiE 'Invalid username or password|Wrong username or password' "$BODY"; then
+        echo
+        warn "本机识别到的凭据不是可用的登录凭据，或面板启用了双重验证。"
+        echo "数据库中的密码哈希无法反向还原为原始密码。"
+        echo "请通过 x-ui 官方管理菜单查看/重置面板登录凭据后再运行脚本。"
+    elif [[ "$status" == "403" ]]; then
+        warn "HTTP 403：检查 Base Path、CSRF Token、访问策略或认证机制。"
     fi
+
+    [[ -s "$BODY" ]] && cat "$BODY"
     return 1
-}
-
-# API 的所有 POST 请求都附带当前会话的 CSRF Token
-api_post() {
-    local endpoint="$1" json_file="$2" status
-    status="$(request POST "${API_PREFIX}${endpoint}" \
-        -H 'Content-Type: application/json' \
-        -H 'Accept: application/json' \
-        -H "X-CSRF-Token: $CSRF_TOKEN" \
-        --data-binary "@$json_file")"
-
-    if [[ "$status" != "200" ]] || ! json_success; then
-        err "API 请求失败：$endpoint，HTTP：$status"
-        show_response
-        return 1
-    fi
-    return 0
 }
 
 api_get() {
-    local endpoint="$1" status
-    status="$(request GET "${API_PREFIX}${endpoint}" \
-        -H 'Accept: application/json' \
-        -H "X-CSRF-Token: $CSRF_TOKEN")"
+    local path="$1"
+    [[ "$LOGIN_OK" == "1" ]] || { err "尚未登录。"; return 1; }
 
-    if [[ "$status" != "200" ]] || ! json_success; then
-        err "API 请求失败：$endpoint，HTTP：$status"
-        show_response
+    local status
+    status="$(request GET "${API_PREFIX}${path}" \
+        -H 'Accept: application/json' \
+        -H "X-CSRF-Token: $CSRF_TOKEN")
+
+    if [[ "$status" != "200" ]]; then
+        err "API 请求失败，HTTP：$status"
+        [[ -s "$BODY" ]] && cat "$BODY"
+        return 1
+    fi
+
+    if grep -q '"success"[[:space:]]*:[[:space:]]*false' "$BODY"; then
+        err "API 返回失败："
+        cat "$BODY"
         return 1
     fi
     return 0
 }
 
-find_xray() {
-    local p
-    for p in /usr/local/x-ui/bin/xray /usr/local/bin/xray /usr/bin/xray; do
-        [[ -x "$p" ]] && { printf '%s' "$p"; return 0; }
-    done
-    command -v xray 2>/dev/null
+api_post_file() {
+    local path="$1"
+    local json_file="$2"
+    [[ "$LOGIN_OK" == "1" ]] || { err "尚未登录。"; return 1; }
+
+    local status
+    status="$(request POST "${API_PREFIX}${path}" \
+        -H 'Content-Type: application/json' \
+        -H 'Accept: application/json' \
+        -H "X-CSRF-Token: $CSRF_TOKEN" \
+        --data-binary "@$json_file")
+
+    if [[ "$status" != "200" ]]; then
+        err "API 请求失败，HTTP：$status"
+        [[ -s "$BODY" ]] && cat "$BODY"
+        return 1
+    fi
+
+    if ! is_true_json "$BODY"; then
+        err "API 返回失败："
+        cat "$BODY"
+        return 1
+    fi
+    return 0
 }
 
-get_public_ipv4() {
-    local ip
-    for url in https://api.ipify.org https://ipv4.icanhazip.com; do
-        ip="$(curl -4 -fsS --connect-timeout 3 --max-time 5 "$url" 2>/dev/null |
-            tr -d '[:space:]' || true)"
-        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-            printf '%s' "$ip"
-            return 0
-        fi
-    done
-    return 1
+# ---------- 节点列表 ----------
+
+list_inbounds() {
+    if [[ "$LOGIN_OK" != "1" ]]; then
+        api_login || return 1
+    fi
+
+    info "正在读取节点列表……"
+    api_get "/inbounds/list" || return 1
+
+    python3 - "$BODY" <<'PY'
+import json,sys
+try:
+    obj=json.load(open(sys.argv[1],encoding="utf-8"))
+    rows=obj.get("obj") or []
+    if isinstance(rows,dict):
+        rows=rows.get("inbounds") or []
+    if not rows:
+        print("当前没有可显示的节点。")
+    for x in rows:
+        print("-"*54)
+        print("ID：",x.get("id",""))
+        print("备注：",x.get("remark",""))
+        print("协议：",x.get("protocol",""))
+        print("端口：",x.get("port",""))
+        print("启用：",x.get("enable",""))
+        print("流量上限：",x.get("total",""))
+        print("到期时间：",x.get("expiryTime",""))
+        stream=x.get("streamSettings") or {}
+        reality=stream.get("realitySettings") or {}
+        print("传输：",stream.get("network",""))
+        print("安全：",stream.get("security",""))
+        print("目标：",reality.get("dest",""))
+except Exception as e:
+    print("解析节点列表失败：",e)
+    print(open(sys.argv[1],encoding="utf-8").read())
+PY
 }
 
-random_port() {
-    python3 - <<'PY'
-import socket, random
-for _ in range(200):
-    p = random.randint(20000, 60000)
-    s = socket.socket()
+# ---------- 创建 VLESS + REALITY ----------
+
+get_random_port() {
+    python3 <<'PY'
+import socket
+for port in range(20000,60000):
+    s=socket.socket()
     try:
-        s.bind(("0.0.0.0", p))
+        s.bind(("0.0.0.0",port))
+        print(port)
         s.close()
-        print(p)
         break
     except OSError:
         s.close()
@@ -298,259 +455,279 @@ PY
 }
 
 generate_reality_keys() {
-    local xray="$1" output
-    output="$("$xray" x25519 2>&1)" || {
-        err "Xray 生成密钥失败："
-        printf '%s\n' "$output"
+    local output
+    command -v xray >/dev/null 2>&1 || {
+        err "未找到 xray 命令，无法生成 REALITY 密钥。"
         return 1
     }
 
-    REALITY_PRIVATE_KEY="$(
-        printf '%s\n' "$output" |
-        sed -nE 's/^[[:space:]]*PrivateKey:[[:space:]]*([^[:space:]]+).*$/\1/p' |
-        head -n1
-    )"
-    REALITY_PUBLIC_KEY="$(
-        printf '%s\n' "$output" |
-        sed -nE 's/^[[:space:]]*Password:[[:space:]]*([^[:space:]]+).*$/\1/p' |
-        head -n1
-    )"
+    output="$(xray x25519 2>&1 || true)"
+    local priv pub
+    priv="$(printf '%s\n' "$output" | sed -nE 's/^[[:space:]]*PrivateKey:[[:space:]]*(.*)$/\1/p' | head -1)"
+    pub="$(printf '%s\n' "$output" | sed -nE 's/^[[:space:]]*(Password|PublicKey):[[:space:]]*(.*)$/\2/p' | head -1)"
 
-    # 兼容输出标签为 Private key / Public key 的版本
-    [[ -n "$REALITY_PRIVATE_KEY" ]] || REALITY_PRIVATE_KEY="$(
-        printf '%s\n' "$output" |
-        sed -nE 's/^[[:space:]]*Private[[:space:]]*key:[[:space:]]*([^[:space:]]+).*$/\1/p' |
-        head -n1
-    )"
-    [[ -n "$REALITY_PUBLIC_KEY" ]] || REALITY_PUBLIC_KEY="$(
-        printf '%s\n' "$output" |
-        sed -nE 's/^[[:space:]]*(Public[[:space:]]*key|PublicKey):[[:space:]]*([^[:space:]]+).*$/\2/p' |
-        head -n1
-    )"
-
-    if [[ -z "$REALITY_PRIVATE_KEY" || -z "$REALITY_PUBLIC_KEY" ]]; then
-        err "无法识别当前 Xray 的密钥输出格式："
-        printf '%s\n' "$output"
+    if [[ -z "$priv" || -z "$pub" ]]; then
+        echo "$output"
+        err "无法识别 xray x25519 密钥输出格式。"
         return 1
     fi
+
+    printf '%s\n%s\n' "$priv" "$pub"
 }
 
-add_reality_inbound() {
+create_reality_inbound() {
     api_login || return 1
 
-    local xray ip port uuid remark dest sni sid
-    xray="$(find_xray)" || { err "未找到 Xray。"; return 1; }
+    local remark port dest server_name flow uuid short_id keys private_key public_key
+    read -r -p "节点备注 [XT-Reality]：" remark
+    remark="${remark:-XT-Reality}"
 
-    ip="$(get_public_ipv4 || true)"
-    [[ -n "$ip" ]] || read -r -p "请输入服务器公网 IPv4：" ip
-
-    read -r -p "节点备注 [Xiazheteng-REALITY]：" remark
-    remark="${remark:-Xiazheteng-REALITY}"
+    read -r -p "监听端口（回车自动选择）：" port
+    if [[ -z "$port" ]]; then
+        port="$(get_random_port)"
+    fi
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
+        err "端口不合法。"
+        return 1
+    fi
 
     read -r -p "REALITY 目标域名 [www.microsoft.com]：" dest
     dest="${dest:-www.microsoft.com}"
-    sni="${dest%%:*}"
+    dest="${dest#https://}"
+    dest="${dest#http://}"
+    dest="${dest%/}"
+    [[ "$dest" == *:* ]] || dest="${dest}:443"
 
-    read -r -p "监听端口（留空自动选择）：" port
-    port="${port:-$(random_port)}"
+    server_name="${dest%:*}"
+    read -r -p "ServerName [$server_name]：" flow
+    server_name="${flow:-$server_name}"
 
-    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || {
-        err "端口无效。"
-        return 1
-    }
+    read -r -p "客户端 Flow [xtls-rprx-vision]：" flow
+    flow="${flow:-xtls-rprx-vision}"
 
-    if ss -lnt 2>/dev/null | awk '{print $4}' |
-        grep -Eq "(:|\])${port}$"; then
-        err "端口 $port 已被监听，请换一个端口。"
-        return 1
+    uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+    if [[ -z "$uuid" ]]; then
+        uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
     fi
 
-    uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-    sid="$(openssl rand -hex 8)"
-    generate_reality_keys "$xray" || return 1
+    short_id="$(openssl rand -hex 8 2>/dev/null || true)"
+    if [[ -z "$short_id" ]]; then
+        short_id="$(python3 -c 'import secrets; print(secrets.token_hex(8))')"
+    fi
 
-    export INBOUND_PORT="$port" INBOUND_REMARK="$remark"
-    export INBOUND_UUID="$uuid" REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY
-    export REALITY_SHORT_ID="$sid" REALITY_DEST="${dest}:443"
-    export REALITY_SERVER_NAME="$sni"
+    info "正在生成 REALITY 密钥……"
+    keys="$(generate_reality_keys)" || return 1
+    private_key="$(printf '%s\n' "$keys" | sed -n '1p')"
+    public_key="$(printf '%s\n' "$keys" | sed -n '2p')"
 
-    python3 - "$INBOUND_JSON" <<'PY'
-import json, os, sys
-
-port = int(os.environ["INBOUND_PORT"])
-uuid = os.environ["INBOUND_UUID"]
-remark = os.environ["INBOUND_REMARK"]
-private_key = os.environ["REALITY_PRIVATE_KEY"]
-short_id = os.environ["REALITY_SHORT_ID"]
-dest = os.environ["REALITY_DEST"]
-sni = os.environ["REALITY_SERVER_NAME"]
-
-settings = {
-    "clients": [{
-        "id": uuid,
-        "flow": "xtls-rprx-vision",
-        "email": "xiazheteng-" + str(port),
-        "enable": True,
-        "limitIp": 0,
-        "totalGB": 0,
-        "expiryTime": 0,
-        "tgId": "",
-        "subId": ""
-    }],
-    "decryption": "none",
-    "encryption": "none"
+    python3 - "$INBOUND_JSON" "$remark" "$port" "$dest" "$server_name" \
+        "$flow" "$uuid" "$short_id" "$private_key" <<'PY'
+import json,sys
+_,path,remark,port,dest,sni,flow,uuid,sid,priv=sys.argv
+data={
+ "enable":True,
+ "remark":remark,
+ "listen":"",
+ "port":int(port),
+ "protocol":"vless",
+ "settings":{
+   "clients":[{"id":uuid,"email":remark,"enable":True,"flow":flow}],
+   "decryption":"none",
+   "fallbacks":[]
+ },
+ "streamSettings":{
+   "network":"tcp",
+   "security":"reality",
+   "realitySettings":{
+     "show":False,
+     "xver":0,
+     "dest":dest,
+     "serverNames":[sni],
+     "privateKey":priv,
+     "shortIds":[sid],
+     "settings":{"publicKey":"","fingerprint":"chrome","serverName":"","spiderX":"/"}
+   }
+ },
+ "sniffing":{
+   "enabled":True,
+   "destOverride":["http","tls","quic"]
+ },
+ "allocate":{"strategy":"always","refresh":5,"concurrency":3}
 }
-stream = {
-    "network": "tcp",
-    "security": "reality",
-    "realitySettings": {
-        "show": False,
-        "xver": 0,
-        "dest": dest,
-        "serverNames": [sni],
-        "privateKey": private_key,
-        "shortIds": [short_id]
-    }
-}
-sniffing = {
-    "enabled": True,
-    "destOverride": ["http", "tls", "quic"],
-    "metadataOnly": False,
-    "routeOnly": False
-}
-payload = {
-    "up": 0, "down": 0, "total": 0,
-    "remark": remark, "enable": True, "expiryTime": 0,
-    "listen": "", "port": port, "protocol": "vless",
-    "settings": json.dumps(settings, separators=(",", ":")),
-    "streamSettings": json.dumps(stream, separators=(",", ":")),
-    "sniffing": json.dumps(sniffing, separators=(",", ":"))
-}
-with open(sys.argv[1], "w", encoding="utf-8") as f:
-    json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+with open(path,"w",encoding="utf-8") as f:
+    json.dump(data,f,ensure_ascii=False)
 PY
     chmod 600 "$INBOUND_JSON"
 
-    info "正在向 3x-ui 添加节点……"
-    api_post "/inbounds/add" "$INBOUND_JSON" || return 1
-    ok "面板已确认节点添加成功。"
+    info "正在创建 VLESS + REALITY 入站……"
+    if ! api_post_file "/inbounds/add" "$INBOUND_JSON"; then
+        err "创建失败。没有删除或覆盖现有节点。"
+        return 1
+    fi
 
+    ok "节点已提交创建请求。"
     echo
-    echo "========== 节点参数 =========="
     echo "备注：$remark"
-    echo "协议：VLESS + REALITY"
-    echo "服务器：$ip"
     echo "端口：$port"
     echo "UUID：$uuid"
-    echo "流控：xtls-rprx-vision"
-    echo "SNI：$sni"
-    echo "公钥：$REALITY_PUBLIC_KEY"
-    echo "Short ID：$sid"
-    echo "指纹：chrome"
-    echo "=============================="
-
+    echo "目标：$dest"
+    echo "ServerName：$server_name"
+    echo "Short ID：$short_id"
+    echo "Public Key：$public_key"
     echo
+    warn "请确认当前 3x-ui/Xray 版本接受该 REALITY 配置，并在防火墙/安全组放行 TCP $port。"
+    warn "如果面板返回的节点配置中没有保存 Public Key，请在面板中检查该入站的 REALITY 设置。"
+
+    # 尝试输出客户端 URI。公钥使用 xray x25519 输出中的 Password/PublicKey。
+    local encoded_remark
+    encoded_remark="$(python3 - "$remark" <<'PY'
+import sys,urllib.parse
+print(urllib.parse.quote(sys.argv[1],safe=""))
+PY
+)"
     echo "VLESS 分享链接："
-    python3 - "$uuid" "$ip" "$port" "$sni" "$REALITY_PUBLIC_KEY" "$sid" "$remark" <<'PY'
-import sys, urllib.parse
-uuid, ip, port, sni, key, sid, remark = sys.argv[1:]
-params = urllib.parse.urlencode({
-    "encryption": "none",
-    "flow": "xtls-rprx-vision",
-    "security": "reality",
-    "sni": sni,
-    "fp": "chrome",
-    "pbk": key,
-    "sid": sid,
-    "type": "tcp"
-})
-print(f"vless://{uuid}@{ip}:{port}?{params}#{urllib.parse.quote(remark)}")
-PY
-
+    echo "vless://${uuid}@YOUR_SERVER_IP:${port}?type=tcp&security=reality&encryption=none&pbk=${public_key}&fp=chrome&sni=${server_name}&sid=${short_id}&flow=${flow}#${encoded_remark}"
     echo
-    warn "请确认云安全组和服务器防火墙允许该 TCP 端口。"
+    warn "将 YOUR_SERVER_IP 替换成 VPS 公网 IPv4；请确认端口已开放。"
 }
 
-list_inbounds() {
-    api_login || return 1
-    api_get "/inbounds/list" || return 1
+# ---------- 服务状态与日志 ----------
 
-    python3 - "$BODY" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1], encoding="utf-8"))
-items = d.get("obj") or []
-if isinstance(items, dict):
-    items = items.get("inbounds") or []
-if not items:
-    print("没有获取到入站节点。")
-for x in items:
-    print("-" * 55)
-    print("ID：", x.get("id"))
-    print("备注：", x.get("remark"))
-    print("协议：", x.get("protocol"))
-    print("端口：", x.get("port"))
-    print("启用：", x.get("enable"))
-PY
-}
+show_status_logs() {
+    echo "===== x-ui 服务状态 ====="
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --no-pager --full status x-ui 2>&1 | head -45
+    else
+        service x-ui status 2>&1 || true
+    fi
 
-diagnose() {
-    discover_panel || return 1
-    echo
-    echo "===== 服务状态 ====="
-    systemctl is-active x-ui 2>/dev/null || true
     echo
     echo "===== 监听端口 ====="
-    ss -lntp 2>/dev/null | grep -E ":${PANEL_PORT}\b|x-ui|xray" || true
+    if command -v ss >/dev/null 2>&1; then
+        ss -lntp 2>/dev/null | grep -E ":(${PANEL_PORT}|2096)\\b" || true
+    else
+        netstat -lntp 2>/dev/null | grep -E ":(${PANEL_PORT}|2096)\\b" || true
+    fi
+
     echo
-    echo "===== 最近 15 分钟日志 ====="
-    journalctl -u x-ui --since "15 minutes ago" --no-pager -n 80 2>/dev/null || true
+    echo "===== 最近 60 行日志 ====="
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl -u x-ui -n 60 --no-pager 2>&1 || true
+    elif [[ -f /var/log/x-ui.log ]]; then
+        tail -60 /var/log/x-ui.log
+    else
+        warn "未找到可读取的 x-ui 日志。"
+    fi
 }
 
 restart_xui() {
-    read -r -p "重启 x-ui 会短暂中断面板服务，输入 YES 确认：" answer
-    [[ "$answer" == "YES" ]] || { info "已取消。"; return 0; }
-    systemctl restart x-ui
-    systemctl --no-pager --full status x-ui || true
+    echo
+    warn "重启 x-ui 会短暂中断面板和相关服务。"
+    read -r -p "确定重启？输入 YES 确认：" confirm
+    [[ "$confirm" == "YES" ]] || {
+        info "已取消。"
+        return 0
+    }
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart x-ui || {
+            err "重启失败。"
+            return 1
+        }
+    else
+        service x-ui restart || {
+            err "重启失败。"
+            return 1
+        }
+    fi
+
+    sleep 2
+    ok "已发送重启命令。"
+    systemctl --no-pager --full status x-ui 2>&1 | head -20 || true
 }
 
-while true; do
+check_config() {
+    discover_config
     echo
-    echo "=============================================="
-    echo " 瞎折腾吧 | 3x-ui 节点管理器"
-    echo "=============================================="
-    echo "1. 检查面板配置"
-    echo "2. 测试登录并列出节点"
-    echo "3. 创建 VLESS + REALITY 节点"
-    echo "4. 查看服务状态和日志"
-    echo "5. 重启 x-ui"
-    echo "0. 退出"
-    echo "=============================================="
-    read -r -p "请选择：" choice
+    echo "===== 服务信息 ====="
+    systemctl is-active x-ui 2>/dev/null || true
+    echo
+    echo "===== 本机 HTTP 连通性 ====="
+    curl -sS --connect-timeout 3 --max-time 5 \
+        -o /dev/null -w "HTTP 状态：%{http_code}\n" \
+        "${PANEL_ORIGIN}/" 2>/dev/null || echo "无法连接面板根路径"
+    echo
+    echo "===== 数据库文件 ====="
+    if [[ -r "$DB" ]]; then
+        ls -lh "$DB"
+    else
+        warn "无法读取数据库：$DB"
+    fi
+    echo
+    echo "注意：密码哈希不可逆恢复；脚本不会尝试暴力破解。"
+}
 
-    case "$choice" in
-        1)
-            discover_panel || true
-            ;;
-        2)
-            if api_login; then
-                list_inbounds || true
-            fi
-            ;;
-        3)
-            add_reality_inbound || true
-            ;;
-        4)
-            diagnose || true
-            ;;
-        5)
-            restart_xui
-            ;;
-        0)
-            rm -f "$COOKIE" "$LOGIN_JSON" "$INBOUND_JSON"
-            exit 0
-            ;;
-        *)
-            warn "无效选项。"
-            ;;
-    esac
-done
+# ---------- 主菜单 ----------
+
+main_menu() {
+    while true; do
+        echo
+        echo "=============================================="
+        echo "$APP_NAME"
+        echo "=============================================="
+        echo "1. 检查面板配置"
+        echo "2. 测试登录并列出节点"
+        echo "3. 创建 VLESS + REALITY 节点"
+        echo "4. 查看服务状态和日志"
+        echo "5. 重启 x-ui"
+        echo "0. 退出"
+        echo "=============================================="
+        read -r -p "请选择：" choice
+
+        case "$choice" in
+            1)
+                check_config
+                pause
+                ;;
+            2)
+                LOGIN_OK=0
+                if api_login; then
+                    list_inbounds
+                fi
+                pause
+                ;;
+            3)
+                create_reality_inbound
+                pause
+                ;;
+            4)
+                show_status_logs
+                pause
+                ;;
+            5)
+                restart_xui
+                pause
+                ;;
+            0)
+                echo "已退出。"
+                return 0
+                ;;
+            *)
+                warn "无效选项，请重新选择。"
+                ;;
+        esac
+    done
+}
+
+# ---------- 启动 ----------
+
+if [[ $EUID -ne 0 ]]; then
+    err "请使用 root 运行此脚本。"
+    exit 1
+fi
+
+need_commands || exit 1
+
+# 初始化已知环境；每次执行菜单时仍会重新发现可读取的配置。
+discover_config >/dev/null 2>&1 || true
+main_menu
