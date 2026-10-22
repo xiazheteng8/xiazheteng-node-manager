@@ -1,351 +1,483 @@
 
-cat > /root/xiazheteng-node-manager.sh <<'SCRIPT_EOF'
 #!/usr/bin/env bash
-
-# ============================================================
-# 瞎折腾吧 | 3x-ui 节点管理器
-# Version: 2.1.0
+# 瞎折腾吧 | VPS 一键节点部署器
 # Ubuntu 22.04 / Debian
-# ============================================================
+# 当前自动部署协议：VLESS REALITY、VMess TCP、Shadowsocks
 
+set -uo pipefail
 umask 077
 
-VERSION="2.1.0"
-LOG_DIR="/var/log/xiazheteng-node-manager"
-BACKUP_DIR="/var/backups/xiazheteng-node-manager"
-LOG_FILE="$LOG_DIR/run.log"
+APP="xiazheteng-node-manager"
+BASE="/opt/$APP"
+DATA="$BASE/data"
+ENV_FILE="$BASE/config.env"
+SUB_TOKEN_FILE="$BASE/subscription.token"
+SUB_PORT=18888
+LOG="/var/log/$APP.log"
 
-mkdir -p "$LOG_DIR" "$BACKUP_DIR" 2>/dev/null || {
-    echo "[错误] 无法创建日志或备份目录。"
-    exit 1
-}
+mkdir -p "$BASE" "$DATA" /var/log
+touch "$LOG"
+chmod 600 "$LOG"
 
-# 不使用 exec 重定向标准输入，避免影响菜单交互。
 log() {
-    local msg="$*"
-    printf '%s %s\n' "[$(date '+%F %T')]" "$msg" >> "$LOG_FILE"
-    printf '%s\n' "$msg"
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"
 }
 
-pause() {
-    echo
-    if [[ -r /dev/tty ]]; then
-        read -r -p "按回车继续..." _ </dev/tty || true
-    else
-        echo "[提示] 当前没有可交互终端。"
-    fi
-}
-
-is_root() {
-    if [[ "$(id -u)" -ne 0 ]]; then
-        echo "[错误] 请使用 root 用户运行。"
-        return 1
-    fi
-}
-
-on_error() {
-    local rc=$?
-    log "[错误] 命令失败，退出码=$rc，位置=${BASH_LINENO[0]:-未知}"
-    log "[提示] 日志文件：$LOG_FILE"
-    return 0
-}
-trap on_error ERR
-
-install_dependencies() {
-    local missing=()
-    local pkg
-
-    command -v curl >/dev/null 2>&1 || missing+=(curl)
-    command -v jq >/dev/null 2>&1 || missing+=(jq)
-    command -v openssl >/dev/null 2>&1 || missing+=(openssl)
-    command -v uuidgen >/dev/null 2>&1 || missing+=(uuid-runtime)
-    command -v ss >/dev/null 2>&1 || missing+=(iproute2)
-    command -v systemctl >/dev/null 2>&1 || missing+=(systemd)
-
-    dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null \
-        | grep -q 'install ok installed' \
-        || missing+=(ca-certificates)
-
-    if [[ "${#missing[@]}" -eq 0 ]]; then
-        log "[成功] 所需依赖均已安装。"
-        return 0
-    fi
-
-    # 去重
-    mapfile -t missing < <(printf '%s\n' "${missing[@]}" | sort -u)
-
-    log "[信息] 需要安装依赖：${missing[*]}"
-
-    if ! command -v apt-get >/dev/null 2>&1; then
-        log "[错误] 当前系统没有 apt-get，无法自动安装依赖。"
-        return 1
-    fi
-
-    log "[信息] 正在更新软件包索引..."
-    if ! apt-get update; then
-        log "[错误] apt-get update 失败。"
-        return 1
-    fi
-
-    log "[信息] 正在安装依赖..."
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        curl ca-certificates jq openssl uuid-runtime iproute2; then
-        log "[错误] 依赖安装失败。"
-        return 1
-    fi
-
-    # 安装后重新检查
-    local failed=()
-    command -v curl >/dev/null 2>&1 || failed+=(curl)
-    command -v jq >/dev/null 2>&1 || failed+=(jq)
-    command -v openssl >/dev/null 2>&1 || failed+=(openssl)
-    command -v uuidgen >/dev/null 2>&1 || failed+=(uuidgen)
-    command -v ss >/dev/null 2>&1 || failed+=(ss)
-
-    if [[ "${#failed[@]}" -gt 0 ]]; then
-        log "[错误] 以下命令安装后仍不可用：${failed[*]}"
-        return 1
-    fi
-
-    log "[成功] 依赖安装并复检通过。"
-    return 0
-}
-
-detect_xui() {
-    command -v x-ui >/dev/null 2>&1 && return 0
-
-    systemctl list-unit-files --no-legend 2>/dev/null \
-        | awk '{print $1}' \
-        | grep -qx 'x-ui.service' && return 0
-
-    [[ -x /usr/local/x-ui/x-ui ]] && return 0
-
+fail() {
+    log "[失败] $*"
     return 1
 }
 
-show_status() {
-    echo
-    echo "========== 3x-ui 状态 =========="
+pause() {
+    read -r -p "按回车继续..." _ </dev/tty || true
+}
 
+need_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "请使用 root 运行。"
+        exit 1
+    fi
+}
+
+install_dependencies() {
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update || return 1
+    apt-get install -y curl ca-certificates jq openssl python3 iproute2 uuid-runtime || return 1
+    command -v curl >/dev/null &&
+    command -v jq >/dev/null &&
+    command -v openssl >/dev/null &&
+    command -v python3 >/dev/null
+}
+
+get_public_ip() {
+    local ip
+    ip="$(curl -4 -fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf '%s' "$ip"
+    else
+        printf ''
+    fi
+}
+
+port_free() {
+    ! ss -H -lnt "( sport = :$1 )" 2>/dev/null | grep -q .
+}
+
+choose_port() {
+    local p
+    for p in "$@"; do
+        if port_free "$p"; then
+            printf '%s' "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+detect_xui() {
+    command -v x-ui >/dev/null 2>&1 ||
+    [[ -x /usr/local/x-ui/x-ui ]] ||
+    systemctl list-unit-files --no-legend 2>/dev/null |
+        awk '{print $1}' | grep -qx 'x-ui.service'
+}
+
+install_xui() {
     if detect_xui; then
-        echo "[检测] 已发现 3x-ui。"
-    else
-        echo "[提示] 未发现常见的 3x-ui 安装路径。"
+        log "[信息] 检测到已有 3x-ui，保留现有安装。"
+        return 0
     fi
 
-    if systemctl list-unit-files --no-legend 2>/dev/null \
-        | awk '{print $1}' | grep -qx 'x-ui.service'; then
-        systemctl --no-pager --full status x-ui || true
-    else
-        echo "[提示] 未找到 x-ui.service。"
-    fi
+    log "[信息] 正在运行 3x-ui 官方无人值守安装程序..."
+    XUI_NONINTERACTIVE=1 bash <(
+        curl -4 -fsSL --retry 3 \
+          https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh
+    ) || {
+        fail "3x-ui 官方安装程序失败。"
+        return 1
+    }
 
-    echo
-    echo "========== TCP 监听端口 =========="
-    if command -v ss >/dev/null 2>&1; then
-        ss -lntp || true
-    else
-        echo "[提示] ss 命令尚不可用。"
-    fi
+    systemctl enable --now x-ui || return 1
+    systemctl is-active --quiet x-ui || {
+        fail "3x-ui 服务未正常启动。"
+        return 1
+    }
+
+    log "[成功] 3x-ui 已安装并运行。"
 }
 
-show_logs() {
-    echo
-    echo "========== 3x-ui 服务日志 =========="
+read_credentials() {
+    local result="/etc/x-ui/install-result.env"
 
-    if systemctl list-unit-files --no-legend 2>/dev/null \
-        | awk '{print $1}' | grep -qx 'x-ui.service'; then
-        journalctl -u x-ui -n 100 --no-pager || true
-    else
-        echo "[提示] 未找到 x-ui.service。"
+    echo
+    echo "需要面板 API 登录凭据。"
+    echo "新安装时请使用官方安装程序生成的凭据；已有面板请使用当前凭据。"
+
+    if [[ -f "$result" ]]; then
+        echo "官方安装结果文件存在：$result"
+        echo "请查看其中的变量名称和实际字段，勿将密码发给他人。"
     fi
+
+    read -r -p "面板用户名：" XUI_USER </dev/tty
+    read -r -s -p "面板密码：" XUI_PASS </dev/tty
+    echo
+    read -r -p "面板端口 [默认 2053]：" XUI_PORT </dev/tty
+    XUI_PORT="${XUI_PORT:-2053}"
+    read -r -p "面板 Web 路径（例如 /abc123/）：" XUI_PATH </dev/tty
+
+    [[ "$XUI_PORT" =~ ^[0-9]+$ ]] || {
+        fail "面板端口格式不正确。"
+        return 1
+    }
+
+    [[ "$XUI_PATH" == /* && "$XUI_PATH" == */ ]] || {
+        fail "Web 路径必须以 / 开始并以 / 结束。"
+        return 1
+    }
+
+    cat > "$ENV_FILE" <<EOF
+XUI_USER=$(printf '%q' "$XUI_USER")
+XUI_PASS=$(printf '%q' "$XUI_PASS")
+XUI_PORT=$(printf '%q' "$XUI_PORT")
+XUI_PATH=$(printf '%q' "$XUI_PATH")
+EOF
+    chmod 600 "$ENV_FILE"
 }
 
-restart_xui() {
-    echo
-    if ! detect_xui; then
-        log "[错误] 未检测到 3x-ui，取消重启。"
+api_login() {
+    source "$ENV_FILE"
+
+    local root="http://127.0.0.1:${XUI_PORT}${XUI_PATH}"
+    local csrf response
+
+    COOKIE="$BASE/cookie.txt"
+    rm -f "$COOKIE"
+
+    csrf="$(curl -fsS --max-time 10 "$root/csrf-token" 2>/dev/null |
+        jq -r '.obj // empty' || true)"
+
+    local -a headers=()
+    [[ -n "$csrf" ]] && headers=(-H "X-CSRF-Token: $csrf")
+
+    response="$(curl -sS --max-time 15 \
+        -c "$COOKIE" -b "$COOKIE" \
+        -H 'Content-Type: application/json' \
+        "${headers[@]}" \
+        -d "$(jq -n --arg u "$XUI_USER" --arg p "$XUI_PASS" \
+            '{username:$u,password:$p}')" \
+        "$root/login" 2>/dev/null || true)"
+
+    if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$response"; then
+        fail "面板 API 登录失败。请确认用户名、密码、端口和 Web 路径。"
         return 1
     fi
 
-    if ! systemctl list-unit-files --no-legend 2>/dev/null \
-        | awk '{print $1}' | grep -qx 'x-ui.service'; then
-        log "[错误] 未找到 x-ui.service，无法通过 systemd 重启。"
-        return 1
-    fi
-
-    if systemctl restart x-ui; then
-        sleep 2
-        log "[成功] 已执行 3x-ui 重启。"
-        systemctl --no-pager --full status x-ui || true
-    else
-        log "[错误] 3x-ui 重启失败。"
-        return 1
-    fi
+    echo "$root" > "$BASE/api-root"
+    chmod 600 "$COOKIE" "$BASE/api-root"
+    log "[成功] 面板 API 登录成功。"
 }
 
-backup_xui() {
-    local stamp dest
-    local paths=()
+api_post() {
+    local endpoint="$1" body="$2"
+    local root csrf response
 
-    stamp="$(date '+%Y%m%d-%H%M%S')"
-    dest="$BACKUP_DIR/xui-backup-$stamp.tar.gz"
+    root="$(cat "$BASE/api-root")"
+    csrf="$(curl -fsS -b "$COOKIE" "$root/csrf-token" 2>/dev/null |
+        jq -r '.obj // empty' || true)"
 
-    [[ -e /etc/x-ui ]] && paths+=(etc/x-ui)
-    [[ -e /usr/local/x-ui ]] && paths+=(usr/local/x-ui)
+    response="$(curl -sS --max-time 20 \
+        -b "$COOKIE" -c "$COOKIE" \
+        -H 'Content-Type: application/json' \
+        ${csrf:+-H "X-CSRF-Token: $csrf"} \
+        -d "$body" \
+        "${root}panel/api/inbounds/$endpoint" 2>/dev/null || true)"
 
-    if [[ "${#paths[@]}" -eq 0 ]]; then
-        log "[错误] 未找到 /etc/x-ui 或 /usr/local/x-ui，无法创建备份。"
+    if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$response"; then
+        log "[失败] API 请求 $endpoint 失败：$response"
         return 1
     fi
+    printf '%s' "$response"
+}
 
-    if tar -czf "$dest" -C / "${paths[@]}"; then
-        chmod 600 "$dest"
-        log "[成功] 配置备份已保存：$dest"
-    else
-        rm -f "$dest"
-        log "[错误] 备份失败。"
+create_reality() {
+    local ip="$1" port="$2"
+    local uuid private public short remark body settings stream sniff response
+
+    uuid="$(cat /proc/sys/kernel/random/uuid)"
+    remark="ZT-VLESS-REALITY"
+    short="$(openssl rand -hex 8)"
+
+    local xray
+    xray="$(find /usr/local/x-ui /usr/local/bin -type f -name 'xray*' 2>/dev/null | head -n1)"
+    [[ -x "$xray" ]] || {
+        fail "没有找到可执行的 Xray 程序。"
         return 1
-    fi
+    }
+
+    local keys
+    keys="$("$xray" x25519 2>/dev/null || true)"
+    private="$(awk -F': *' '/PrivateKey:/ {print $2; exit}' <<<"$keys")"
+    public="$(awk -F': *' '/Password:/ {print $2; exit}' <<<"$keys")"
+    [[ -n "$public" ]] || public="$(awk -F': *' '/PublicKey:/ {print $2; exit}' <<<"$keys")"
+
+    [[ -n "$private" && -n "$public" ]] || {
+        fail "无法识别当前 Xray 的 x25519 输出格式。"
+        return 1
+    }
+
+    settings="$(jq -cn --arg id "$uuid" \
+        '{clients:[{id:$id,flow:"xtls-rprx-vision",email:$id}],decryption:"none"}')"
+
+    stream="$(jq -cn --arg pk "$private" --arg sid "$short" \
+        '{network:"tcp",security:"reality",realitySettings:{show:false,
+        dest:"www.microsoft.com:443",xver:0,
+        serverNames:["www.microsoft.com"],privateKey:$pk,
+        shortIds:[$sid]}}')"
+
+    sniff='{"enabled":true,"destOverride":["http","tls","quic"]}'
+
+    body="$(jq -cn \
+        --arg remark "$remark" \
+        --argjson port "$port" \
+        --arg settings "$settings" \
+        --arg stream "$stream" \
+        --arg sniff "$sniff" \
+        '{enable:true,remark:$remark,port:$port,protocol:"vless",
+        settings:$settings,streamSettings:$stream,sniffing:$sniff,
+        total:0,expiryTime:0}')"
+
+    response="$(api_post add "$body")" || return 1
+
+    printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
+        "$uuid" "$ip" "$port" "$public" "$short" "$remark" >> "$DATA/nodes.txt"
+
+    log "[成功] VLESS REALITY 入站已由面板 API 接受。"
 }
 
-show_ip_info() {
-    echo
-    echo "========== 本机网络 =========="
+create_vmess() {
+    local ip="$1" port="$2"
+    local uuid remark settings stream sniff body vmess_json encoded
 
-    if command -v ip >/dev/null 2>&1; then
-        ip -brief address || true
-        echo
-        ip route show default || true
-    else
-        hostname -I 2>/dev/null || true
-    fi
+    uuid="$(cat /proc/sys/kernel/random/uuid)"
+    remark="ZT-VMESS-TCP"
 
-    echo
-    echo "========== 公网 IPv4 =========="
-    if command -v curl >/dev/null 2>&1; then
-        curl -4 -fsS --connect-timeout 5 --max-time 10 \
-            https://api.ipify.org || echo "[提示] 公网 IPv4 查询失败。"
-        echo
-    else
-        echo "[提示] curl 尚未安装。"
-    fi
+    settings="$(jq -cn --arg id "$uuid" \
+        '{clients:[{id:$id,alterId:0,email:$id}],disableInsecureEncryption:false}')"
+    stream='{"network":"tcp","security":"none"}'
+    sniff='{"enabled":true,"destOverride":["http","tls"]}'
+
+    body="$(jq -cn --arg remark "$remark" --argjson port "$port" \
+        --arg settings "$settings" --arg stream "$stream" --arg sniff "$sniff" \
+        '{enable:true,remark:$remark,port:$port,protocol:"vmess",
+        settings:$settings,streamSettings:$stream,sniffing:$sniff,
+        total:0,expiryTime:0}')"
+
+    api_post add "$body" >/dev/null || return 1
+
+    vmess_json="$(jq -cn --arg add "$ip" --arg port "$port" --arg id "$uuid" \
+        --arg ps "$remark" \
+        '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",scy:"auto",
+        net:"tcp",type:"none",host:"",path:"",tls:""}')"
+    encoded="$(printf '%s' "$vmess_json" | base64 -w0)"
+
+    printf 'vmess://%s\n' "$encoded" >> "$DATA/nodes.txt"
+    log "[成功] VMess TCP 入站已由面板 API 接受。"
 }
 
-show_manager_logs() {
-    echo
-    echo "========== 管理器日志 =========="
-    if [[ -f "$LOG_FILE" ]]; then
-        tail -n 80 "$LOG_FILE"
-    else
-        echo "[提示] 尚无日志。"
+create_shadowsocks() {
+    local ip="$1" port="$2"
+    local password method remark settings stream sniff body userinfo encoded
+
+    password="$(openssl rand -base64 24 | tr -d '\n')"
+    method="aes-128-gcm"
+    remark="ZT-SHADOWSOCKS"
+
+    settings="$(jq -cn --arg p "$password" --arg m "$method" \
+        '{method:$m,password:$p,network:"tcp,udp",clients:[]}')"
+    stream='{"network":"tcp","security":"none"}'
+    sniff='{"enabled":true,"destOverride":["http","tls"]}'
+
+    body="$(jq -cn --arg remark "$remark" --argjson port "$port" \
+        --arg settings "$settings" --arg stream "$stream" --arg sniff "$sniff" \
+        '{enable:true,remark:$remark,port:$port,protocol:"shadowsocks",
+        settings:$settings,streamSettings:$stream,sniffing:$sniff,
+        total:0,expiryTime:0}')"
+
+    api_post add "$body" >/dev/null || return 1
+
+    userinfo="$(printf '%s' "$method:$password" | base64 -w0)"
+    printf 'ss://%s@%s:%s#%s\n' "$userinfo" "$ip" "$port" "$remark" >> "$DATA/nodes.txt"
+    log "[成功] Shadowsocks 入站已由面板 API 接受。"
+}
+
+install_subscription_server() {
+    local token
+    token="$(openssl rand -hex 24)"
+    printf '%s' "$token" > "$SUB_TOKEN_FILE"
+    chmod 600 "$SUB_TOKEN_FILE"
+
+    cat > "$BASE/subscription-server.py" <<'PYEOF'
+#!/usr/bin/env python3
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import base64
+
+base = Path("/opt/xiazheteng-node-manager/data")
+token_file = Path("/opt/xiazheteng-node-manager/subscription.token")
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        token = token_file.read_text().strip()
+        if self.path != "/" + token:
+            self.send_error(404)
+            return
+        nodes = base.joinpath("nodes.txt")
+        if not nodes.exists():
+            self.send_error(503, "Subscription not ready")
+            return
+        payload = base64.b64encode(nodes.read_bytes())
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+ThreadingHTTPServer(("0.0.0.0", 18888), Handler).serve_forever()
+PYEOF
+
+    chmod 700 "$BASE/subscription-server.py"
+
+    cat > /etc/systemd/system/xiazheteng-subscription.service <<EOF
+[Unit]
+Description=Xiazheteng Node Subscription
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 $BASE/subscription-server.py
+Restart=on-failure
+RestartSec=3
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=$BASE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now xiazheteng-subscription.service || return 1
+}
+
+deploy_all() {
+    need_root || return 1
+    install_dependencies || {
+        fail "依赖安装失败。"
+        return 1
+    }
+
+    install_xui || return 1
+
+    if [[ ! -f "$ENV_FILE" ]]; then
+        read_credentials || return 1
     fi
+
+    api_login || return 1
+
+    local ip p1 p2 p3
+    ip="$(get_public_ip)"
+    [[ -n "$ip" ]] || {
+        fail "无法获取公网 IPv4。"
+        return 1
+    }
+
+    p1="$(choose_port 24443 18443 14443 10443)" || {
+        fail "没有找到可用的 VLESS REALITY 端口。"
+        return 1
+    }
+    p2="$(choose_port 23456 23457 23458 23459)" || {
+        fail "没有找到可用的 VMess 端口。"
+        return 1
+    }
+    p3="$(choose_port 23888 23889 23890 23891)" || {
+        fail "没有找到可用的 Shadowsocks 端口。"
+        return 1
+    }
+
+    : > "$DATA/nodes.txt"
+    create_reality "$ip" "$p1" || return 1
+    create_vmess "$ip" "$p2" || return 1
+    create_shadowsocks "$ip" "$p3" || return 1
+
+    install_subscription_server || {
+        fail "订阅服务安装失败。"
+        return 1
+    }
+
+    local token url
+    token="$(cat "$SUB_TOKEN_FILE")"
+    url="http://$ip:$SUB_PORT/$token"
+
+    echo
+    echo "================ 部署结果 ================"
+    echo "公网 IPv4：$ip"
+    echo "VLESS REALITY 端口：$p1"
+    echo "VMess TCP 端口：$p2"
+    echo "Shadowsocks 端口：$p3"
+    echo
+    echo "统一订阅链接："
+    echo "$url"
+    echo
+    echo "节点文件：$DATA/nodes.txt"
+    echo "管理器日志：$LOG"
+    echo
+    echo "[重要] 请在云服务商防火墙放行以上三个节点端口及 TCP $SUB_PORT。"
+    echo "[重要] 当前订阅服务使用 HTTP；生产环境建议通过已有 HTTPS 反向代理保护订阅链接。"
+    echo "=========================================="
 }
 
 show_menu() {
     echo
     echo "============================================================"
-    echo "       瞎折腾吧 | 3x-ui 节点管理器 v$VERSION"
+    echo "       瞎折腾吧 | VPS 一键节点部署器"
     echo "============================================================"
-    echo "  1. 检查并安装依赖"
-    echo "  2. 查看 3x-ui 状态与监听端口"
-    echo "  3. 查看 3x-ui 服务日志"
-    echo "  4. 重启 3x-ui"
-    echo "  5. 备份 3x-ui 配置"
-    echo "  6. 查看管理器日志"
-    echo "  7. 查看本机网络信息"
+    echo "  1. 一键安装 / 检查 / 部署节点"
+    echo "  2. 查看 3x-ui 状态"
+    echo "  3. 查看已生成节点"
+    echo "  4. 查看日志"
+    echo "  5. 重启 3x-ui"
+    echo "  6. 重启订阅服务"
     echo "  0. 退出"
     echo "============================================================"
 }
 
-main_menu() {
-    local choice
-
+main() {
+    need_root || exit 1
     while true; do
         show_menu
-
-        if [[ ! -r /dev/tty ]]; then
-            log "[错误] 无法打开交互终端，菜单无法读取输入。"
-            return 1
-        fi
-
-        if ! IFS= read -r -p "请输入选项 [0-7]：" choice </dev/tty; then
-            echo
-            log "[错误] 无法从终端读取输入。"
-            log "[提示] 请在 SSH 交互终端中运行：bash $0"
-            return 1
-        fi
+        local choice
+        read -r -p "请选择：" choice </dev/tty || {
+            echo "[错误] 无法读取终端输入。"
+            exit 1
+        }
 
         case "$choice" in
-            1)
-                install_dependencies || true
-                pause
-                ;;
-            2)
-                show_status
-                pause
-                ;;
-            3)
-                show_logs
-                pause
-                ;;
-            4)
-                restart_xui || true
-                pause
-                ;;
-            5)
-                backup_xui || true
-                pause
-                ;;
-            6)
-                show_manager_logs
-                pause
-                ;;
-            7)
-                show_ip_info
-                pause
-                ;;
-            0)
-                log "[信息] 已退出节点管理器。"
-                return 0
-                ;;
-            *)
-                echo "[提示] 无效选项，请输入 0-7。"
-                ;;
+            1) deploy_all; pause ;;
+            2) systemctl --no-pager --full status x-ui || true; pause ;;
+            3) cat "$DATA/nodes.txt" 2>/dev/null || echo "尚未生成节点"; pause ;;
+            4) tail -n 100 "$LOG"; pause ;;
+            5) systemctl restart x-ui && echo "已重启" || echo "重启失败"; pause ;;
+            6) systemctl restart xiazheteng-subscription.service && echo "已重启" || echo "重启失败"; pause ;;
+            0) echo "已退出"; exit 0 ;;
+            *) echo "无效选项，请输入 0-6。" ;;
         esac
     done
 }
 
-main() {
-    if ! is_root; then
-        return 1
-    fi
-
-    log "============================================================"
-    log "瞎折腾吧 | 3x-ui 节点管理器 v$VERSION"
-    log "[信息] 开始初始化..."
-
-    if ! install_dependencies; then
-        log "[警告] 依赖检查未通过，但仍保留菜单供查看日志。"
-    fi
-
-    log "[成功] 初始化阶段结束，正在进入菜单..."
-    main_menu
-}
-
 main "$@"
-SCRIPT_EOF
-
-chmod 700 /root/xiazheteng-node-manager.sh
-
-echo "========== Bash 语法检查 =========="
-if bash -n /root/xiazheteng-node-manager.sh; then
-    echo "[成功] 语法检查通过。"
-else
-    echo "[错误] 语法检查失败，停止运行。"
-    exit 1
-fi
-
-echo
-echo "========== 启动管理器 =========="
-bash /root/xiazheteng-node-manager.sh
