@@ -2,9 +2,9 @@
 #!/usr/bin/env bash
 # ============================================================
 # 瞎折腾吧 | VPS 节点管理器
-# 支持：VLESS REALITY / VMess TCP / Shadowsocks
-# 系统：Ubuntu / Debian
-# 功能：自动检测、自动修复、故障隔离、统一订阅、结果汇总
+# Ubuntu / Debian
+# VLESS REALITY + VLESS TLS + VMess TCP + Shadowsocks
+# 自动检测、故障隔离、订阅检查、TLS 证书管理
 # ============================================================
 
 set -uo pipefail
@@ -20,7 +20,7 @@ TOKEN_FILE="$BASE/subscription.token"
 RESULT_FILE="$BASE/deploy-results.txt"
 LOG="/var/log/$APP.log"
 SERVICE="xiazheteng-subscription"
-SUB_PORT="${SUB_PORT:-18888}"
+SUB_PORT=18888
 
 mkdir -p "$BASE" "$DATA" /var/log
 touch "$LOG"
@@ -36,7 +36,6 @@ fail() {
 }
 
 pause() {
-    printf '\n'
     read -r -p "按回车继续..." _ </dev/tty || true
 }
 
@@ -48,45 +47,45 @@ need_root() {
 }
 
 # ------------------------------------------------------------
-# 通用工具
+# 基础工具
 # ------------------------------------------------------------
 
 install_dependencies() {
     export DEBIAN_FRONTEND=noninteractive
 
-    log "[检查] 正在检查必要依赖。"
+    log "[检查] 安装必要依赖。"
 
-    if ! apt-get update; then
+    apt-get update || {
         fail "apt-get update 失败，请检查系统软件源和网络。"
         return 1
-    fi
+    }
 
-    if ! apt-get install -y \
+    apt-get install -y \
         curl ca-certificates jq openssl python3 iproute2 \
-        uuid-runtime coreutils util-linux; then
+        uuid-runtime coreutils util-linux dnsutils certbot \
+        python3-certbot-nginx || {
         fail "依赖安装失败。"
         return 1
-    fi
+    }
 
     local cmd
-    for cmd in curl jq openssl python3 ss awk grep sed base64; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            fail "依赖检查失败：缺少 $cmd"
+    for cmd in curl jq openssl python3 ss awk grep sed base64 certbot; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            fail "缺少必要命令：$cmd"
             return 1
-        fi
+        }
     done
 
     log "[成功] 依赖检查通过。"
 }
 
 get_public_ip() {
-    local ip=""
-    local url
+    local ip url
 
     for url in \
-        "https://api.ipify.org" \
-        "https://ipv4.icanhazip.com" \
-        "https://ifconfig.me/ip"; do
+        https://api.ipify.org \
+        https://ipv4.icanhazip.com \
+        https://ifconfig.me/ip; do
 
         ip="$(curl -4 -fsS --connect-timeout 4 --max-time 8 \
             "$url" 2>/dev/null | tr -d '[:space:]' || true)"
@@ -123,127 +122,25 @@ choose_port() {
     return 1
 }
 
-# ------------------------------------------------------------
-# Xray 自动检测与密钥处理
-# ------------------------------------------------------------
+open_ufw_port_if_active() {
+    local port="$1"
 
-find_xray() {
-    local candidate
-    local -a candidates=(
-        /usr/local/x-ui/bin/xray-linux-amd64
-        /usr/local/x-ui/bin/xray
-        /usr/local/x-ui/xray
-        /usr/local/bin/xray
-        /usr/bin/xray
-    )
+    if command -v ufw >/dev/null 2>&1 &&
+       ufw status 2>/dev/null | grep -q 'Status: active'; then
 
-    for candidate in "${candidates[@]}"; do
-        if [[ -x "$candidate" && ! -d "$candidate" ]]; then
-            if "$candidate" version >/dev/null 2>&1 ||
-               "$candidate" x25519 >/dev/null 2>&1; then
-                printf '%s\n' "$candidate"
-                return 0
-            fi
-        fi
-    done
-
-    if command -v xray >/dev/null 2>&1; then
-        candidate="$(command -v xray)"
-        if [[ -x "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return 0
+        if ufw allow "${port}/tcp"; then
+            log "[修复] 已在 UFW 中允许 TCP $port。"
+        else
+            log "[警告] UFW 放行失败：TCP $port。"
         fi
     fi
 
-    # 仅在常见安装目录中寻找，不扫描整个系统。
-    for candidate in /usr/local/x-ui/bin/* /usr/local/x-ui/*; do
-        [[ -f "$candidate" && -x "$candidate" ]] || continue
-        [[ "$(basename "$candidate")" == *xray* ]] || continue
-
-        if "$candidate" version >/dev/null 2>&1; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-
-    return 1
-}
-
-get_xray_reality_keys() {
-    local xray="$1"
-    local output
-    local private=""
-    local public=""
-
-    [[ -x "$xray" ]] || {
-        log "[失败] Xray 可执行文件不存在：$xray"
-        return 1
-    }
-
-    log "[检查] 使用 Xray 生成 REALITY 密钥。"
-
-    if ! output="$("$xray" x25519 2>&1)"; then
-        log "[失败] Xray x25519 命令执行失败。"
-        printf '%s\n' "$output" >> "$LOG"
-        log "[诊断] Xray 输出已写入日志：$LOG"
-        return 1
-    fi
-
-    # 兼容 PrivateKey、Private key 等不同字段大小写及空格。
-    private="$(printf '%s\n' "$output" | awk '
-    {
-        line=$0
-        sub(/^[[:space:]]*/, "", line)
-        lower=tolower(line)
-        if (lower ~ /^private[ _-]*key[[:space:]]*:/) {
-            sub(/^[^:]*:[[:space:]]*/, "", line)
-            print line
-            exit
-        }
-    }')"
-
-    # Xray 常见输出中的 Password 是客户端使用的公钥。
-    # 同时兼容显式输出 PublicKey/Public key 的版本。
-    public="$(printf '%s\n' "$output" | awk '
-    {
-        line=$0
-        sub(/^[[:space:]]*/, "", line)
-        lower=tolower(line)
-        if (lower ~ /^(password|public[ _-]*key)[[:space:]]*:/) {
-            sub(/^[^:]*:[[:space:]]*/, "", line)
-            print line
-            exit
-        }
-    }')"
-
-    private="$(printf '%s' "$private" | tr -d '\r[:space:]')"
-    public="$(printf '%s' "$public" | tr -d '\r[:space:]')"
-
-    # 不猜测未知字段，也不把 Hash32 等其他值误认成公钥。
-    # 如果字段无法识别，输出诊断并安全失败。
-    if [[ -z "$private" || -z "$public" || "$private" == "$public" ]]; then
-        log "[失败] 无法可靠识别 Xray x25519 输出格式。"
-        log "[诊断] 当前 Xray 输出如下："
-        while IFS= read -r line; do
-            log "[Xray] $line"
-        done <<< "$output"
-        return 1
-    fi
-
-    if [[ ! "$private" =~ ^[A-Za-z0-9_-]{40,}$ ||
-          ! "$public" =~ ^[A-Za-z0-9_-]{40,}$ ]]; then
-        log "[失败] Xray 密钥格式校验失败。"
-        while IFS= read -r line; do
-            log "[Xray] $line"
-        done <<< "$output"
-        return 1
-    fi
-
-    printf '%s\n%s\n' "$private" "$public"
+    # 不自动清空 iptables/nftables 规则。
+    # 云厂商安全组需要用户在服务商控制台放行。
 }
 
 # ------------------------------------------------------------
-# 3x-ui 检测与 API 登录
+# 3x-ui 检测和 API
 # ------------------------------------------------------------
 
 detect_xui() {
@@ -258,9 +155,9 @@ install_xui() {
         log "[信息] 检测到已有 3x-ui，保留现有安装。"
 
         if ! systemctl is-active --quiet x-ui; then
-            log "[修复] 3x-ui 未运行，尝试启动。"
+            log "[修复] 尝试启动现有 3x-ui。"
             systemctl start x-ui || {
-                fail "3x-ui 无法启动，请检查 systemctl status x-ui。"
+                fail "3x-ui 启动失败，请检查 systemctl status x-ui。"
                 return 1
             }
         fi
@@ -268,46 +165,39 @@ install_xui() {
         return 0
     fi
 
-    log "[信息] 未检测到 3x-ui，准备运行官方安装程序。"
+    log "[信息] 未检测到 3x-ui，下载官方安装程序。"
 
     local installer="$BASE/3x-ui-install.sh"
 
-    if ! curl -4 -fsSL --retry 3 \
+    curl -4 -fsSL --retry 3 \
         https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh \
-        -o "$installer"; then
-        fail "无法下载 3x-ui 官方安装程序。"
+        -o "$installer" || {
+        fail "下载 3x-ui 官方安装程序失败。"
         return 1
-    fi
+    }
 
     chmod 700 "$installer"
 
-    log "[警告] 官方安装程序可能需要交互，请按照其提示完成安装。"
+    echo "[注意] 接下来可能进入官方安装程序的交互界面。"
     bash "$installer" || {
         fail "3x-ui 安装程序执行失败。"
         return 1
     }
 
     detect_xui || {
-        fail "安装后仍未检测到 3x-ui。"
+        fail "安装结束后仍未检测到 3x-ui。"
         return 1
     }
 
-    systemctl enable --now x-ui || {
-        fail "3x-ui 服务启动失败。"
-        return 1
-    }
-
-    log "[成功] 3x-ui 安装检查完成。"
+    systemctl enable --now x-ui || return 1
 }
 
 read_credentials() {
     local user pass port path
 
     echo
-    echo "请输入现有 3x-ui 面板登录信息。"
-    echo "本脚本不会自动重置现有面板密码。"
-    echo "面板端口及 Web 路径必须与当前安装一致。"
-    echo
+    echo "请输入当前 3x-ui 面板登录信息。"
+    echo "脚本不会擅自重置已有面板密码。"
 
     read -r -p "面板用户名：" user </dev/tty || return 1
     read -r -s -p "面板密码：" pass </dev/tty || return 1
@@ -339,21 +229,19 @@ read_credentials() {
     } > "$ENV_FILE"
 
     chmod 600 "$ENV_FILE"
-    log "[成功] 面板配置已保存到 $ENV_FILE"
 }
 
 load_credentials() {
-    if [[ ! -f "$ENV_FILE" ]]; then
-        read_credentials || return 1
-    fi
+    [[ -f "$ENV_FILE" ]] || read_credentials || return 1
 
-    # 文件由本脚本创建，权限为 600。
     # shellcheck disable=SC1090
     source "$ENV_FILE"
 
-    [[ -n "${XUI_USER:-}" && -n "${XUI_PASS:-}" &&
-       -n "${XUI_PORT:-}" && -n "${XUI_PATH:-}" ]] || {
-        fail "面板配置缺失或不完整，请重新配置。"
+    [[ -n "${XUI_USER:-}" &&
+       -n "${XUI_PASS:-}" &&
+       -n "${XUI_PORT:-}" &&
+       -n "${XUI_PATH:-}" ]] || {
+        fail "面板配置不完整，请重新配置。"
         return 1
     }
 }
@@ -365,15 +253,12 @@ api_login() {
     local -a headers=()
 
     root="http://127.0.0.1:${XUI_PORT}${XUI_PATH}"
-
     rm -f "$COOKIE"
 
     csrf="$(curl -fsS --max-time 8 "$root/csrf-token" 2>/dev/null |
         jq -r '.obj // empty' 2>/dev/null || true)"
 
-    if [[ -n "$csrf" ]]; then
-        headers=(-H "X-CSRF-Token: $csrf")
-    fi
+    [[ -z "$csrf" ]] || headers=(-H "X-CSRF-Token: $csrf")
 
     response="$(curl -sS --max-time 15 \
         -c "$COOKIE" -b "$COOKIE" \
@@ -385,8 +270,7 @@ api_login() {
 
     if ! jq -e '.success == true' >/dev/null 2>&1 <<< "$response"; then
         log "[失败] 3x-ui API 登录失败。"
-        log "[检查] 请确认用户名、密码、端口、Web 路径及面板 API 状态。"
-        log "[提示] 如面板路径或密码已变化，请重新运行菜单并更新配置。"
+        log "[检查] 请确认面板用户名、密码、端口和 Web 路径。"
         return 1
     fi
 
@@ -397,13 +281,12 @@ api_login() {
 }
 
 api_post() {
-    local endpoint="$1"
-    local body="$2"
+    local endpoint="$1" body="$2"
     local root csrf response
     local -a headers=()
 
     [[ -s "$COOKIE" && -s "$API_ROOT_FILE" ]] || {
-        fail "API 会话不存在，需要重新登录。"
+        fail "API 会话不存在。"
         return 1
     }
 
@@ -414,14 +297,11 @@ api_post() {
         jq -r '.obj // empty' 2>/dev/null || true)"
 
     headers=(-H 'Content-Type: application/json')
-    if [[ -n "$csrf" ]]; then
-        headers+=(-H "X-CSRF-Token: $csrf")
-    fi
+    [[ -z "$csrf" ]] || headers+=(-H "X-CSRF-Token: $csrf")
 
     response="$(curl -sS --max-time 20 \
         -b "$COOKIE" -c "$COOKIE" \
-        "${headers[@]}" \
-        -d "$body" \
+        "${headers[@]}" -d "$body" \
         "${root}panel/api/inbounds/$endpoint" 2>/dev/null || true)"
 
     if ! jq -e '.success == true' >/dev/null 2>&1 <<< "$response"; then
@@ -431,6 +311,209 @@ api_post() {
     fi
 
     printf '%s' "$response"
+}
+
+# ------------------------------------------------------------
+# Xray 密钥检测
+# ------------------------------------------------------------
+
+find_xray() {
+    local candidate
+    local -a candidates=(
+        /usr/local/x-ui/bin/xray-linux-amd64
+        /usr/local/x-ui/bin/xray
+        /usr/local/x-ui/xray
+        /usr/local/bin/xray
+        /usr/bin/xray
+    )
+
+    for candidate in "${candidates[@]}"; do
+        [[ -x "$candidate" && ! -d "$candidate" ]] || continue
+
+        if "$candidate" version >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    if command -v xray >/dev/null 2>&1; then
+        command -v xray
+        return 0
+    fi
+
+    return 1
+}
+
+get_xray_reality_keys() {
+    local xray="$1" output private public
+
+    output="$("$xray" x25519 2>&1)" || {
+        log "[失败] Xray x25519 命令执行失败。"
+        while IFS= read -r line; do log "[Xray] $line"; done <<< "$output"
+        return 1
+    }
+
+    private="$(printf '%s\n' "$output" | awk '
+    {
+        line=$0
+        sub(/^[[:space:]]*/, "", line)
+        if (tolower(line) ~ /^private[ _-]*key[[:space:]]*:/) {
+            sub(/^[^:]*:[[:space:]]*/, "", line)
+            print line
+            exit
+        }
+    }')"
+
+    public="$(printf '%s\n' "$output" | awk '
+    {
+        line=$0
+        sub(/^[[:space:]]*/, "", line)
+        if (tolower(line) ~ /^(password|public[ _-]*key)[[:space:]]*:/) {
+            sub(/^[^:]*:[[:space:]]*/, "", line)
+            print line
+            exit
+        }
+    }')"
+
+    private="$(printf '%s' "$private" | tr -d '\r[:space:]')"
+    public="$(printf '%s' "$public" | tr -d '\r[:space:]')"
+
+    if [[ ! "$private" =~ ^[A-Za-z0-9_-]{40,}$ ||
+          ! "$public" =~ ^[A-Za-z0-9_-]{40,}$ ||
+          "$private" == "$public" ]]; then
+        log "[失败] 无法可靠识别 Xray x25519 输出格式。"
+        while IFS= read -r line; do log "[Xray] $line"; done <<< "$output"
+        return 1
+    fi
+
+    printf '%s\n%s\n' "$private" "$public"
+}
+
+# ------------------------------------------------------------
+# 域名 / TLS 证书
+# ------------------------------------------------------------
+
+ask_domain_mode() {
+    local answer
+
+    echo
+    echo "是否使用域名部署 VLESS TLS 节点？"
+    echo "  1. 是，输入域名并自动检查证书"
+    echo "  2. 否，跳过 TLS 节点"
+    read -r -p "请选择 [默认 2]：" answer </dev/tty || return 1
+
+    case "${answer:-2}" in
+        1)
+            read -r -p "请输入已解析到本 VPS 的域名：" TLS_DOMAIN </dev/tty || return 1
+            TLS_DOMAIN="${TLS_DOMAIN,,}"
+            TLS_DOMAIN="${TLS_DOMAIN%.}"
+
+            if [[ ! "$TLS_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ||
+                  "$TLS_DOMAIN" == *..* ]]; then
+                fail "域名格式不正确。"
+                return 1
+            fi
+
+            USE_TLS=1
+            ;;
+        2)
+            USE_TLS=0
+            TLS_DOMAIN=""
+            ;;
+        *)
+            fail "无效选项。"
+            return 1
+            ;;
+    esac
+}
+
+obtain_tls_certificate() {
+    local domain="$1"
+    local public_ip cert_dir fullchain privkey
+    local dns_result
+
+    cert_dir="/etc/letsencrypt/live/$domain"
+    fullchain="$cert_dir/fullchain.pem"
+    privkey="$cert_dir/privkey.pem"
+
+    public_ip="$(get_public_ip)" || {
+        fail "无法获取公网 IPv4，无法检查域名解析。"
+        return 1
+    }
+
+    dns_result="$(getent ahostsv4 "$domain" 2>/dev/null |
+        awk '{print $1}' | sort -u || true)"
+
+    if [[ -z "$dns_result" ]]; then
+        fail "域名 $domain 没有可查询到的 IPv4 解析。"
+        return 1
+    fi
+
+    echo "[信息] 域名 IPv4 解析结果："
+    printf '%s\n' "$dns_result"
+    echo "[信息] 当前 VPS 公网 IPv4：$public_ip"
+
+    if ! grep -Fxq "$public_ip" <<< "$dns_result"; then
+        log "[警告] DNS 解析结果未直接包含本机 IP。"
+        log "[提示] 如果使用 CDN 代理，请确认源站地址及 HTTP 验证可用。"
+    fi
+
+    if [[ -s "$fullchain" && -s "$privkey" ]] &&
+       openssl x509 -in "$fullchain" -noout -checkend 86400 >/dev/null 2>&1; then
+        if openssl x509 -in "$fullchain" -noout -ext subjectAltName 2>/dev/null |
+            grep -Fq "$domain"; then
+            log "[成功] 检测到可用证书：$fullchain"
+            return 0
+        fi
+    fi
+
+    log "[信息] 未找到有效证书，尝试自动申请。"
+
+    # 不覆盖现有 Nginx 配置，也不终止正在运行的服务。
+    # Nginx 存在时使用 certbot nginx authenticator。
+    # 没有 Nginx 时才使用 standalone。
+    if systemctl is-active --quiet nginx; then
+        log "[信息] 检测到 Nginx，尝试使用 Certbot Nginx 插件验证域名。"
+
+        certbot certonly --nginx \
+            -d "$domain" \
+            --non-interactive \
+            --agree-tos \
+            --register-unsafely-without-email \
+            --preferred-challenges http || {
+            fail "通过现有 Nginx 申请证书失败。未删除或覆盖现有站点。"
+            log "[建议] 检查域名解析、80 端口、Nginx server_name 和 CDN 配置。"
+            return 1
+        }
+    else
+        if ! port_free 80; then
+            fail "80 端口被其他程序占用，且没有可用的 Nginx 验证方式。"
+            log "[建议] 请配置 DNS-01 验证，或先确认现有 Web 服务的验证方式。"
+            return 1
+        fi
+
+        certbot certonly --standalone \
+            -d "$domain" \
+            --non-interactive \
+            --agree-tos \
+            --register-unsafely-without-email \
+            --preferred-challenges http || {
+            fail "Certbot 申请证书失败。"
+            return 1
+        }
+    fi
+
+    [[ -s "$fullchain" && -s "$privkey" ]] || {
+        fail "Certbot 执行后仍未找到完整证书文件。"
+        return 1
+    }
+
+    openssl x509 -in "$fullchain" -noout -checkend 86400 >/dev/null 2>&1 || {
+        fail "证书有效期检查失败。"
+        return 1
+    }
+
+    log "[成功] TLS 证书已准备好。"
 }
 
 # ------------------------------------------------------------
@@ -447,17 +530,11 @@ create_reality() {
     short="$(openssl rand -hex 8)"
 
     xray="$(find_xray)" || {
-        log "[失败] 找不到可用的 Xray 程序，REALITY 无法创建。"
+        log "[失败] 找不到 Xray 程序。"
         return 1
     }
 
-    log "[信息] Xray 路径：$xray"
-
-    key_output="$(get_xray_reality_keys "$xray")" || {
-        log "[警告] REALITY 密钥生成失败，继续尝试其他协议。"
-        return 1
-    }
-
+    key_output="$(get_xray_reality_keys "$xray")" || return 1
     private="$(printf '%s\n' "$key_output" | sed -n '1p')"
     public="$(printf '%s\n' "$key_output" | sed -n '2p')"
 
@@ -488,27 +565,72 @@ create_reality() {
         --argjson stream "$stream" \
         --argjson sniff "$sniff" \
         '{
-          enable:true,
-          remark:$remark,
-          port:$port,
-          protocol:"vless",
-          settings:$settings,
-          streamSettings:$stream,
-          sniffing:$sniff,
-          total:0,
-          expiryTime:0
+          enable:true,remark:$remark,port:$port,protocol:"vless",
+          settings:$settings,streamSettings:$stream,sniffing:$sniff,
+          total:0,expiryTime:0
         }')" || return 1
 
-    api_post add "$body" >/dev/null || {
-        log "[失败] REALITY 入站创建失败。"
-        return 1
-    }
+    api_post add "$body" >/dev/null || return 1
 
     printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
         "$uuid" "$ip" "$port" "$public" "$short" "$remark" \
         >> "$DATA/nodes.txt"
 
-    log "[成功] VLESS REALITY 入站创建成功。"
+    open_ufw_port_if_active "$port"
+    log "[成功] REALITY 入站已提交给 3x-ui。"
+}
+
+create_tls() {
+    local domain="$1" port="$2"
+    local uuid remark settings stream sniff body
+
+    uuid="$(cat /proc/sys/kernel/random/uuid)"
+    remark="ZT-VLESS-TLS"
+
+    settings="$(jq -cn --arg id "$uuid" \
+        '{clients:[{id:$id,email:$id}],decryption:"none"}')" || return 1
+
+    stream="$(jq -cn \
+        --arg domain "$domain" \
+        --arg cert "/etc/letsencrypt/live/$domain/fullchain.pem" \
+        --arg key "/etc/letsencrypt/live/$domain/privkey.pem" \
+        '{
+          network:"tcp",
+          security:"tls",
+          tlsSettings:{
+            serverName:$domain,
+            minVersion:"1.2",
+            certificates:[{
+              certificateFile:$cert,
+              keyFile:$key,
+              ocspStapling:3600
+            }],
+            alpn:["http/1.1"]
+          }
+        }')" || return 1
+
+    sniff='{"enabled":true,"destOverride":["http","tls"]}'
+
+    body="$(jq -cn \
+        --arg remark "$remark" \
+        --argjson port "$port" \
+        --argjson settings "$settings" \
+        --argjson stream "$stream" \
+        --argjson sniff "$sniff" \
+        '{
+          enable:true,remark:$remark,port:$port,protocol:"vless",
+          settings:$settings,streamSettings:$stream,sniffing:$sniff,
+          total:0,expiryTime:0
+        }')" || return 1
+
+    api_post add "$body" >/dev/null || return 1
+
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=tcp#%s\n' \
+        "$uuid" "$domain" "$port" "$domain" "$remark" \
+        >> "$DATA/nodes.txt"
+
+    open_ufw_port_if_active "$port"
+    log "[成功] VLESS TLS 入站已提交给 3x-ui。"
 }
 
 create_vmess() {
@@ -532,27 +654,15 @@ create_vmess() {
         --argjson stream "$stream" \
         --argjson sniff "$sniff" \
         '{
-          enable:true,
-          remark:$remark,
-          port:$port,
-          protocol:"vmess",
-          settings:$settings,
-          streamSettings:$stream,
-          sniffing:$sniff,
-          total:0,
-          expiryTime:0
+          enable:true,remark:$remark,port:$port,protocol:"vmess",
+          settings:$settings,streamSettings:$stream,sniffing:$sniff,
+          total:0,expiryTime:0
         }')" || return 1
 
-    api_post add "$body" >/dev/null || {
-        log "[失败] VMess 入站创建失败。"
-        return 1
-    }
+    api_post add "$body" >/dev/null || return 1
 
     vmess_json="$(jq -cn \
-        --arg add "$ip" \
-        --arg port "$port" \
-        --arg id "$uuid" \
-        --arg ps "$remark" \
+        --arg add "$ip" --arg port "$port" --arg id "$uuid" --arg ps "$remark" \
         '{
           v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",
           scy:"auto",net:"tcp",type:"none",host:"",path:"",tls:""
@@ -561,7 +671,8 @@ create_vmess() {
     encoded="$(printf '%s' "$vmess_json" | base64 -w0)" || return 1
     printf 'vmess://%s\n' "$encoded" >> "$DATA/nodes.txt"
 
-    log "[成功] VMess TCP 入站创建成功。"
+    open_ufw_port_if_active "$port"
+    log "[成功] VMess TCP 入站已提交给 3x-ui。"
 }
 
 create_shadowsocks() {
@@ -585,46 +696,35 @@ create_shadowsocks() {
         --argjson stream "$stream" \
         --argjson sniff "$sniff" \
         '{
-          enable:true,
-          remark:$remark,
-          port:$port,
-          protocol:"shadowsocks",
-          settings:$settings,
-          streamSettings:$stream,
-          sniffing:$sniff,
-          total:0,
-          expiryTime:0
+          enable:true,remark:$remark,port:$port,protocol:"shadowsocks",
+          settings:$settings,streamSettings:$stream,sniffing:$sniff,
+          total:0,expiryTime:0
         }')" || return 1
 
-    api_post add "$body" >/dev/null || {
-        log "[失败] Shadowsocks 入站创建失败。"
-        return 1
-    }
+    api_post add "$body" >/dev/null || return 1
 
     userinfo="$(printf '%s' "$method:$password" | base64 -w0)" || return 1
-
     printf 'ss://%s@%s:%s#%s\n' \
         "$userinfo" "$ip" "$port" "$remark" >> "$DATA/nodes.txt"
 
-    log "[成功] Shadowsocks 入站创建成功。"
+    open_ufw_port_if_active "$port"
+    log "[成功] Shadowsocks 入站已提交给 3x-ui。"
 }
 
 # ------------------------------------------------------------
-# 统一订阅服务
+# 订阅服务
 # ------------------------------------------------------------
 
 install_subscription_server() {
     local port="$1"
-
     SUB_PORT="$port"
+
     mkdir -p "$BASE" "$DATA"
     chmod 700 "$BASE" "$DATA"
 
     if [[ ! -s "$TOKEN_FILE" ]]; then
-        log "[修复] 订阅令牌缺失，重新生成。"
         openssl rand -hex 24 > "$TOKEN_FILE" || return 1
     fi
-
     chmod 600 "$TOKEN_FILE"
 
     cat > "$BASE/subscription-server.py" <<'PYEOF'
@@ -651,10 +751,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
-        node_file = DATA / "nodes.txt"
-
         try:
-            raw = node_file.read_bytes()
+            raw = (DATA / "nodes.txt").read_bytes()
         except Exception:
             self.send_error(503, "Subscription not ready")
             return
@@ -664,7 +762,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         payload = base64.b64encode(raw)
-
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -696,9 +793,6 @@ RestartSec=3
 User=root
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
-ReadOnlyPaths=$BASE/data/nodes.txt
-ReadOnlyPaths=$BASE/subscription.token
 
 [Install]
 WantedBy=multi-user.target
@@ -706,208 +800,250 @@ EOF
 
     systemctl daemon-reload || return 1
     systemctl enable "$SERVICE" >/dev/null 2>&1 || return 1
-
-    if ! systemctl is-active --quiet "$SERVICE"; then
-        log "[修复] 订阅服务未运行，尝试启动。"
-        systemctl restart "$SERVICE" || return 1
-    else
-        systemctl restart "$SERVICE" || return 1
-    fi
+    systemctl restart "$SERVICE" || return 1
 
     sleep 1
 
-    if ! systemctl is-active --quiet "$SERVICE"; then
+    systemctl is-active --quiet "$SERVICE" || {
         log "[失败] 订阅服务启动失败。"
-        journalctl -u "$SERVICE" -n 40 --no-pager 2>&1 |
-            while IFS= read -r line; do log "[订阅日志] $line"; done
-        return 1
-    fi
-
-    if ! ss -H -lnt | awk -v p=":$SUB_PORT" \
-        '$4 ~ (p "$") {found=1} END {exit !found}'; then
-        log "[失败] 订阅端口 $SUB_PORT 未监听。"
-        return 1
-    fi
-
-    log "[成功] 订阅服务已启动，监听端口 $SUB_PORT。"
-}
-
-verify_subscription_service() {
-    local token response_file
-    token="$(cat "$TOKEN_FILE" 2>/dev/null)" || return 1
-
-    [[ -n "$token" && -s "$DATA/nodes.txt" ]] || {
-        fail "订阅令牌或节点文件为空。"
+        journalctl -u "$SERVICE" -n 40 --no-pager
         return 1
     }
 
-    response_file="$(mktemp)"
-    chmod 600 "$response_file"
+    ss -H -lnt | awk -v p=":$SUB_PORT" \
+        '$4 ~ (p "$") {found=1} END {exit !found}' || {
+        fail "订阅端口 $SUB_PORT 没有监听。"
+        return 1
+    }
+
+    open_ufw_port_if_active "$SUB_PORT"
+}
+
+verify_subscription() {
+    local token tmp decoded
+
+    [[ -s "$DATA/nodes.txt" ]] || {
+        fail "节点文件为空。"
+        return 1
+    }
+
+    token="$(cat "$TOKEN_FILE")" || return 1
+    tmp="$(mktemp)"
+    decoded="$(mktemp)"
+    chmod 600 "$tmp" "$decoded"
 
     if ! curl -fsS --connect-timeout 3 --max-time 8 \
-        "http://127.0.0.1:${SUB_PORT}/${token}" \
-        -o "$response_file"; then
-
-        rm -f "$response_file"
-        log "[修复] 订阅本地访问失败，尝试重启服务。"
-
-        systemctl restart "$SERVICE" || return 1
+        "http://127.0.0.1:${SUB_PORT}/${token}" -o "$tmp"; then
+        log "[修复] 订阅访问失败，尝试重启服务。"
+        systemctl restart "$SERVICE" || true
         sleep 1
 
-        response_file="$(mktemp)"
-        chmod 600 "$response_file"
-
         if ! curl -fsS --connect-timeout 3 --max-time 8 \
-            "http://127.0.0.1:${SUB_PORT}/${token}" \
-            -o "$response_file"; then
-            rm -f "$response_file"
+            "http://127.0.0.1:${SUB_PORT}/${token}" -o "$tmp"; then
+            rm -f "$tmp" "$decoded"
             fail "订阅服务重启后仍无法访问。"
             journalctl -u "$SERVICE" -n 40 --no-pager
             return 1
         fi
     fi
 
-    if ! base64 -d "$response_file" 2>/dev/null |
-        grep -qE '^(vless|vmess|ss)://'; then
-        rm -f "$response_file"
-        fail "订阅接口返回内容无效，未发现有效节点链接。"
+    if ! base64 -d "$tmp" > "$decoded" 2>/dev/null ||
+       ! grep -qE '^(vless|vmess|ss)://' "$decoded"; then
+        rm -f "$tmp" "$decoded"
+        fail "订阅返回内容无效。"
         return 1
     fi
 
-    rm -f "$response_file"
-    log "[成功] 订阅接口本地检查通过。"
+    rm -f "$tmp" "$decoded"
+    log "[成功] 订阅本地访问与内容检查通过。"
 }
 
 # ------------------------------------------------------------
-# 部署流程：一个协议失败，不影响其他协议
+# 节点端口和 Xray 状态检查
 # ------------------------------------------------------------
 
-deploy_protocols() {
-    local ip="$1" p1="$2" p2="$3" p3="$4"
+verify_inbound_port() {
+    local port="$1"
+    local i
+
+    for i in 1 2 3 4 5; do
+        if ss -H -lnt 2>/dev/null |
+            awk -v p=":$port" '$4 ~ (p "$") {found=1} END {exit !found}'; then
+            log "[成功] TCP 端口 $port 正在监听。"
+            return 0
+        fi
+        sleep 1
+    done
+
+    log "[警告] TCP 端口 $port 未检测到监听。"
+    log "[修复] 尝试重启 3x-ui 一次。"
+
+    systemctl restart x-ui || true
+    sleep 2
+
+    if ss -H -lnt 2>/dev/null |
+        awk -v p=":$port" '$4 ~ (p "$") {found=1} END {exit !found}'; then
+        log "[成功] 重启后端口 $port 已开始监听。"
+        return 0
+    fi
+
+    log "[失败] 重启后端口 $port 仍未监听。"
+    log "[提示] 请检查 3x-ui 入站配置、端口冲突和 Xray 日志。"
+    return 1
+}
+
+# ------------------------------------------------------------
+# 部署主流程
+# ------------------------------------------------------------
+
+deploy_all() {
+    need_root || return 1
+    install_dependencies || return 1
+    install_xui || return 1
+    api_login || return 1
+
+    local ip p1 p2 p3 tls_port sub_port
     local success=0 failed=0
+    local use_tls=0 tls_domain=""
+
+    ip="$(get_public_ip)" || {
+        fail "无法获取公网 IPv4。"
+        return 1
+    }
+
+    echo
+    echo "[信息] 公网 IPv4：$ip"
+
+    if ask_domain_mode; then
+        use_tls="$USE_TLS"
+        tls_domain="$TLS_DOMAIN"
+    else
+        log "[警告] 域名配置无效或读取失败，本轮跳过 TLS 节点。"
+    fi
+
+    p1="$(choose_port 24443 18443 14443 10443)" || p1=""
+    p2="$(choose_port 23456 23457 23458 23459)" || p2=""
+    p3="$(choose_port 23888 23889 23890 23891)" || p3=""
+
+    # TLS 端口优先 443；占用时自动尝试备用端口。
+    tls_port=""
+    if (( use_tls == 1 )); then
+        if ! obtain_tls_certificate "$tls_domain"; then
+            log "[警告] TLS 证书不可用，本轮跳过 TLS 节点。"
+            use_tls=0
+        else
+            tls_port="$(choose_port 443 8443 2053 9443 10443)" || tls_port=""
+            if [[ -z "$tls_port" ]]; then
+                log "[失败] 443 和所有备用 TLS 端口均被占用。"
+                log "[提示] 不会停止或杀死占用端口的服务。"
+                use_tls=0
+            elif [[ "$tls_port" != "443" ]]; then
+                log "[信息] 443 已被占用，TLS 节点将使用备用端口 $tls_port。"
+            fi
+        fi
+    fi
+
+    if [[ -z "$p1" ]]; then log "[警告] 无可用 REALITY 端口。"; fi
+    if [[ -z "$p2" ]]; then log "[警告] 无可用 VMess 端口。"; fi
+    if [[ -z "$p3" ]]; then log "[警告] 无可用 Shadowsocks 端口。"; fi
+
+    # 订阅服务优先复用原端口；若端口被占用则寻找备用端口。
+    sub_port="$(choose_port "$SUB_PORT" 18889 18890 18891)" || {
+        fail "找不到可用订阅端口。"
+        return 1
+    }
+    SUB_PORT="$sub_port"
 
     : > "$DATA/nodes.txt"
     : > "$RESULT_FILE"
     chmod 600 "$DATA/nodes.txt" "$RESULT_FILE"
 
-    log "[阶段] 开始生成 VLESS REALITY。"
-    if create_reality "$ip" "$p1"; then
-        echo "VLESS REALITY：成功，端口 $p1" | tee -a "$RESULT_FILE"
-        success=$((success + 1))
-    else
-        echo "VLESS REALITY：失败，端口 $p1" | tee -a "$RESULT_FILE"
-        failed=$((failed + 1))
-        log "[恢复] REALITY 失败，继续生成 VMess。"
-    fi
-
-    log "[阶段] 开始生成 VMess TCP。"
-    if create_vmess "$ip" "$p2"; then
-        echo "VMess TCP：成功，端口 $p2" | tee -a "$RESULT_FILE"
-        success=$((success + 1))
-    else
-        echo "VMess TCP：失败，端口 $p2" | tee -a "$RESULT_FILE"
-        failed=$((failed + 1))
-        log "[恢复] VMess 失败，继续生成 Shadowsocks。"
-    fi
-
-    log "[阶段] 开始生成 Shadowsocks。"
-    if create_shadowsocks "$ip" "$p3"; then
-        echo "Shadowsocks：成功，端口 $p3" | tee -a "$RESULT_FILE"
-        success=$((success + 1))
-    else
-        echo "Shadowsocks：失败，端口 $p3" | tee -a "$RESULT_FILE"
-        failed=$((failed + 1))
-    fi
-
-    echo
-    echo "========== 协议生成汇总 =========="
-    cat "$RESULT_FILE"
-    echo "成功协议数：$success"
-    echo "失败协议数：$failed"
-    echo "=================================="
-
-    [[ -s "$DATA/nodes.txt" ]] || {
-        fail "所有协议都未生成节点，拒绝创建空订阅。"
-        return 1
-    }
-
-    return 0
-}
-
-deploy_all() {
-    need_root || return 1
-
-    install_dependencies || {
-        fail "依赖检查未通过，无法继续部署。"
-        return 1
-    }
-
-    install_xui || return 1
-
-    api_login || {
-        fail "无法登录 3x-ui API，请检查面板配置。"
-        return 1
-    }
-
-    local ip p1 p2 p3 sub_port
-
-    ip="$(get_public_ip)" || {
-        fail "无法获取公网 IPv4，请检查服务器网络。"
-        return 1
-    }
-
-    log "[信息] 公网 IPv4：$ip"
-
-    p1="$(choose_port 24443 18443 14443 10443)" || {
-        fail "没有找到可用的 REALITY 候选端口。"
-        return 1
-    }
-
-    p2="$(choose_port 23456 23457 23458 23459)" || {
-        fail "没有找到可用的 VMess 候选端口。"
-        return 1
-    }
-
-    p3="$(choose_port 23888 23889 23890 23891)" || {
-        fail "没有找到可用的 Shadowsocks 候选端口。"
-        return 1
-    }
-
-    # 订阅服务如果已在运行，优先复用其当前端口；
-    # 否则选择空闲候选端口，避免占用其他程序的监听端口。
-    if systemctl is-active --quiet "$SERVICE"; then
-        local old_port
-        old_port="$(systemctl show "$SERVICE" -p Environment --value 2>/dev/null |
-            grep -oE 'SUB_PORT=[0-9]+' | head -n1 | cut -d= -f2 || true)"
-
-        if [[ "$old_port" =~ ^[0-9]+$ ]] &&
-           ss -H -lnt | awk -v p=":$old_port" \
-             '$4 ~ (p "$") {found=1} END {exit !found}'; then
-            sub_port="$old_port"
+    if [[ -n "$p1" ]]; then
+        if create_reality "$ip" "$p1"; then
+            if verify_inbound_port "$p1"; then
+                echo "VLESS REALITY：已创建，端口 $p1；监听检查通过" | tee -a "$RESULT_FILE"
+                success=$((success + 1))
+            else
+                echo "VLESS REALITY：已创建，但监听检查失败，端口 $p1" | tee -a "$RESULT_FILE"
+                failed=$((failed + 1))
+            fi
+        else
+            echo "VLESS REALITY：创建失败" | tee -a "$RESULT_FILE"
+            failed=$((failed + 1))
         fi
+    else
+        echo "VLESS REALITY：没有可用端口" | tee -a "$RESULT_FILE"
+        failed=$((failed + 1))
     fi
 
-    if [[ -z "${sub_port:-}" ]]; then
-        sub_port="$(choose_port 18888 18889 18890 18891)" || {
-            fail "没有找到可用的订阅服务端口。"
-            return 1
-        }
+    if (( use_tls == 1 )) && [[ -n "$tls_port" ]]; then
+        if create_tls "$tls_domain" "$tls_port"; then
+            if verify_inbound_port "$tls_port"; then
+                echo "VLESS TLS：已创建，端口 $tls_port；监听检查通过" | tee -a "$RESULT_FILE"
+                success=$((success + 1))
+            else
+                echo "VLESS TLS：已创建，但监听检查失败，端口 $tls_port" | tee -a "$RESULT_FILE"
+                failed=$((failed + 1))
+            fi
+        else
+            echo "VLESS TLS：创建失败" | tee -a "$RESULT_FILE"
+            failed=$((failed + 1))
+        fi
+    elif (( use_tls == 1 )); then
+        echo "VLESS TLS：无可用端口" | tee -a "$RESULT_FILE"
+        failed=$((failed + 1))
+    else
+        echo "VLESS TLS：已跳过" | tee -a "$RESULT_FILE"
     fi
 
-    SUB_PORT="$sub_port"
+    if [[ -n "$p2" ]]; then
+        if create_vmess "$ip" "$p2"; then
+            if verify_inbound_port "$p2"; then
+                echo "VMess TCP：已创建，端口 $p2；监听检查通过" | tee -a "$RESULT_FILE"
+                success=$((success + 1))
+            else
+                echo "VMess TCP：已创建，但监听检查失败，端口 $p2" | tee -a "$RESULT_FILE"
+                failed=$((failed + 1))
+            fi
+        else
+            echo "VMess TCP：创建失败" | tee -a "$RESULT_FILE"
+            failed=$((failed + 1))
+        fi
+    else
+        echo "VMess TCP：没有可用端口" | tee -a "$RESULT_FILE"
+        failed=$((failed + 1))
+    fi
 
-    deploy_protocols "$ip" "$p1" "$p2" "$p3" || {
-        fail "没有可用节点，订阅服务未发布。"
+    if [[ -n "$p3" ]]; then
+        if create_shadowsocks "$ip" "$p3"; then
+            if verify_inbound_port "$p3"; then
+                echo "Shadowsocks：已创建，端口 $p3；监听检查通过" | tee -a "$RESULT_FILE"
+                success=$((success + 1))
+            else
+                echo "Shadowsocks：已创建，但监听检查失败，端口 $p3" | tee -a "$RESULT_FILE"
+                failed=$((failed + 1))
+            fi
+        else
+            echo "Shadowsocks：创建失败" | tee -a "$RESULT_FILE"
+            failed=$((failed + 1))
+        fi
+    else
+        echo "Shadowsocks：没有可用端口" | tee -a "$RESULT_FILE"
+        failed=$((failed + 1))
+    fi
+
+    if [[ ! -s "$DATA/nodes.txt" ]]; then
+        fail "没有生成任何节点，不发布空订阅。"
         return 1
-    }
+    fi
 
     install_subscription_server "$SUB_PORT" || {
         fail "订阅服务启动失败。"
         return 1
     }
 
-    verify_subscription_service || {
-        fail "订阅服务检查失败。"
+    verify_subscription || {
+        fail "订阅检查失败。"
         return 1
     }
 
@@ -916,104 +1052,53 @@ deploy_all() {
 
     echo
     echo "============================================================"
-    echo "                 部署结果汇总"
+    echo "                   部署结果汇总"
     echo "============================================================"
     echo "公网 IPv4：$ip"
     echo
     cat "$RESULT_FILE"
     echo
-    echo "统一订阅链接："
-    echo "http://${ip}:${SUB_PORT}/${token}"
-    echo
-    echo "节点文件：$DATA/nodes.txt"
-    echo "部署结果：$RESULT_FILE"
-    echo "管理器日志：$LOG"
-    echo
-    echo "[注意] 请在云服务商防火墙放行实际创建成功的节点端口。"
-    echo "[注意] 请放行 TCP $SUB_PORT，客户端才能访问订阅。"
-    echo "[安全] 当前订阅为 HTTP。建议通过你已有的 HTTPS 反向代理保护订阅链接。"
-    echo "[限制] 本地订阅检查不等于外网连通性或节点实际代理测试。"
-    echo "============================================================"
+    echo "生成节点数：$(grep -cE '^(vless|vmess|ss)://' "$DATA/nodes.txt" || true)"
+    echo "订阅地址：http://${ip}:${SUB_PORT}/${token}"
 
-    if (( failed > 0 )); then
-        log "[警告] 部分协议失败，请查看部署汇总及日志。"
+    if (( use_tls == 1 )) && [[ -n "$tls_port" ]]; then
+        echo "TLS 域名：$tls_domain"
+        echo "TLS 端口：$tls_port"
     fi
 
+    echo
+    echo "节点文件：$DATA/nodes.txt"
+    echo "结果文件：$RESULT_FILE"
+    echo "日志文件：$LOG"
+    echo
+    echo "[注意] 必须在云服务商安全组放行实际使用的节点端口和订阅端口。"
+    echo "[注意] TLS 证书申请成功不等于 TLS 节点外网可连接。"
+    echo "[注意] 监听检查通过也不代表客户端测速一定成功。"
+    echo "============================================================"
+
+    log "[完成] 节点生成流程结束：成功 $success，失败 $failed。"
     return 0
 }
 
 # ------------------------------------------------------------
-# 管理菜单
+# 菜单
 # ------------------------------------------------------------
 
 show_menu() {
     echo
     echo "============================================================"
-    echo "             瞎折腾吧 | VPS 节点管理器"
+    echo "               瞎折腾吧 | VPS 节点管理器"
     echo "============================================================"
-    echo "  1. 一键检查 / 自动修复 / 部署节点"
+    echo "  1. 一键部署 / 自动修复 / 检查节点"
     echo "  2. 查看 3x-ui 状态"
-    echo "  3. 查看已生成节点"
+    echo "  3. 查看订阅节点"
     echo "  4. 查看部署结果"
     echo "  5. 查看最近日志"
     echo "  6. 重启 3x-ui"
-    echo "  7. 检查 / 重启订阅服务"
-    echo "  8. 重新配置 3x-ui API 登录信息"
+    echo "  7. 重启订阅服务"
+    echo "  8. 重新配置面板登录信息"
     echo "  0. 退出"
     echo "============================================================"
-}
-
-menu_status_xui() {
-    echo
-    systemctl --no-pager --full status x-ui || true
-    pause
-}
-
-menu_nodes() {
-    echo
-    if [[ -s "$DATA/nodes.txt" ]]; then
-        cat "$DATA/nodes.txt"
-    else
-        echo "当前没有已生成的节点。"
-    fi
-    pause
-}
-
-menu_results() {
-    echo
-    if [[ -s "$RESULT_FILE" ]]; then
-        cat "$RESULT_FILE"
-    else
-        echo "暂无部署结果。"
-    fi
-    pause
-}
-
-menu_logs() {
-    echo
-    tail -n 100 "$LOG" 2>/dev/null || true
-    pause
-}
-
-menu_subscription() {
-    echo
-
-    if ! systemctl is-active --quiet "$SERVICE"; then
-        echo "[修复] 订阅服务未运行，尝试重启。"
-        systemctl restart "$SERVICE" || true
-    else
-        systemctl restart "$SERVICE" || true
-    fi
-
-    if systemctl is-active --quiet "$SERVICE"; then
-        echo "[成功] 订阅服务正在运行。"
-        systemctl --no-pager --full status "$SERVICE" || true
-    else
-        echo "[失败] 订阅服务无法启动。"
-        journalctl -u "$SERVICE" -n 40 --no-pager || true
-    fi
-
-    pause
 }
 
 main() {
@@ -1023,43 +1108,60 @@ main() {
         show_menu
 
         local choice
-        if ! read -r -p "请选择 [0-8]：" choice </dev/tty; then
-            echo
-            echo "[错误] 无法读取终端输入。请在交互式 SSH 终端运行。"
+        read -r -p "请选择 [0-8]：" choice </dev/tty || {
+            echo "[错误] 无法读取终端输入。"
             exit 1
-        fi
+        }
 
         case "$choice" in
             1)
-                if deploy_all; then
-                    echo
-                    echo "[完成] 部署流程执行结束。"
+                deploy_all || echo "[警告] 部署存在失败项目，请查看 $LOG"
+                pause
+                ;;
+            2)
+                systemctl --no-pager --full status x-ui || true
+                pause
+                ;;
+            3)
+                if [[ -s "$DATA/nodes.txt" ]]; then
+                    cat "$DATA/nodes.txt"
                 else
-                    echo
-                    echo "[警告] 部署流程存在未解决的问题，请查看日志：$LOG"
+                    echo "暂无节点。"
                 fi
                 pause
                 ;;
-            2) menu_status_xui ;;
-            3) menu_nodes ;;
-            4) menu_results ;;
-            5) menu_logs ;;
+            4)
+                if [[ -s "$RESULT_FILE" ]]; then
+                    cat "$RESULT_FILE"
+                else
+                    echo "暂无部署结果。"
+                fi
+                pause
+                ;;
+            5)
+                tail -n 100 "$LOG" || true
+                pause
+                ;;
             6)
                 if systemctl restart x-ui; then
-                    echo "[成功] 已发送 3x-ui 重启请求。"
+                    echo "[成功] 已发送重启请求。"
                 else
                     echo "[失败] 3x-ui 重启失败。"
                 fi
                 pause
                 ;;
-            7) menu_subscription ;;
+            7)
+                if systemctl restart "$SERVICE"; then
+                    echo "[成功] 已发送订阅服务重启请求。"
+                else
+                    echo "[失败] 订阅服务重启失败。"
+                    journalctl -u "$SERVICE" -n 40 --no-pager || true
+                fi
+                pause
+                ;;
             8)
                 rm -f "$ENV_FILE" "$COOKIE" "$API_ROOT_FILE"
-                if read_credentials; then
-                    echo "[成功] 面板配置已更新。"
-                else
-                    echo "[失败] 面板配置更新失败。"
-                fi
+                read_credentials || echo "[失败] 配置更新失败。"
                 pause
                 ;;
             0)
@@ -1067,7 +1169,7 @@ main() {
                 exit 0
                 ;;
             *)
-                echo "[错误] 无效选项，请输入 0-8。"
+                echo "[错误] 无效选项。"
                 ;;
         esac
     done
