@@ -21,6 +21,7 @@ RESULT_FILE="$BASE/deploy-results.txt"
 LOG="/var/log/$APP.log"
 SERVICE="xiazheteng-subscription"
 SUB_PORT=18888
+API_LAST_RESPONSE=""
 
 mkdir -p "$BASE" "$DATA" /var/log
 touch "$LOG"
@@ -319,13 +320,54 @@ api_post() {
         "${headers[@]}" -d "$body" \
         "${root}panel/api/inbounds/$endpoint" 2>/dev/null || true)"
 
+    API_LAST_RESPONSE="$response"
+
     if ! jq -e '.success == true' >/dev/null 2>&1 <<< "$response"; then
         log "[失败] 3x-ui API 操作失败：$endpoint"
-        log "[诊断] API 响应：$response"
+        # Avoid printing the full payload: some responses may contain client secrets.
+        log "[诊断] API 响应摘要：$(jq -c '{success,msg,errmsg,code,obj:(if (.obj|type)=="object" then {id:.obj.id,port:.obj.port,protocol:.obj.protocol,remark:.obj.remark} else .obj end)}' <<< "$response" 2>/dev/null || printf '%s' '响应不是有效 JSON')"
         return 1
     fi
 
+    log "[诊断] API 响应摘要：$(jq -c '{success,msg,errmsg,code,obj:(if (.obj|type)=="object" then {id:.obj.id,port:.obj.port,protocol:.obj.protocol,remark:.obj.remark} else .obj end)}' <<< "$response" 2>/dev/null || printf '%s' '响应不是有效 JSON')"
     printf '%s' "$response"
+}
+
+verify_inbound_saved() {
+    local port="$1" protocol="$2"
+    local root list found
+
+    [[ -s "$COOKIE" && -s "$API_ROOT_FILE" ]] || {
+        log "[失败] 无法验证入站：API 会话不存在。"
+        return 1
+    }
+
+    root="$(cat "$API_ROOT_FILE")"
+    list="$(curl -sS --max-time 10 -b "$COOKIE" \
+        "${root}panel/api/inbounds/list" 2>/dev/null || true)"
+
+    if ! jq -e '.success == true' >/dev/null 2>&1 <<< "$list"; then
+        log "[失败] API 已返回成功，但创建后无法读取入站列表。"
+        log "[诊断] 入站列表响应摘要：$(jq -c '{success,msg,errmsg,code}' <<< "$list" 2>/dev/null || printf '%s' '响应不是有效 JSON')"
+        return 1
+    fi
+
+    found="$(jq -r --argjson p "$port" --arg proto "$protocol" \
+        '[.obj[]? | select((.port|tonumber)==$p and .protocol==$proto)] | length' \
+        <<< "$list" 2>/dev/null || printf '0')"
+
+    if [[ "$found" =~ ^[0-9]+$ ]] && (( found > 0 )); then
+        log "[成功] API 入站列表已确认保存：$protocol / $port。"
+        return 0
+    fi
+
+    log "[失败] API 返回 success=true，但入站列表中不存在 $protocol / $port。"
+    log "[诊断] 创建响应摘要：$(jq -c '{success,msg,errmsg,code,obj:(if (.obj|type)=="object" then {id:.obj.id,port:.obj.port,protocol:.obj.protocol,remark:.obj.remark} else .obj end)}' <<< "$API_LAST_RESPONSE" 2>/dev/null || printf '%s' '响应不是有效 JSON')"
+    log "[诊断] 当前入站列表中相关协议/端口："
+    jq -r --argjson p "$port" --arg proto "$protocol" \
+        '.obj[]? | select((.port|tonumber)==$p or .protocol==$proto) | "[入站] id=\(.id // "?") protocol=\(.protocol // "?") port=\(.port // "?") enable=\(.enable // false) remark=\(.remark // "")"' \
+        <<< "$list" | while IFS= read -r line; do log "$line"; done
+    return 1
 }
 
 # ------------------------------------------------------------
@@ -589,6 +631,7 @@ create_reality() {
         }')" || return 1
 
     api_post add "$body" >/dev/null || return 1
+    verify_inbound_saved "$port" "vless" || return 1
 
     printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
         "$uuid" "$ip" "$port" "$public" "$short" "$remark" \
@@ -642,6 +685,7 @@ create_tls() {
         }')" || return 1
 
     api_post add "$body" >/dev/null || return 1
+    verify_inbound_saved "$port" "vless" || return 1
 
     printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=tcp#%s\n' \
         "$uuid" "$domain" "$port" "$domain" "$remark" \
@@ -678,6 +722,7 @@ create_vmess() {
         }')" || return 1
 
     api_post add "$body" >/dev/null || return 1
+    verify_inbound_saved "$port" "vmess" || return 1
 
     vmess_json="$(jq -cn \
         --arg add "$ip" --arg port "$port" --arg id "$uuid" --arg ps "$remark" \
@@ -720,6 +765,7 @@ create_shadowsocks() {
         }')" || return 1
 
     api_post add "$body" >/dev/null || return 1
+    verify_inbound_saved "$port" "shadowsocks" || return 1
 
     userinfo="$(printf '%s' "$method:$password" | base64 -w0)" || return 1
     printf 'ss://%s@%s:%s#%s\n' \
