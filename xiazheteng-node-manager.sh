@@ -1,7 +1,7 @@
 
 #!/usr/bin/env bash
 # ============================================================
-# 瞎折腾吧 | VPS 节点管理器（监听诊断修订版）
+# 瞎折腾吧 | VPS 节点管理器（端口选择修复版）
 # Ubuntu / Debian
 # VLESS REALITY + VLESS TLS + VMess TCP + Shadowsocks
 # 自动检测、故障隔离、订阅检查、TLS 证书管理
@@ -47,7 +47,7 @@ need_root() {
 }
 
 # ------------------------------------------------------------
-# 基础工具
+# 基础工具与端口检查
 # ------------------------------------------------------------
 
 install_dependencies() {
@@ -99,16 +99,24 @@ get_public_ip() {
     return 1
 }
 
+# 返回 0 表示 TCP 端口未被监听，可以尝试使用。
+# 返回 1 表示端口已被监听或端口参数无效。
 port_free() {
     local port="$1"
 
     [[ "$port" =~ ^[0-9]+$ ]] || return 1
     (( port >= 1 && port <= 65535 )) || return 1
 
-    ! ss -H -lnt 2>/dev/null |
-        awk -v p=":$port" '$4 ~ (p "$") {found=1} END {exit !found}'
+    if ss -H -lnt 2>/dev/null |
+        awk -v p=":$port" '$4 ~ (p "$") {found=1} END {exit !found}'; then
+        return 1
+    fi
+
+    return 0
 }
 
+# 按候选顺序选择第一个当前未被 TCP 监听的端口。
+# 不查询 3x-ui 的历史入站列表，避免把未监听的旧配置误判为端口占用。
 choose_port() {
     local port
 
@@ -136,11 +144,11 @@ open_ufw_port_if_active() {
     fi
 
     # 不自动清空 iptables/nftables 规则。
-    # 云厂商安全组需要用户在服务商控制台放行。
+    # 云服务商安全组需要在服务商控制台检查。
 }
 
 # ------------------------------------------------------------
-# 3x-ui 检测和 API
+# 3x-ui 检测与 API
 # ------------------------------------------------------------
 
 detect_xui() {
@@ -194,7 +202,7 @@ install_xui() {
 
 detect_xui_port() {
     ss -H -lntp 2>/dev/null | awk '
-        /users:\( \("x-ui"/ || /users:\(("x-ui"/ {
+        /users:\(\("x-ui"/ {
             addr=$4
             sub(/^.*:/, "", addr)
             if (addr ~ /^[0-9]+$/ && addr > 0 && addr <= 65535) {
@@ -325,48 +333,6 @@ api_post() {
     fi
 
     printf '%s' "$response"
-}
-
-# 检查端口是否已经存在于 3x-ui 入站列表。
-# 不能只检查系统监听状态：已禁用的入站也可能占用配置中的端口。
-xui_port_in_use() {
-    local port="$1"
-    local root list
-
-    [[ -s "$COOKIE" && -s "$API_ROOT_FILE" ]] || return 1
-
-    root="$(cat "$API_ROOT_FILE")"
-    list="$(curl -fsS --max-time 10 -b "$COOKIE" \
-        "${root}panel/api/inbounds/list" 2>/dev/null || true)"
-
-    jq -e --argjson p "$port" \
-        '.success == true and
-         ([.obj[]? | select((.port | tonumber?) == $p)] | length > 0)' \
-        >/dev/null 2>&1 <<< "$list"
-}
-
-# 节点端口必须同时满足：
-# 1. 操作系统当前没有 TCP 监听；
-# 2. 3x-ui 入站列表中没有相同端口。
-choose_node_port() {
-    local port
-
-    for port in "$@"; do
-        if ! port_free "$port"; then
-            log "[信息] TCP 端口 $port 已被系统监听，跳过。"
-            continue
-        fi
-
-        if xui_port_in_use "$port"; then
-            log "[信息] 3x-ui 已配置端口 $port，跳过以避免重复入站。"
-            continue
-        fi
-
-        printf '%s\n' "$port"
-        return 0
-    done
-
-    return 1
 }
 
 # ------------------------------------------------------------
@@ -570,8 +536,9 @@ obtain_tls_certificate() {
 
 # ------------------------------------------------------------
 # 节点创建
-# 注意：settings / streamSettings / sniffing 按 3x-ui API
-# 的 JSON 字符串格式传递，不要将对应参数随意改成 --argjson。
+#
+# 注意：3x-ui 入站 API 的 settings、streamSettings、sniffing
+# 按当前接口格式作为 JSON 字符串传递，保留 --arg。
 # ------------------------------------------------------------
 
 create_reality() {
@@ -759,7 +726,8 @@ create_shadowsocks() {
 
     userinfo="$(printf '%s' "$method:$password" | base64 -w0)" || return 1
     printf 'ss://%s@%s:%s#%s\n' \
-        "$userinfo" "$ip" "$port" "$remark" >> "$DATA/nodes.txt"
+        "$userinfo" "$ip" "$port" "$remark" \
+        >> "$DATA/nodes.txt"
 
     open_ufw_port_if_active "$port"
     log "[成功] Shadowsocks 入站已提交给 3x-ui。"
@@ -864,11 +832,11 @@ EOF
         return 1
     }
 
-    ss -H -lnt | awk -v p=":$SUB_PORT" \
-        '$4 ~ (p "$") {found=1} END {exit !found}' || {
+    if ! ss -H -lnt | awk -v p=":$SUB_PORT" \
+        '$4 ~ (p "$") {found=1} END {exit !found}'; then
         fail "订阅端口 $SUB_PORT 没有监听。"
         return 1
-    }
+    fi
 
     open_ufw_port_if_active "$SUB_PORT"
 }
@@ -913,7 +881,7 @@ verify_subscription() {
 }
 
 # ------------------------------------------------------------
-# 节点端口和 Xray 状态检查
+# 节点监听验证与诊断
 # ------------------------------------------------------------
 
 remove_last_generated_node() {
@@ -925,9 +893,9 @@ remove_last_generated_node() {
 
 verify_inbound_port() {
     local port="$1"
-    local i list root
+    local i root list
 
-    # 给 3x-ui / Xray 最多 20 秒应用配置。
+    # 等待 Xray 应用新配置，最多 20 秒。
     for i in $(seq 1 20); do
         if ss -H -lnt 2>/dev/null |
             awk -v p=":$port" '$4 ~ (p "$") {found=1} END {exit !found}'; then
@@ -941,15 +909,14 @@ verify_inbound_port() {
 
     if ss -H -lnu 2>/dev/null |
         awk -v p=":$port" '$4 ~ (p "$") {found=1} END {exit !found}'; then
-        log "[诊断] 发现 UDP $port，但节点所需的 TCP 监听未出现。"
+        log "[诊断] 发现 UDP $port，但 TCP 监听未出现。"
     fi
 
-    log "[诊断] 该端口当前的 TCP/UDP 套接字："
+    log "[诊断] 当前相关监听："
     ss -H -lntup 2>/dev/null |
-        awk -v p=":$port" 'index($0,p) {print "[套接字] " $0}' |
+        awk -v p=":$port" 'index($0,p) {print "[端口] " $0}' |
         while IFS= read -r line; do log "$line"; done
 
-    log "[诊断] 查询 3x-ui 入站列表："
     if [[ -s "$COOKIE" && -s "$API_ROOT_FILE" ]]; then
         root="$(cat "$API_ROOT_FILE")"
         list="$(curl -fsS --max-time 10 -b "$COOKIE" \
@@ -958,19 +925,18 @@ verify_inbound_port() {
         if jq -e '.success == true' >/dev/null 2>&1 <<< "$list"; then
             jq -r --argjson p "$port" '
                 .obj[]? |
-                select((.port | tonumber?) == $p) |
+                select((.port|tonumber)==$p) |
                 "[入站] id=\(.id // "?") protocol=\(.protocol // "?") enable=\(.enable // false) remark=\(.remark // "")"
-            ' <<< "$list" |
+            ' <<< "$list' 2>/dev/null |
                 while IFS= read -r line; do log "$line"; done
 
             if ! jq -e --argjson p "$port" \
-                '.obj[]? | select((.port | tonumber?) == $p)' \
+                '.obj[]? | select((.port|tonumber)==$p)' \
                 >/dev/null 2>&1 <<< "$list"; then
-                log "[诊断] 入站列表中没有端口 $port，可能未成功保存。"
+                log "[诊断] API 入站列表中未找到端口 $port。"
             fi
         else
             log "[诊断] 无法读取 3x-ui 入站列表。"
-            log "[诊断] API 响应：$list"
         fi
     fi
 
@@ -978,12 +944,8 @@ verify_inbound_port() {
     journalctl -u x-ui --since "-5 minutes" -n 160 --no-pager 2>/dev/null |
         while IFS= read -r line; do log "[x-ui] $line"; done
 
-    log "[诊断] 当前 Xray 进程："
-    pgrep -a -f '(^|/)xray([[:space:]]|$)' 2>/dev/null |
-        while IFS= read -r line; do log "[进程] $line"; done || true
-
-    log "[诊断] 不自动重启 x-ui，以免中断现有节点。"
-    log "[建议] 重点检查日志中是否存在配置解析错误、端口冲突或入站配置错误。"
+    log "[诊断] 不自动重启 x-ui，以免中断已有节点。"
+    log "[建议] 检查 Xray 配置解析错误、端口冲突及入站配置。"
 
     return 1
 }
@@ -1017,10 +979,11 @@ deploy_all() {
         log "[警告] 域名配置无效或读取失败，本轮跳过 TLS 节点。"
     fi
 
-    # 使用增强版端口选择，避免重复使用 3x-ui 中已有的入站端口。
-    p1="$(choose_node_port 24443 18443 14443 10443)" || p1=""
-    p2="$(choose_node_port 23456 23457 23458 23459)" || p2=""
-    p3="$(choose_node_port 23888 23889 23890 23891)" || p3=""
+    # 修复重点：使用原始 choose_port，只根据系统 TCP 监听状态选端口。
+    # 不将 3x-ui 入站列表中的旧记录直接视为端口占用。
+    p1="$(choose_port 24443 18443 14443 10443)" || p1=""
+    p2="$(choose_port 23456 23457 23458 23459)" || p2=""
+    p3="$(choose_port 23888 23889 23890 23891)" || p3=""
 
     tls_port=""
     if (( use_tls == 1 )); then
@@ -1028,19 +991,19 @@ deploy_all() {
             log "[警告] TLS 证书不可用，本轮跳过 TLS 节点。"
             use_tls=0
         else
-            tls_port="$(choose_node_port 443 8443 2053 9443 10443)" || tls_port=""
+            tls_port="$(choose_port 443 8443 2053 9443 10443)" || tls_port=""
             if [[ -z "$tls_port" ]]; then
-                log "[失败] TLS 首选端口及备用端口均不可用。"
+                log "[失败] TLS 首选端口及备用端口均被系统监听。"
                 use_tls=0
             elif [[ "$tls_port" != "443" ]]; then
-                log "[信息] 443 已被占用或已配置，TLS 节点将使用端口 $tls_port。"
+                log "[信息] 443 已被系统监听，TLS 节点将使用备用端口 $tls_port。"
             fi
         fi
     fi
 
-    if [[ -z "$p1" ]]; then log "[警告] 无可用 REALITY 端口。"; fi
-    if [[ -z "$p2" ]]; then log "[警告] 无可用 VMess 端口。"; fi
-    if [[ -z "$p3" ]]; then log "[警告] 无可用 Shadowsocks 端口。"; fi
+    [[ -n "$p1" ]] || log "[警告] 无可用 REALITY 端口。"
+    [[ -n "$p2" ]] || log "[警告] 无可用 VMess 端口。"
+    [[ -n "$p3" ]] || log "[警告] 无可用 Shadowsocks 端口。"
 
     sub_port="$(choose_port "$SUB_PORT" 18889 18890 18891)" || {
         fail "找不到可用订阅端口。"
@@ -1170,8 +1133,8 @@ deploy_all() {
     echo "日志文件：$LOG"
     echo
     echo "[注意] 必须在云服务商安全组放行实际使用的节点端口和订阅端口。"
-    echo "[注意] TLS 证书申请成功不等于 TLS 节点外网可连接。"
-    echo "[注意] 监听检查通过也不代表客户端测速一定成功。"
+    echo "[注意] TLS 证书有效不代表 TLS 节点外网一定可连接。"
+    echo "[注意] 本机监听通过不代表客户端测速一定成功。"
     echo "============================================================"
 
     log "[完成] 节点生成流程结束：成功 $success，失败 $failed。"
@@ -1250,7 +1213,7 @@ main() {
                 ;;
             7)
                 if systemctl restart "$SERVICE"; then
-                    echo "[成功] 已发送重启请求。"
+                    echo "[成功] 已发送订阅服务重启请求。"
                 else
                     echo "[失败] 订阅服务重启失败。"
                     journalctl -u "$SERVICE" -n 40 --no-pager || true
