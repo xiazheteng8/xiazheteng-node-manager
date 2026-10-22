@@ -299,7 +299,7 @@ api_login() {
 
 api_post() {
     local endpoint="$1" body="$2"
-    local root csrf response
+    local root csrf response http_code
     local -a headers=()
 
     [[ -s "$COOKIE" && -s "$API_ROOT_FILE" ]] || {
@@ -316,17 +316,19 @@ api_post() {
     headers=(-H 'Content-Type: application/json')
     [[ -z "$csrf" ]] || headers+=(-H "X-CSRF-Token: $csrf")
 
-    response="$(curl -sS --max-time 20 \
-        -b "$COOKIE" -c "$COOKIE" \
+    # Keep the HTTP status separate from the JSON body so a proxy/login HTML
+    # response cannot be mistaken for a successful API call.
+    http_code="$(curl -sS --max-time 20 -o "$API_RESPONSE_FILE" -w '%{http_code}' \
+        -X POST -b "$COOKIE" -c "$COOKIE" \
         "${headers[@]}" -d "$body" \
         "${root}panel/api/inbounds/$endpoint" 2>/dev/null || true)"
+    response="$(cat "$API_RESPONSE_FILE" 2>/dev/null || true)"
 
     API_LAST_RESPONSE="$response"
-    printf '%s\n' "$response" > "$API_RESPONSE_FILE" 2>/dev/null || true
     chmod 600 "$API_RESPONSE_FILE" 2>/dev/null || true
 
-    if ! jq -e '.success == true' >/dev/null 2>&1 <<< "$response"; then
-        log "[失败] 3x-ui API 操作失败：$endpoint"
+    if [[ "$http_code" != "200" ]] || ! jq -e '.success == true' >/dev/null 2>&1 <<< "$response"; then
+        log "[失败] 3x-ui API 操作失败：$endpoint（HTTP ${http_code:-未知}）"
         # Avoid printing the full payload: some responses may contain client secrets.
         log "[诊断] API 响应摘要：$(jq -c '{success,msg,errmsg,code,obj:(if (.obj|type)=="object" then {id:.obj.id,port:.obj.port,protocol:.obj.protocol,remark:.obj.remark} else .obj end)}' <<< "$response" 2>/dev/null || printf '%s' '响应不是有效 JSON')"
         return 1
@@ -338,7 +340,7 @@ api_post() {
 
 verify_inbound_saved() {
     local port="$1" protocol="$2"
-    local root list found i
+    local root list found i list_http_code list_tmp
 
     [[ -s "$COOKIE" && -s "$API_ROOT_FILE" ]] || {
         log "[失败] 无法验证入站：API 会话不存在。"
@@ -346,16 +348,23 @@ verify_inbound_saved() {
     }
 
     root="$(cat "$API_ROOT_FILE")"
-    # 3x-ui 可能在 API 返回后短暂延迟更新列表，重试 10 次。
+    list_tmp="$(mktemp)" || return 1
+    chmod 600 "$list_tmp" 2>/dev/null || true
+
+    # Check both HTTP status and JSON content. Older code silently discarded
+    # curl errors, making an empty API response look like an empty inbound list.
     for i in $(seq 1 10); do
-        list="$(curl -sS --max-time 10 -b "$COOKIE" \
+        list_http_code="$(curl -sS --max-time 10 -o "$list_tmp" -w '%{http_code}' \
+            -b "$COOKIE" -c "$COOKIE" \
             "${root}panel/api/inbounds/list" 2>/dev/null || true)"
+        list="$(cat "$list_tmp" 2>/dev/null || true)"
 
         if jq -e '.success == true' >/dev/null 2>&1 <<< "$list"; then
             found="$(jq -r --argjson p "$port" --arg proto "$protocol" \
                 '[.obj[]? | select((.port|tonumber)==$p and .protocol==$proto)] | length' \
                 <<< "$list" 2>/dev/null || printf '0')"
             if [[ "$found" =~ ^[0-9]+$ ]] && (( found > 0 )); then
+                rm -f "$list_tmp"
                 log "[成功] API 入站列表已确认保存：$protocol / $port。"
                 return 0
             fi
@@ -369,12 +378,37 @@ verify_inbound_saved() {
         create_response="$(cat "$API_RESPONSE_FILE" 2>/dev/null || true)"
     fi
     log "[诊断] 创建响应摘要：$(jq -c '{success,msg,errmsg,code,obj:(if (.obj|type)=="object" then {id:.obj.id,port:.obj.port,protocol:.obj.protocol,remark:.obj.remark} else .obj end)}' <<< "$create_response" 2>/dev/null || printf '%s' '响应不是有效 JSON')"
-    log "[诊断] 当前入站列表响应摘要：$(jq -c '{success,msg,errmsg,code}' <<< "$list" 2>/dev/null || printf '%s' '响应不是有效 JSON')"
+    log "[诊断] 入站列表 HTTP 状态：${list_http_code:-未知}；响应字节数：$(wc -c < "$list_tmp" 2>/dev/null || printf '0')"
+    log "[诊断] 当前入站列表响应摘要：$(jq -c '{success,msg,errmsg,code,objType:(.obj|type),objCount:(.obj|if type=="array" then length else null end)}' <<< "$list" 2>/dev/null || printf '%s' '响应不是有效 JSON 或响应为空')"
     log "[诊断] 当前入站列表中相关协议/端口："
     jq -r --argjson p "$port" --arg proto "$protocol" \
-        '.obj[]? | select((.port|tonumber)==$p or .protocol==$proto) | "[入站] id=\(.id // "?") protocol=\(.protocol // "?") port=\(.port // "?") enable=\(.enable // false) remark=\(.remark // "")"' \
-        <<< "$list" | while IFS= read -r line; do log "$line"; done
+        '.obj[]? | select((.port|tonumber)==$p or .protocol==$proto) | "[入站] id=\(.id // \"?\") protocol=\(.protocol // \"?\") port=\(.port // \"?\") enable=\(.enable // false) remark=\(.remark // \"\")"' \
+        <<< "$list" 2>/dev/null | while IFS= read -r line; do log "$line"; done
+    rm -f "$list_tmp"
     return 1
+}
+
+# Create an inbound using the preferred nested-JSON format first, then
+# automatically fall back to the legacy JSON-string format used by older panels.
+api_add_inbound_compat() {
+    local port="$1" protocol="$2" body="$3" legacy_body
+
+    if api_post add "$body" >/dev/null && verify_inbound_saved "$port" "$protocol"; then
+        return 0
+    fi
+
+    log "[兼容] 嵌套 JSON 格式未能确认入站保存，改用旧版 JSON 字符串格式重试：$protocol / $port。"
+    legacy_body="$(jq -c '
+        .settings = (.settings | tojson) |
+        .streamSettings = (.streamSettings | tojson) |
+        .sniffing = (.sniffing | tojson)
+    ' <<< "$body")" || {
+        log "[失败] 无法生成旧版 API 请求格式。"
+        return 1
+    }
+
+    api_post add "$legacy_body" >/dev/null || return 1
+    verify_inbound_saved "$port" "$protocol" || return 1
 }
 
 # ------------------------------------------------------------
@@ -625,21 +659,22 @@ create_reality() {
 
     sniff='{"enabled":true,"destOverride":["http","tls","quic"]}'
 
-    # 3x-ui inbound API expects settings/streamSettings/sniffing as JSON-encoded strings.
+    # Send settings/streamSettings/sniffing as JSON objects. This is the
+    # preferred payload shape in current 3x-ui API documentation and avoids
+    # version-specific double-encoded JSON handling.
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --arg settings "$settings" \
-        --arg stream "$stream" \
-        --arg sniff "$sniff" \
+        --argjson settings "$settings" \
+        --argjson stream "$stream" \
+        --argjson sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",port:$port,protocol:"vless",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
           total:0,expiryTime:0
         }')" || return 1
 
-    api_post add "$body" >/dev/null || return 1
-    verify_inbound_saved "$port" "vless" || return 1
+    api_add_inbound_compat "$port" "vless" "$body" || return 1
 
     printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
         "$uuid" "$ip" "$port" "$public" "$short" "$remark" \
@@ -683,17 +718,16 @@ create_tls() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --arg settings "$settings" \
-        --arg stream "$stream" \
-        --arg sniff "$sniff" \
+        --argjson settings "$settings" \
+        --argjson stream "$stream" \
+        --argjson sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",port:$port,protocol:"vless",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
           total:0,expiryTime:0
         }')" || return 1
 
-    api_post add "$body" >/dev/null || return 1
-    verify_inbound_saved "$port" "vless" || return 1
+    api_add_inbound_compat "$port" "vless" "$body" || return 1
 
     printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=tcp#%s\n' \
         "$uuid" "$domain" "$port" "$domain" "$remark" \
@@ -720,17 +754,16 @@ create_vmess() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --arg settings "$settings" \
-        --arg stream "$stream" \
-        --arg sniff "$sniff" \
+        --argjson settings "$settings" \
+        --argjson stream "$stream" \
+        --argjson sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",port:$port,protocol:"vmess",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
           total:0,expiryTime:0
         }')" || return 1
 
-    api_post add "$body" >/dev/null || return 1
-    verify_inbound_saved "$port" "vmess" || return 1
+    api_add_inbound_compat "$port" "vmess" "$body" || return 1
 
     vmess_json="$(jq -cn \
         --arg add "$ip" --arg port "$port" --arg id "$uuid" --arg ps "$remark" \
@@ -763,17 +796,16 @@ create_shadowsocks() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --arg settings "$settings" \
-        --arg stream "$stream" \
-        --arg sniff "$sniff" \
+        --argjson settings "$settings" \
+        --argjson stream "$stream" \
+        --argjson sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",port:$port,protocol:"shadowsocks",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
           total:0,expiryTime:0
         }')" || return 1
 
-    api_post add "$body" >/dev/null || return 1
-    verify_inbound_saved "$port" "shadowsocks" || return 1
+    api_add_inbound_compat "$port" "shadowsocks" "$body" || return 1
 
     userinfo="$(printf '%s' "$method:$password" | base64 -w0)" || return 1
     printf 'ss://%s@%s:%s#%s\n' \
