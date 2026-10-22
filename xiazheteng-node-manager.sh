@@ -415,31 +415,34 @@ ask_domain_mode() {
     echo "是否使用域名部署 VLESS TLS 节点？"
     echo "  1. 是，输入域名并自动检查证书"
     echo "  2. 否，跳过 TLS 节点"
+    echo "  也可以直接输入域名，例如 xiazheteng.fun"
     read -r -p "请选择 [默认 2]：" answer </dev/tty || return 1
 
     case "${answer:-2}" in
         1)
             read -r -p "请输入已解析到本 VPS 的域名：" TLS_DOMAIN </dev/tty || return 1
-            TLS_DOMAIN="${TLS_DOMAIN,,}"
-            TLS_DOMAIN="${TLS_DOMAIN%.}"
-
-            if [[ ! "$TLS_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ||
-                  "$TLS_DOMAIN" == *..* ]]; then
-                fail "域名格式不正确。"
-                return 1
-            fi
-
-            USE_TLS=1
             ;;
         2)
             USE_TLS=0
             TLS_DOMAIN=""
+            return 0
             ;;
         *)
-            fail "无效选项。"
-            return 1
+            # 兼容用户在选项提示处直接输入域名的操作方式。
+            TLS_DOMAIN="$answer"
             ;;
     esac
+
+    TLS_DOMAIN="${TLS_DOMAIN,,}"
+    TLS_DOMAIN="${TLS_DOMAIN%.}"
+
+    if [[ ! "$TLS_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ||
+          "$TLS_DOMAIN" == *..* ]]; then
+        fail "域名格式不正确。"
+        return 1
+    fi
+
+    USE_TLS=1
 }
 
 obtain_tls_certificate() {
@@ -576,9 +579,9 @@ create_reality() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --arg settings "$settings" \
-        --arg stream "$stream" \
-        --arg sniff "$sniff" \
+        --argjson settings "$settings" \
+        --argjson stream "$stream" \
+        --argjson sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"vless",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
@@ -629,9 +632,9 @@ create_tls() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --arg settings "$settings" \
-        --arg stream "$stream" \
-        --arg sniff "$sniff" \
+        --argjson settings "$settings" \
+        --argjson stream "$stream" \
+        --argjson sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"vless",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
@@ -665,9 +668,9 @@ create_vmess() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --arg settings "$settings" \
-        --arg stream "$stream" \
-        --arg sniff "$sniff" \
+        --argjson settings "$settings" \
+        --argjson stream "$stream" \
+        --argjson sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"vmess",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
@@ -707,9 +710,9 @@ create_shadowsocks() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --arg settings "$settings" \
-        --arg stream "$stream" \
-        --arg sniff "$sniff" \
+        --argjson settings "$settings" \
+        --argjson stream "$stream" \
+        --argjson sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"shadowsocks",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
