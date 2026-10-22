@@ -579,9 +579,9 @@ create_reality() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --argjson settings "$settings" \
-        --argjson stream "$stream" \
-        --argjson sniff "$sniff" \
+        --arg settings "$settings" \
+        --arg stream "$stream" \
+        --arg sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"vless",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
@@ -632,9 +632,9 @@ create_tls() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --argjson settings "$settings" \
-        --argjson stream "$stream" \
-        --argjson sniff "$sniff" \
+        --arg settings "$settings" \
+        --arg stream "$stream" \
+        --arg sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"vless",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
@@ -668,9 +668,9 @@ create_vmess() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --argjson settings "$settings" \
-        --argjson stream "$stream" \
-        --argjson sniff "$sniff" \
+        --arg settings "$settings" \
+        --arg stream "$stream" \
+        --arg sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"vmess",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
@@ -710,9 +710,9 @@ create_shadowsocks() {
     body="$(jq -cn \
         --arg remark "$remark" \
         --argjson port "$port" \
-        --argjson settings "$settings" \
-        --argjson stream "$stream" \
-        --argjson sniff "$sniff" \
+        --arg settings "$settings" \
+        --arg stream "$stream" \
+        --arg sniff "$sniff" \
         '{
           enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"shadowsocks",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
