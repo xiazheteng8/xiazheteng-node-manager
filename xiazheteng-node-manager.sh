@@ -1,498 +1,779 @@
-
 #!/usr/bin/env bash
 # ============================================================
-# 瞎折腾吧 | 3x-ui 自动节点管理器
-# 目标：Ubuntu / Debian + 3x-ui v3.x
-# YouTube: https://www.youtube.com/@xiazheteng8
-# Telegram: https://t.me/xiazheteng8
-#
-# 功能：
-#   1. 自动读取 x-ui.db 中的面板配置
-#   2. 自动识别 Web Base Path、端口和登录凭据
-#   3. 自动生成 VLESS + REALITY 节点
-#   4. 自动选择空闲端口
-#   5. 自动生成分享链接和 Base64 订阅
-#   6. 不删除、不重置已有节点和面板配置
-#
-# 注意：如果无法可靠读取凭据或 API 认证失败，会安全退出。
+# 瞎折腾吧 | 3x-ui / Xray 节点管理器
+# 单文件版本：复用已有 3x-ui，不重建数据库，不删除已有节点
+# 修复重点：JSON 登录、自定义 Base Path、403 诊断、避免重复登录
 # ============================================================
 
 set -Eeuo pipefail
 umask 077
 
-APP="xiazheteng-node-manager"
-BASE="/etc/$APP"
-DATA="$BASE/data"
-NODE_FILE="$DATA/nodes.txt"
-SUB_FILE="$DATA/subscription.txt"
-INFO_FILE="$DATA/node.env"
-BACKUP_DIR="$BASE/backup"
-
+APP_NAME="瞎折腾吧 | VPS 节点管理器"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 DB="/etc/x-ui/x-ui.db"
-XRAY=""
-PANEL_PORT=""
-BASE_PATH=""
-PANEL_USER=""
-PANEL_PASS=""
-PUBLIC_IP=""
-NODE_PORT=""
-UUID=""
-PRIVATE_KEY=""
-PUBLIC_KEY=""
-SHORT_ID=""
-SNI="www.microsoft.com"
-REMARK="瞎折腾吧-REALITY"
-COOKIE="$(mktemp)"
-WORK="$(mktemp -d)"
+WORK_DIR="/tmp/xiazheteng-node-manager"
+COOKIE_JAR="$WORK_DIR/cookies.txt"
+RESPONSE_FILE="$WORK_DIR/response.txt"
+LOGIN_JSON="$WORK_DIR/login.json"
+INBOUND_JSON="$WORK_DIR/inbound.json"
 
-info(){ printf '\033[1;34m[信息]\033[0m %s\n' "$*"; }
-ok(){ printf '\033[1;32m[成功]\033[0m %s\n' "$*"; }
-warn(){ printf '\033[1;33m[提示]\033[0m %s\n' "$*"; }
-die(){ printf '\033[1;31m[错误]\033[0m %s\n' "$*" >&2; exit 1; }
+mkdir -p "$WORK_DIR"
+chmod 700 "$WORK_DIR"
 
-cleanup(){
-  rm -f "$COOKIE"
-  rm -rf "$WORK"
+RED='\033[31m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+BLUE='\033[36m'
+RESET='\033[0m'
+
+info() { echo -e "${BLUE}[信息]${RESET} $*"; }
+ok()   { echo -e "${GREEN}[成功]${RESET} $*"; }
+warn() { echo -e "${YELLOW}[警告]${RESET} $*"; }
+err()  { echo -e "${RED}[错误]${RESET} $*" >&2; }
+
+pause() {
+    echo
+    read -r -p "按回车键继续..." _
 }
-trap cleanup EXIT
 
-[[ $EUID -eq 0 ]] || die "请使用 root 权限运行。"
-[[ -f "$DB" ]] || die "未找到数据库：$DB"
-command -v python3 >/dev/null 2>&1 || die "缺少 python3。"
-command -v curl >/dev/null 2>&1 || die "缺少 curl。"
-command -v openssl >/dev/null 2>&1 || die "缺少 openssl。"
-command -v ss >/dev/null 2>&1 || die "缺少 ss。"
+need_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        err "请使用 root 运行：sudo bash $SCRIPT_PATH"
+        exit 1
+    fi
+}
 
-mkdir -p "$DATA" "$BACKUP_DIR"
-chmod 700 "$BASE" "$DATA" "$BACKUP_DIR"
+check_dependencies() {
+    local missing=()
+    for cmd in curl python3 openssl; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+
+    if ((${#missing[@]})); then
+        err "缺少依赖：${missing[*]}"
+        echo "Debian/Ubuntu 可执行："
+        echo "apt-get update && apt-get install -y curl python3 openssl"
+        return 1
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        warn "未检测到 jq，部分 JSON 操作将使用 Python 处理。"
+    fi
+}
 
 # ------------------------------------------------------------
-# 1. 自动识别数据库配置
+# 读取 3x-ui 数据库设置
+# 不打印密码；不修改数据库
 # ------------------------------------------------------------
+db_setting() {
+    local key="$1"
 
-info "正在读取 3x-ui 数据库结构……"
+    [[ -f "$DB" ]] || return 1
 
-python3 - "$DB" "$WORK/db.env" <<'PY'
-import sqlite3, sys, os, re
+    python3 - "$DB" "$key" <<'PY'
+import sqlite3, sys
 
-db, out = sys.argv[1:]
-con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-con.row_factory = sqlite3.Row
-tables = [
-    r["name"] for r in con.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    )
-]
-
-values = {}
-
-# 兼容常见 key/value 设置表结构。
-for table in tables:
-    try:
-        cols = [r["name"] for r in con.execute(
-            f'PRAGMA table_info("{table}")'
-        )]
-    except Exception:
-        continue
-
-    lower = {c.lower(): c for c in cols}
-
-    if "key" in lower and "value" in lower:
-        try:
-            rows = con.execute(
-                f'SELECT "{lower["key"]}", "{lower["value"]}" FROM "{table}"'
-            )
-            for row in rows:
-                if row[0] is not None and row[1] is not None:
-                    values[str(row[0]).lower()] = str(row[1])
-        except Exception:
-            pass
-
-    # 某些版本把面板用户放在独立 users 表中。
-    if "username" in lower and "password" in lower:
-        try:
-            row = con.execute(
-                f'SELECT "{lower["username"]}", "{lower["password"]}" '
-                f'FROM "{table}" LIMIT 1'
-            ).fetchone()
-            if row:
-                values.setdefault("username", str(row[0] or ""))
-                values.setdefault("password", str(row[1] or ""))
-        except Exception:
-            pass
-
-def first(*keys):
-    for key in keys:
-        val = values.get(key.lower(), "")
-        if val != "":
-            return val
-    return ""
-
-port = first("webPort", "webport", "web_port", "port")
-base = first("webBasePath", "webbasepath", "web_base_path", "basePath")
-user = first("username", "webUser", "webUsername")
-password = first("password", "webPass", "webPassword")
-
-# 只接受合法端口。
+db, wanted = sys.argv[1], sys.argv[2]
 try:
-    port = int(port)
-    if not 1 <= port <= 65535:
-        raise ValueError()
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
+    tables = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()
+
+    aliases = {
+        "username": ["username", "webUser", "webUsername"],
+        "password": ["password", "webPass", "webPassword"],
+        "webPort": ["webPort", "port"],
+        "webBasePath": ["webBasePath", "basePath", "webPath"],
+        "webListen": ["webListen", "listen"],
+    }
+    candidates = aliases.get(wanted, [wanted])
+
+    for (table,) in tables:
+        cols = [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
+        if "key" in cols and "value" in cols:
+            for key in candidates:
+                row = con.execute(
+                    f'SELECT value FROM "{table}" WHERE key=? LIMIT 1',
+                    (key,)
+                ).fetchone()
+                if row and row[0] is not None and str(row[0]) != "":
+                    print(str(row[0]))
+                    con.close()
+                    sys.exit(0)
+
+        # 某些版本使用单行 settings 表
+        for key in candidates:
+            if key in cols:
+                row = con.execute(
+                    f'SELECT "{key}" FROM "{table}" LIMIT 1'
+                ).fetchone()
+                if row and row[0] is not None and str(row[0]) != "":
+                    print(str(row[0]))
+                    con.close()
+                    sys.exit(0)
+
+    con.close()
 except Exception:
-    port = ""
-
-# Base Path 规范化为以 / 开头、以 / 结尾。
-base = (base or "").strip()
-if base and not base.startswith("/"):
-    base = "/" + base
-if base and not base.endswith("/"):
-    base += "/"
-
-def q(v):
-    return "'" + str(v).replace("'", "'\\''") + "'"
-
-with open(out, "w", encoding="utf-8") as f:
-    f.write(f"PANEL_PORT={q(port)}\n")
-    f.write(f"BASE_PATH={q(base)}\n")
-    f.write(f"PANEL_USER={q(user)}\n")
-    f.write(f"PANEL_PASS={q(password)}\n")
-
-print("发现数据库表：", ", ".join(tables))
-print("面板端口：", port if port else "无法可靠识别")
-print("Base Path：", base if base else "(根路径)")
-print("用户名：", "已识别" if user else "未识别")
-print("密码字段：", "已识别" if password else "未识别")
-con.close()
+    pass
+sys.exit(1)
 PY
-
-# 数据库导出文件由本机 Python 生成，只包含 shell 赋值。
-# shellcheck disable=SC1090
-source "$WORK/db.env"
-
-[[ -n "$PANEL_PORT" ]] || die \
-  "无法从数据库可靠识别面板端口。为保护现有环境，未修改任何配置。"
-
-if [[ -z "$PANEL_USER" || -z "$PANEL_PASS" ]]; then
-  die "无法从数据库可靠读取面板用户名或密码。脚本不会猜测凭据或重置密码。请先核实当前版本的数据库字段结构。"
-fi
-
-info "面板地址将使用本机 HTTP 和数据库识别出的 Base Path。"
-
-# ------------------------------------------------------------
-# 2. 定位 Xray
-# ------------------------------------------------------------
-
-for candidate in \
-  /usr/local/x-ui/bin/xray-linux-amd64 \
-  /usr/local/x-ui/bin/xray \
-  /usr/local/bin/xray \
-  /usr/bin/xray
-do
-  if [[ -x "$candidate" ]]; then
-    XRAY="$candidate"
-    break
-  fi
-done
-
-if [[ -z "$XRAY" ]]; then
-  XRAY="$(command -v xray || true)"
-fi
-
-[[ -n "$XRAY" && -x "$XRAY" ]] || die \
-  "没有找到可执行的 Xray。请检查 3x-ui 安装目录。"
-
-# ------------------------------------------------------------
-# 3. 自动检测面板登录路径
-# ------------------------------------------------------------
-
-API_ROOT="http://127.0.0.1:${PANEL_PORT}${BASE_PATH}"
-
-info "正在自动验证面板 API……"
-
-LOGIN_HTTP="$(
-  curl -sS --connect-timeout 5 --max-time 15 \
-    -o "$WORK/login.body" \
-    -w '%{http_code}' \
-    -c "$COOKIE" -b "$COOKIE" \
-    -X POST "${API_ROOT}login" \
-    --data-urlencode "username=${PANEL_USER}" \
-    --data-urlencode "password=${PANEL_PASS}" \
-    || true
-)"
-
-if [[ "$LOGIN_HTTP" != "200" ]]; then
-  warn "面板登录 HTTP 状态：${LOGIN_HTTP:-连接失败}"
-  if [[ "$LOGIN_HTTP" == "403" ]]; then
-    die "面板返回 403。可能是 Base Path、访问策略或认证机制不匹配；未修改面板、数据库或已有节点。"
-  elif [[ "$LOGIN_HTTP" == "404" ]]; then
-    die "登录地址返回 404。数据库中的 Base Path 与实际路由可能不一致；未修改现有配置。"
-  else
-    die "面板 API 登录未成功。响应已保存在临时目录中，脚本退出时会清理。"
-  fi
-fi
-
-if ! grep -Eqi '"success"[[:space:]]*:[[:space:]]*true' "$WORK/login.body"; then
-  warn "HTTP 返回 200，但响应未明确表示登录成功。"
-  die "为避免向未认证的 API 写入数据，已停止。"
-fi
-
-ok "面板 API 登录成功。"
-
-# ------------------------------------------------------------
-# 4. 自动选择空闲端口
-# ------------------------------------------------------------
-
-port_used(){
-  ss -H -lnt 2>/dev/null |
-    awk '{print $4}' |
-    grep -Eq "(:|\\])${1}$"
 }
 
-NODE_PORT=""
-for _ in $(seq 1 200); do
-  p="$(shuf -i 20000-60000 -n 1)"
-  if ! port_used "$p"; then
-    NODE_PORT="$p"
-    break
-  fi
-done
+# 尝试从官方 CLI 读取设置；不自动更改设置
+cli_settings() {
+    local cli=""
+    for p in /usr/local/x-ui/x-ui /usr/bin/x-ui /usr/local/bin/x-ui; do
+        if [[ -x "$p" ]]; then
+            cli="$p"
+            break
+        fi
+    done
 
-[[ -n "$NODE_PORT" ]] || die "无法找到空闲端口。"
+    if [[ -n "$cli" ]]; then
+        "$cli" setting -show 2>/dev/null || true
+    elif command -v x-ui >/dev/null 2>&1; then
+        x-ui setting -show 2>/dev/null || true
+    fi
+}
+
+normalise_base_path() {
+    local p="${1:-/}"
+
+    [[ -n "$p" ]] || p="/"
+
+    if [[ "$p" != /* ]]; then
+        p="/$p"
+    fi
+
+    if [[ "$p" != */ ]]; then
+        p="$p/"
+    fi
+
+    printf '%s' "$p"
+}
+
+discover_panel() {
+    PANEL_PORT="$(db_setting webPort 2>/dev/null || true)"
+    PANEL_BASE="$(db_setting webBasePath 2>/dev/null || true)"
+    PANEL_USER="$(db_setting username 2>/dev/null || true)"
+    PANEL_PASS="$(db_setting password 2>/dev/null || true)"
+
+    # CLI 作为补充信息，不能保证所有版本都以相同格式输出
+    if [[ -z "$PANEL_PORT" || -z "$PANEL_BASE" ]]; then
+        local settings=""
+        settings="$(cli_settings)"
+        if [[ -z "$PANEL_PORT" ]]; then
+            PANEL_PORT="$(printf '%s\n' "$settings" |
+                sed -nE 's/.*webPort[^0-9]*([0-9]{2,5}).*/\1/p' |
+                head -n1)"
+        fi
+        if [[ -z "$PANEL_BASE" ]]; then
+            PANEL_BASE="$(printf '%s\n' "$settings" |
+                sed -nE 's/.*webBasePath[^[:alnum:]\/]*([^[:space:]]+).*/\1/p' |
+                head -n1)"
+        fi
+    fi
+
+    [[ "$PANEL_PORT" =~ ^[0-9]{1,5}$ ]] || PANEL_PORT="2053"
+    PANEL_BASE="$(normalise_base_path "${PANEL_BASE:-/}")"
+
+    # 使用回环地址访问本机面板，避免依赖公网域名和 Cloudflare
+    PANEL_ORIGIN="http://127.0.0.1:${PANEL_PORT}"
+    PANEL_PREFIX="${PANEL_ORIGIN}${PANEL_BASE}"
+    LOGIN_URL="${PANEL_PREFIX%/}/login"
+    API_PREFIX="${PANEL_PREFIX%/}/panel/api"
+
+    info "面板本地地址：$PANEL_ORIGIN"
+    info "面板访问路径：$PANEL_BASE"
+}
 
 # ------------------------------------------------------------
-# 5. 自动获取公网 IPv4
+# API 请求封装
 # ------------------------------------------------------------
+api_request() {
+    local method="$1"
+    local endpoint="$2"
+    local data="${3:-}"
+    local url="${API_PREFIX}${endpoint}"
+    local status
 
-for url in \
-  https://api.ipify.org \
-  https://ipv4.icanhazip.com \
-  https://ifconfig.me/ip
-do
-  PUBLIC_IP="$(curl -4 -fsS --connect-timeout 5 --max-time 10 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-  if python3 - "$PUBLIC_IP" <<'PY' >/dev/null 2>&1
-import ipaddress,sys
-ipaddress.IPv4Address(sys.argv[1])
+    : > "$RESPONSE_FILE"
+
+    if [[ "$method" == "GET" ]]; then
+        status="$(curl -sS --connect-timeout 3 --max-time 15 \
+            -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+            -o "$RESPONSE_FILE" -w '%{http_code}' \
+            "$url" 2>"$WORK_DIR/curl-error.txt" || true)"
+    else
+        status="$(curl -sS --connect-timeout 3 --max-time 20 \
+            -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+            -H 'Content-Type: application/json' \
+            --data-binary "@$data" \
+            -o "$RESPONSE_FILE" -w '%{http_code}' \
+            "$url" 2>"$WORK_DIR/curl-error.txt" || true)"
+    fi
+
+    printf '%s' "${status:-000}"
+}
+
+api_login() {
+    discover_panel
+
+    # 如果数据库中没有可靠的凭据，要求用户输入，不猜测默认密码。
+    if [[ -z "${PANEL_USER:-}" ]]; then
+        read -r -p "请输入 3x-ui 用户名：" PANEL_USER
+    else
+        info "已从本地设置数据库读取用户名。"
+    fi
+
+    if [[ -z "${PANEL_PASS:-}" ]]; then
+        read -r -s -p "请输入 3x-ui 密码：" PANEL_PASS
+        echo
+    else
+        info "已从本地设置数据库读取密码。"
+    fi
+
+    if [[ -z "$PANEL_USER" || -z "$PANEL_PASS" ]]; then
+        err "用户名或密码为空。"
+        return 1
+    fi
+
+    # 先检测面板实际响应，防止把 404 当作登录失败
+    local probe_status
+    probe_status="$(curl -sS --connect-timeout 3 --max-time 8 \
+        -o "$RESPONSE_FILE" -w '%{http_code}' \
+        "$LOGIN_URL" 2>"$WORK_DIR/curl-error.txt" || true)"
+
+    if [[ "${probe_status:-000}" == "000" ]]; then
+        err "无法连接面板：$LOGIN_URL"
+        cat "$WORK_DIR/curl-error.txt" 2>/dev/null || true
+        err "请确认端口、监听地址和服务状态。"
+        return 1
+    fi
+
+    if [[ "$probe_status" == "404" ]]; then
+        err "登录路径返回 404，当前 Base Path 可能不正确。"
+        echo "已检测路径：$LOGIN_URL"
+        echo "不会尝试猜测密码，也不会修改数据库。"
+        return 1
+    fi
+
+    # 使用 JSON 请求体；明确包含 twoFactorCode 空字段
+    python3 - "$LOGIN_JSON" "$PANEL_USER" "$PANEL_PASS" <<'PY'
+import json, sys
+path, username, password = sys.argv[1:]
+with open(path, "w", encoding="utf-8") as f:
+    json.dump({
+        "username": username,
+        "password": password,
+        "twoFactorCode": ""
+    }, f)
 PY
-  then
-    break
-  fi
-  PUBLIC_IP=""
-done
+    chmod 600 "$LOGIN_JSON"
 
-[[ -n "$PUBLIC_IP" ]] || die "无法自动获取公网 IPv4。"
+    # 只尝试一次登录，避免反复触发 403 / 登录限流
+    : > "$COOKIE_JAR"
+    local status
+    status="$(curl -sS --connect-timeout 3 --max-time 15 \
+        -X POST \
+        -H 'Content-Type: application/json' \
+        -H 'Accept: application/json' \
+        -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+        --data-binary "@$LOGIN_JSON" \
+        -o "$RESPONSE_FILE" -w '%{http_code}' \
+        "$LOGIN_URL" 2>"$WORK_DIR/curl-error.txt" || true)"
+
+    rm -f "$LOGIN_JSON"
+
+    if [[ "${status:-000}" == "200" ]] &&
+       python3 - "$RESPONSE_FILE" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    sys.exit(0 if d.get("success") is True or d.get("success") == 1
+             or d.get("msg") == "登录成功" or d.get("code") == 0 else 1)
+except Exception:
+    sys.exit(1)
+PY
+    then
+        ok "面板 API 登录成功。"
+        return 0
+    fi
+
+    err "面板 API 登录失败，HTTP 状态码：${status:-000}"
+    echo "服务器响应："
+    python3 - "$RESPONSE_FILE" <<'PY'
+import sys
+try:
+    s = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+    print(s[:1200] if s else "(空响应)")
+except Exception:
+    print("(无法读取响应)")
+PY
+
+    case "${status:-000}" in
+        403)
+            warn "HTTP 403：可能是凭据错误、登录限流、二步验证或版本差异。"
+            warn "脚本不会连续重试、重置密码或关闭安全机制。"
+            echo "建议先检查："
+            echo "  1. 等待可能的登录限制解除；"
+            echo "  2. 确认面板用户名、密码及二步验证设置；"
+            echo "  3. 查看日志：journalctl -u x-ui --since '15 minutes ago' --no-pager"
+            ;;
+        404)
+            warn "登录接口路径不存在，可能是自定义 Base Path 或版本路由不同。"
+            ;;
+        301|302|307|308)
+            warn "面板返回重定向，可能需要 HTTPS 或其他访问路径。"
+            ;;
+        *)
+            warn "请检查面板设置、日志和当前版本 API 路由。"
+            ;;
+    esac
+
+    if [[ -s "$WORK_DIR/curl-error.txt" ]]; then
+        cat "$WORK_DIR/curl-error.txt"
+    fi
+
+    return 1
+}
 
 # ------------------------------------------------------------
-# 6. 生成 REALITY 密钥，兼容多种 Xray 输出格式
+# 节点工具
 # ------------------------------------------------------------
+find_xray() {
+    local x
+    for x in \
+        /usr/local/x-ui/bin/xray \
+        /usr/local/bin/xray \
+        /usr/bin/xray; do
+        if [[ -x "$x" ]]; then
+            printf '%s' "$x"
+            return 0
+        fi
+    done
 
-info "正在生成 REALITY 密钥……"
+    if command -v xray >/dev/null 2>&1; then
+        command -v xray
+        return 0
+    fi
+    return 1
+}
 
-KEY_OUTPUT="$("$XRAY" x25519 2>&1)" ||
-  die "执行 Xray x25519 失败。"
+gen_uuid() {
+    python3 -c 'import uuid; print(uuid.uuid4())'
+}
 
-KEYS="$(
-  printf '%s\n' "$KEY_OUTPUT" |
-  awk '
-  {
-    line=$0
-    pos=index(line, ":")
-    if (!pos) next
+random_port() {
+    python3 - <<'PY'
+import socket, random
+for _ in range(100):
+    p = random.randint(20000, 60000)
+    s = socket.socket()
+    try:
+        s.bind(("0.0.0.0", p))
+        print(p)
+        s.close()
+        break
+    except OSError:
+        s.close()
+PY
+}
 
-    label=substr(line,1,pos-1)
-    value=substr(line,pos+1)
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", label)
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+get_public_ipv4() {
+    local ip=""
+    for url in \
+        https://api.ipify.org \
+        https://ipv4.icanhazip.com \
+        https://checkip.amazonaws.com; do
+        ip="$(curl -4 -fsS --connect-timeout 3 --max-time 5 "$url" 2>/dev/null |
+            tr -d '[:space:]' || true)"
+        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            printf '%s' "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
 
-    normalized=tolower(label)
-    gsub(/[^a-z]/, "", normalized)
+generate_reality_keys() {
+    local xray_bin="$1"
+    local output=""
 
-    if (normalized=="privatekey" || normalized=="private") {
-      private=value
+    output="$("$xray_bin" x25519 2>&1)" || {
+        err "执行 xray x25519 失败。"
+        printf '%s\n' "$output"
+        return 1
     }
 
-    if (normalized=="publickey" ||
-        normalized=="password" ||
-        normalized=="passwordpublickey") {
-      if (value ~ /^[A-Za-z0-9_-]+$/) public=value
+    # 新版 Xray：PrivateKey 为服务端私钥，Password 通常对应客户端公钥。
+    REALITY_PRIVATE_KEY="$(
+        printf '%s\n' "$output" |
+        sed -nE 's/^[[:space:]]*PrivateKey:[[:space:]]*([^[:space:]]+).*$/\1/p' |
+        head -n1
+    )"
+
+    REALITY_PUBLIC_KEY="$(
+        printf '%s\n' "$output" |
+        sed -nE 's/^[[:space:]]*Password:[[:space:]]*([^[:space:]]+).*$/\1/p' |
+        head -n1
+    )"
+
+    # 兼容部分旧版本输出格式
+    if [[ -z "$REALITY_PRIVATE_KEY" ]]; then
+        REALITY_PRIVATE_KEY="$(
+            printf '%s\n' "$output" |
+            sed -nE 's/^[[:space:]]*Private[[:space:]]*key:[[:space:]]*([^[:space:]]+).*$/\1/p' |
+            head -n1
+        )"
+    fi
+    if [[ -z "$REALITY_PUBLIC_KEY" ]]; then
+        REALITY_PUBLIC_KEY="$(
+            printf '%s\n' "$output" |
+            sed -nE 's/^[[:space:]]*(Public[[:space:]]*key|PublicKey):[[:space:]]*([^[:space:]]+).*$/\2/p' |
+            head -n1
+        )"
+    fi
+
+    if [[ -z "$REALITY_PRIVATE_KEY" || -z "$REALITY_PUBLIC_KEY" ]]; then
+        err "无法从当前 Xray 输出中识别 REALITY 密钥。"
+        echo "Xray 输出如下，请检查输出格式："
+        printf '%s\n' "$output"
+        return 1
+    fi
+}
+
+add_reality_inbound() {
+    local xray_bin
+    xray_bin="$(find_xray)" || {
+        err "未找到 Xray 可执行文件。"
+        return 1
     }
-  }
-  END {
-    if (private!="" && public!="")
-      print private "|" public
-  }'
-)"
 
-[[ "$KEYS" == *"|"* ]] || {
-  err "无法解析 Xray x25519 输出格式。"
-  printf '%s\n' "$KEY_OUTPUT" |
-    sed -E 's/^([[:space:]]*[Pp]rivate[^:]*:).*/\1 <已隐藏>/'
-  die "密钥解析失败，未创建节点。"
+    api_login || return 1
+
+    local public_ip port uuid short_id dest server_name remark flow
+    public_ip="$(get_public_ipv4 || true)"
+    if [[ -z "$public_ip" ]]; then
+        read -r -p "无法自动获取公网 IPv4，请输入服务器公网 IP：" public_ip
+    fi
+
+    read -r -p "节点备注 [Xiazheteng-REALITY]：" remark
+    remark="${remark:-Xiazheteng-REALITY}"
+
+    read -r -p "REALITY 目标域名 [www.microsoft.com]：" dest
+    dest="${dest:-www.microsoft.com}"
+
+    read -r -p "监听端口（留空自动选择）：" port
+    if [[ -z "$port" ]]; then
+        port="$(random_port)"
+    fi
+
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
+        err "端口无效。"
+        return 1
+    fi
+
+    if ss -lnt 2>/dev/null | awk '{print $4}' |
+       grep -Eq "(:|\])${port}$"; then
+        err "端口 $port 已被监听，请选择其他端口。"
+        return 1
+    fi
+
+    server_name="${dest%%:*}"
+    [[ -n "$server_name" ]] || server_name="www.microsoft.com"
+    uuid="$(gen_uuid)"
+    short_id="$(openssl rand -hex 8)"
+
+    generate_reality_keys "$xray_bin" || return 1
+
+    # 使用 Python 生成严格 JSON，避免备注、域名等字段破坏 JSON 格式
+    export INBOUND_PORT="$port"
+    export INBOUND_REMARK="$remark"
+    export INBOUND_UUID="$uuid"
+    export REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY
+    export REALITY_SHORT_ID="$short_id"
+    export REALITY_DEST="${dest}:443"
+    export REALITY_SERVER_NAME="$server_name"
+
+    python3 - "$INBOUND_JSON" <<'PY'
+import json, os, sys
+
+port = int(os.environ["INBOUND_PORT"])
+remark = os.environ["INBOUND_REMARK"]
+uuid = os.environ["INBOUND_UUID"]
+private_key = os.environ["REALITY_PRIVATE_KEY"]
+short_id = os.environ["REALITY_SHORT_ID"]
+dest = os.environ["REALITY_DEST"]
+server_name = os.environ["REALITY_SERVER_NAME"]
+
+settings = {
+    "clients": [{
+        "id": uuid,
+        "flow": "xtls-rprx-vision",
+        "email": "xiazheteng-" + str(port),
+        "enable": True,
+        "limitIp": 0,
+        "totalGB": 0,
+        "expiryTime": 0,
+        "tgId": "",
+        "subId": ""
+    }],
+    "decryption": "none",
+    "encryption": "none"
 }
 
-PRIVATE_KEY="${KEYS%%|*}"
-PUBLIC_KEY="${KEYS#*|}"
-
-UUID="$(cat /proc/sys/kernel/random/uuid)"
-SHORT_ID="$(openssl rand -hex 8)"
-
-# ------------------------------------------------------------
-# 7. 创建 VLESS + REALITY 入站
-# ------------------------------------------------------------
-
-# 先确认 API 列表路由能访问，避免把错误路由误当成认证成功。
-LIST_HTTP="$(
-  curl -sS --connect-timeout 5 --max-time 15 \
-    -o "$WORK/list.body" \
-    -w '%{http_code}' \
-    -c "$COOKIE" -b "$COOKIE" \
-    "${API_ROOT}panel/api/inbounds/list" || true
-)"
-
-if [[ "$LIST_HTTP" != "200" ]]; then
-  die "入站列表 API 返回 HTTP ${LIST_HTTP:-连接失败}。已停止，未添加节点。"
-fi
-
-if ! grep -Eqi '"success"[[:space:]]*:[[:space:]]*true' "$WORK/list.body"; then
-  die "入站列表 API 未确认成功。为避免重复创建，已停止。"
-fi
-
-# 生成 JSON，避免 shell 手动拼接嵌套 JSON。
-python3 - "$WORK/inbound.json" "$UUID" "$NODE_PORT" \
-  "$PRIVATE_KEY" "$SHORT_ID" "$SNI" "$REMARK" <<'PY'
-import json,sys
-out,uid,port,private,sid,sni,remark=sys.argv[1:]
-settings={
-    "clients":[{"id":uid,"flow":"xtls-rprx-vision","email":remark}],
-    "decryption":"none",
-    "fallbacks":[]
-}
-stream={
-    "network":"raw",
-    "security":"reality",
-    "realitySettings":{
-        "show":False,
-        "dest":sni+":443",
-        "xver":0,
-        "serverNames":[sni],
-        "privateKey":private,
-        "shortIds":[sid]
+stream = {
+    "network": "tcp",
+    "security": "reality",
+    "realitySettings": {
+        "show": False,
+        "xver": 0,
+        "dest": dest,
+        "serverNames": [server_name],
+        "privateKey": private_key,
+        "shortIds": [short_id]
     }
 }
-obj={
-    "up":0,
-    "down":0,
-    "total":0,
-    "remark":remark,
-    "enable":True,
-    "expiryTime":0,
-    "listen":"0.0.0.0",
-    "port":int(port),
-    "protocol":"vless",
-    "settings":json.dumps(settings,separators=(",",":")),
-    "streamSettings":json.dumps(stream,separators=(",",":")),
-    "sniffing":json.dumps({
-        "enabled":True,
-        "destOverride":["http","tls","quic"]
-    },separators=(",",":"))
+
+sniffing = {
+    "enabled": True,
+    "destOverride": ["http", "tls", "quic"],
+    "metadataOnly": False,
+    "routeOnly": False
 }
-with open(out,"w",encoding="utf-8") as f:
-    json.dump(obj,f,separators=(",",":"))
-PY
 
-info "正在通过 3x-ui API 创建节点……"
-
-ADD_HTTP="$(
-  python3 - "$WORK/inbound.json" <<'PY' |
-import json,sys,urllib.parse
-obj=json.load(open(sys.argv[1],encoding="utf-8"))
-print(urllib.parse.urlencode(obj))
-PY
-  curl -sS --connect-timeout 5 --max-time 20 \
-    -o "$WORK/add.body" \
-    -w '%{http_code}' \
-    -c "$COOKIE" -b "$COOKIE" \
-    -X POST "${API_ROOT}panel/api/inbounds/add" \
-    -H 'Content-Type: application/x-www-form-urlencoded' \
-    --data-binary @- \
-    || true
-)"
-
-if [[ "$ADD_HTTP" != "200" ]] ||
-   ! grep -Eqi '"success"[[:space:]]*:[[:space:]]*true' "$WORK/add.body"; then
-  warn "节点创建请求未获得成功响应。"
-  warn "HTTP 状态：${ADD_HTTP:-连接失败}"
-  warn "请检查 3x-ui 日志；脚本不会删除已有节点或自动重置面板。"
-  die "API 未确认新节点创建成功。"
-fi
-
-# ------------------------------------------------------------
-# 8. 生成分享链接与订阅
-# ------------------------------------------------------------
-
-LINK="$(
-python3 - "$PUBLIC_IP" "$NODE_PORT" "$UUID" "$PUBLIC_KEY" \
-  "$SHORT_ID" "$SNI" "$REMARK" <<'PY'
-import sys,urllib.parse
-ip,port,uid,pbk,sid,sni,remark=sys.argv[1:]
-params={
-  "encryption":"none",
-  "flow":"xtls-rprx-vision",
-  "security":"reality",
-  "sni":sni,
-  "fp":"chrome",
-  "pbk":pbk,
-  "sid":sid,
-  "type":"tcp"
+payload = {
+    "up": 0,
+    "down": 0,
+    "total": 0,
+    "remark": remark,
+    "enable": True,
+    "expiryTime": 0,
+    "listen": "",
+    "port": port,
+    "protocol": "vless",
+    "settings": json.dumps(settings, separators=(",", ":")),
+    "streamSettings": json.dumps(stream, separators=(",", ":")),
+    "sniffing": json.dumps(sniffing, separators=(",", ":"))
 }
-print(
-  f"vless://{uid}@{ip}:{port}?"
-  f"{urllib.parse.urlencode(params)}"
-  f"#{urllib.parse.quote(remark,safe='')}"
-)
+
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
 PY
-)"
 
-printf '%s\n' "$LINK" >> "$NODE_FILE"
-awk 'NF && !seen[$0]++' "$NODE_FILE" > "$WORK/nodes.txt"
-install -m 600 "$WORK/nodes.txt" "$NODE_FILE"
+    chmod 600 "$INBOUND_JSON"
 
-base64 -w 0 "$NODE_FILE" > "$SUB_FILE"
-printf '\n' >> "$SUB_FILE"
-chmod 600 "$SUB_FILE"
+    info "正在创建 VLESS + REALITY 节点……"
+    local status
+    status="$(api_request POST "/inbounds/add" "$INBOUND_JSON")"
 
-cat > "$INFO_FILE" <<EOF
-PUBLIC_IP='$PUBLIC_IP'
-PORT='$NODE_PORT'
-UUID='$UUID'
-PUBLIC_KEY='$PUBLIC_KEY'
-SHORT_ID='$SHORT_ID'
-SNI='$SNI'
-EOF
-chmod 600 "$INFO_FILE"
+    if [[ "$status" != "200" ]]; then
+        err "创建节点请求失败，HTTP 状态码：$status"
+        cat "$RESPONSE_FILE" 2>/dev/null || true
+        return 1
+    fi
 
-# ------------------------------------------------------------
-# 9. 最终输出
-# ------------------------------------------------------------
+    if ! python3 - "$RESPONSE_FILE" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    sys.exit(0 if d.get("success") is True or d.get("success") == 1
+             or d.get("code") == 0 else 1)
+except Exception:
+    sys.exit(1)
+PY
+    then
+        err "面板没有确认创建成功，返回内容："
+        cat "$RESPONSE_FILE"
+        return 1
+    fi
 
-ok "VLESS + REALITY 节点已由 3x-ui API 创建。"
+    ok "节点创建请求已被面板接受。"
+    echo
+    echo "================ 节点参数 ================"
+    echo "备注：       $remark"
+    echo "协议：       VLESS + REALITY"
+    echo "服务器：     $public_ip"
+    echo "端口：       $port"
+    echo "UUID：       $uuid"
+    echo "流控：       xtls-rprx-vision"
+    echo "传输：       TCP"
+    echo "SNI：        $server_name"
+    echo "公钥：       $REALITY_PUBLIC_KEY"
+    echo "Short ID：   $short_id"
+    echo "指纹：       chrome"
+    echo "=========================================="
 
-echo
-echo "================ 部署结果 ================"
-echo "面板版本：      3x-ui v3.x（已通过 API 验证）"
-echo "服务器 IPv4：   $PUBLIC_IP"
-echo "节点端口：      $NODE_PORT"
-echo "UUID：          $UUID"
-echo "REALITY 公钥：  $PUBLIC_KEY"
-echo "Short ID：      $SHORT_ID"
-echo
-echo "分享链接："
-echo "$LINK"
-echo
-echo "本地订阅文件："
-echo "$SUB_FILE"
-echo
-echo "节点记录："
-echo "$NODE_FILE"
-echo
-echo "请确认云服务商安全组放行 TCP $NODE_PORT。"
-echo "==========================================="
+    local link
+    link="vless://${uuid}@${public_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${server_name}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${short_id}&type=tcp&headerType=none#${remark// /%20}"
+
+    echo
+    echo "VLESS 分享链接："
+    printf '%s\n' "$link"
+    echo
+    echo "注意：请确认云服务商安全组和服务器防火墙已允许该端口。"
+    echo "脚本不会自动开放云厂商安全组，也不会修改现有防火墙策略。"
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo
+        warn "检测到 UFW 正在运行。如确认需要开放端口，可执行："
+        echo "ufw allow ${port}/tcp"
+    fi
+}
+
+list_inbounds() {
+    api_login || return 1
+
+    local status
+    status="$(api_request GET "/inbounds/list")"
+
+    if [[ "$status" != "200" ]]; then
+        err "获取节点列表失败，HTTP 状态码：$status"
+        cat "$RESPONSE_FILE" 2>/dev/null || true
+        return 1
+    fi
+
+    python3 - "$RESPONSE_FILE" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception as e:
+    print("无法解析面板响应：", e)
+    sys.exit(1)
+
+if not data.get("success", False):
+    print("面板返回失败：", data.get("msg", data))
+    sys.exit(1)
+
+obj = data.get("obj") or []
+if isinstance(obj, dict):
+    obj = obj.get("inbounds") or []
+
+if not obj:
+    print("当前没有返回节点数据。")
+else:
+    print("\n当前入站列表：")
+    print("-" * 78)
+    for item in obj:
+        print("ID:       ", item.get("id", ""))
+        print("备注:     ", item.get("remark", ""))
+        print("协议:     ", item.get("protocol", ""))
+        print("端口:     ", item.get("port", ""))
+        print("启用:     ", item.get("enable", ""))
+        print("-" * 78)
+PY
+}
+
+diagnose() {
+    echo
+    echo "========== 环境诊断 =========="
+    echo "系统：$(uname -a)"
+    echo "数据库：$([[ -f "$DB" ]] && echo 存在 || echo 不存在)"
+    echo "x-ui 服务："
+    systemctl is-active x-ui 2>/dev/null || true
+
+    echo
+    echo "监听端口："
+    ss -lntp 2>/dev/null | grep -E 'x-ui|xray|:22682|:2096' || true
+
+    echo
+    echo "面板设置（请勿把含有密码的输出公开）："
+    discover_panel
+    echo "本地面板：$PANEL_ORIGIN"
+    echo "Base Path：$PANEL_BASE"
+
+    echo
+    echo "最近 15 分钟 x-ui 日志："
+    journalctl -u x-ui --since "15 minutes ago" --no-pager -n 80 2>/dev/null || true
+
+    echo
+    echo "若 API 登录返回 403，脚本不会自动重置用户名/密码。"
+    echo "先检查登录限流、二步验证、Base Path 和日志。"
+}
+
+restart_xui() {
+    echo "此操作会短暂中断面板和由它管理的服务。"
+    read -r -p "确认重启 x-ui？输入 YES 继续：" confirm
+    [[ "$confirm" == "YES" ]] || {
+        info "已取消。"
+        return 0
+    }
+
+    systemctl restart x-ui
+    sleep 2
+    systemctl --no-pager --full status x-ui || true
+}
+
+show_menu() {
+    clear 2>/dev/null || true
+    echo "=================================================="
+    echo " $APP_NAME"
+    echo "=================================================="
+    echo " 1. 检查环境和面板设置"
+    echo " 2. 测试 API 登录并列出节点"
+    echo " 3. 新建 VLESS + REALITY 节点"
+    echo " 4. 查看 x-ui 服务状态"
+    echo " 5. 查看 API / 403 诊断信息"
+    echo " 6. 重启 x-ui 服务"
+    echo " 0. 退出"
+    echo "=================================================="
+}
+
+main() {
+    need_root
+    check_dependencies || exit 1
+
+    if [[ ! -f "$DB" ]]; then
+        warn "没有找到 $DB。"
+        warn "此脚本面向已安装的 3x-ui，不会自动安装或覆盖数据库。"
+    fi
+
+    while true; do
+        show_menu
+        read -r -p "请选择 [0-6]：" choice
+
+        case "$choice" in
+            1)
+                discover_panel
+                echo "x-ui 服务："
+                systemctl --no-pager --full status x-ui 2>/dev/null || true
+                pause
+                ;;
+            2)
+                if api_login; then
+                    list_inbounds || true
+                fi
+                pause
+                ;;
+            3)
+                add_reality_inbound || true
+                pause
+                ;;
+            4)
+                systemctl --no-pager --full status x-ui 2>/dev/null || true
+                pause
+                ;;
+            5)
+                diagnose
+                pause
+                ;;
+            6)
+                restart_xui
+                pause
+                ;;
+            0)
+                rm -f "$COOKIE_JAR" "$LOGIN_JSON" "$INBOUND_JSON"
+                echo "已退出。"
+                exit 0
+                ;;
+            *)
+                warn "无效选项。"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+main "$@"
