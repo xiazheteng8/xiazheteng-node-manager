@@ -583,7 +583,7 @@ create_reality() {
         --arg stream "$stream" \
         --arg sniff "$sniff" \
         '{
-          enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"vless",
+          enable:true,remark:$remark,listen:"",port:$port,protocol:"vless",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
           total:0,expiryTime:0
         }')" || return 1
@@ -636,7 +636,7 @@ create_tls() {
         --arg stream "$stream" \
         --arg sniff "$sniff" \
         '{
-          enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"vless",
+          enable:true,remark:$remark,listen:"",port:$port,protocol:"vless",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
           total:0,expiryTime:0
         }')" || return 1
@@ -672,7 +672,7 @@ create_vmess() {
         --arg stream "$stream" \
         --arg sniff "$sniff" \
         '{
-          enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"vmess",
+          enable:true,remark:$remark,listen:"",port:$port,protocol:"vmess",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
           total:0,expiryTime:0
         }')" || return 1
@@ -714,7 +714,7 @@ create_shadowsocks() {
         --arg stream "$stream" \
         --arg sniff "$sniff" \
         '{
-          enable:true,remark:$remark,listen:"",tag:"",port:$port,protocol:"shadowsocks",
+          enable:true,remark:$remark,listen:"",port:$port,protocol:"shadowsocks",
           settings:$settings,streamSettings:$stream,sniffing:$sniff,
           total:0,expiryTime:0
         }')" || return 1
