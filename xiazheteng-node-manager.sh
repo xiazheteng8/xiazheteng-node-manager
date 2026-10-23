@@ -1,512 +1,807 @@
 
 #!/usr/bin/env bash
 # ============================================================
-# 瞎折腾吧 | 3x-ui VPS 节点管理器
-# 功能：
-#   1. 自动安装或复用 3x-ui
-#   2. 检查面板 API 登录
-#   3. 自动同步面板中的节点分享链接
-#   4. 独立订阅 HTTP 服务
-#   5. systemd 定时同步，面板手动新增节点自动进入订阅
-#   6. 日志、配置备份、失败保护
-#
-# 支持 Debian / Ubuntu
+# 瞎折腾吧 VPS 节点自动部署管理器
+# 独立 Xray 实例 | 环境检测 | 端口避让 | 订阅生成 | 安全卸载
+# 支持：Debian / Ubuntu，systemd，x86_64 / ARM64
 # ============================================================
 
 set -Eeuo pipefail
 umask 077
 
 APP="xiazheteng-node-manager"
-ROOT="/opt/${APP}"
-DATA="${ROOT}/data"
-BIN="${ROOT}/bin"
-LOG_DIR="/var/log/${APP}"
-LOG="${LOG_DIR}/manager.log"
+BASE="/opt/xiazheteng-node"
+BIN="$BASE/bin/xray"
+CONF="$BASE/config.json"
+DATA="$BASE/data"
+LOGDIR="/var/log/$APP"
+LOG="$LOGDIR/manager.log"
+ENVFILE="$BASE/settings.env"
+MANIFEST="$BASE/managed-files.txt"
+SERVICE="xiazheteng-xray"
+UNIT="/etc/systemd/system/$SERVICE.service"
+SUBFILE="$DATA/subscription.txt"
+SUBJSON="$DATA/nodes.json"
+SUBURLFILE="$DATA/subscription-url.txt"
+PORTFILE="$DATA/ports.env"
+SHORTCUT="/usr/local/bin/x"
+XRAY_REPO="XTLS/Xray-core"
 
-SYNC_PY="${BIN}/sync.py"
-SERVER_PY="${BIN}/server.py"
-CONFIG="${ROOT}/config.json"
-
-SYNC_SERVICE="/etc/systemd/system/${APP}-sync.service"
-SYNC_TIMER="/etc/systemd/system/${APP}-sync.timer"
-SERVER_SERVICE="/etc/systemd/system/${APP}-subscription.service"
-
-mkdir -p "$DATA" "$BIN" "$LOG_DIR"
-chmod 700 "$ROOT" "$DATA" "$BIN" "$LOG_DIR"
+mkdir -p "$LOGDIR"
 touch "$LOG"
 chmod 600 "$LOG"
 
-exec > >(tee -a "$LOG") 2>&1
+log() {
+    printf '[%s] [%s] %s\n' \
+        "$(date '+%F %T')" "$1" "$2" | tee -a "$LOG"
+}
+info() { log INFO "$*"; }
+warn() { log WARN "$*"; }
+err()  { log ERROR "$*"; }
+die()  { err "$*"; exit 1; }
 
-info() { printf '[信息] %s\n' "$*"; }
-ok() { printf '[成功] %s\n' "$*"; }
-warn() { printf '[警告] %s\n' "$*"; }
-die() { printf '[错误] %s\n' "$*" >&2; exit 1; }
+trap 'rc=$?; err "命令执行失败，退出码=$rc，行号=${LINENO}。请检查 $LOG"; exit "$rc"' ERR
 
-trap 'rc=$?; echo "[错误] 第 ${LINENO} 行失败，退出码 ${rc}；查看日志：'"$LOG" >&2; exit "$rc"' ERR
-
-[[ $EUID -eq 0 ]] || die "请以 root 身份运行。"
-[[ -t 0 ]] || die "首次配置需要交互终端。"
-
-[[ -r /etc/os-release ]] || die "无法识别操作系统。"
-# shellcheck disable=SC1091
-source /etc/os-release
-
-case "${ID:-}" in
-  debian|ubuntu|armbian) ;;
-  *) die "仅支持 Debian、Ubuntu、Armbian。" ;;
-esac
-
-export DEBIAN_FRONTEND=noninteractive
-
-apt-get update -y
-apt-get install -y curl ca-certificates python3 python3-requests \
-  openssl iproute2 util-linux
-
-# ------------------------------------------------------------
-# 工具函数
-# ------------------------------------------------------------
-
-random_hex() {
-    openssl rand -hex "$1"
+need_root() {
+    [[ $EUID -eq 0 ]] || {
+        echo "请使用 root 运行：sudo bash $0"
+        exit 1
+    }
 }
 
-find_free_port() {
-    local p i
-    for i in $(seq 1 300); do
-        p="$(shuf -i 20000-55000 -n 1)"
-        if ! ss -H -lnt 2>/dev/null |
-            awk '{print $4}' |
-            grep -Eq "[:.]${p}$"; then
-            printf '%s\n' "$p"
+# -------------------- 环境检测 --------------------
+
+detect_os() {
+    [[ -r /etc/os-release ]] || die "无法识别操作系统。"
+    . /etc/os-release
+
+    case "${ID:-}" in
+        debian|ubuntu) ;;
+        *) die "当前系统 ${ID:-unknown} 不在自动部署支持列表中。" ;;
+    esac
+
+    command -v systemctl >/dev/null ||
+        die "未检测到 systemd。"
+
+    case "$(uname -m)" in
+        x86_64|amd64) ARCH="64" ;;
+        aarch64|arm64) ARCH="arm64-v8a" ;;
+        *) die "不支持的 CPU 架构：$(uname -m)" ;;
+    esac
+
+    info "系统：${PRETTY_NAME:-$ID}，架构：$(uname -m)"
+}
+
+install_dependencies() {
+    local missing=()
+    for c in curl jq openssl python3 ss base64; do
+        command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+    done
+
+    if ((${#missing[@]})); then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y
+        apt-get install -y curl jq openssl python3 iproute2 ca-certificates
+    fi
+
+    for c in curl jq openssl python3 ss; do
+        command -v "$c" >/dev/null 2>&1 ||
+            die "依赖安装后仍缺少命令：$c"
+    done
+}
+
+detect_public_ipv4() {
+    PUBLIC_IP=""
+    local ip
+    for url in \
+        https://api.ipify.org \
+        https://ipv4.icanhazip.com \
+        https://ifconfig.me/ip; do
+        ip="$(curl -4 -fsS --connect-timeout 3 --max-time 6 "$url" 2>/dev/null || true)"
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            PUBLIC_IP="$ip"
+            break
+        fi
+    done
+
+    if [[ -z "$PUBLIC_IP" ]]; then
+        warn "无法获取公网 IPv4；将尝试从本地路由获取地址。"
+        PUBLIC_IP="$(ip -4 route get 1.1.1.1 2>/dev/null |
+            awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+    fi
+
+    [[ -n "$PUBLIC_IP" ]] || die "无法确定 IPv4 地址。"
+    info "检测到 IPv4：$PUBLIC_IP"
+}
+
+check_domain() {
+    DOMAIN_OK=0
+    [[ -n "${DOMAIN:-}" ]] || return 0
+
+    if [[ "$DOMAIN" =~ [^a-zA-Z0-9.-] ]] ||
+       [[ "$DOMAIN" == *..* ]] ||
+       [[ "$DOMAIN" == .* ]] ||
+       [[ "$DOMAIN" == *. ]]; then
+        warn "域名格式不合法，将切换到无域名模式。"
+        DOMAIN=""
+        return 0
+    fi
+
+    local ips
+    ips="$(getent ahostsv4 "$DOMAIN" 2>/dev/null |
+        awk '{print $1}' | sort -u || true)"
+
+    if [[ -z "$ips" ]]; then
+        warn "$DOMAIN 没有 IPv4 解析，域名模式的 TLS 节点将跳过。"
+        return 0
+    fi
+
+    if ! grep -Fxq "$PUBLIC_IP" <<< "$ips"; then
+        warn "$DOMAIN 的 A 记录不包含本机公网 IPv4，跳过 TLS 节点。"
+        return 0
+    fi
+
+    DOMAIN_OK=1
+    info "域名解析检查通过：$DOMAIN"
+}
+
+# -------------------- 端口与已有服务检测 --------------------
+
+port_in_use() {
+    ss -H -lnt "( sport = :$1 )" 2>/dev/null | grep -q .
+}
+
+choose_port() {
+    local p
+    for p in "$@"; do
+        if ! port_in_use "$p"; then
+            echo "$p"
             return 0
         fi
     done
     return 1
 }
 
-valid_domain() {
-    [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]
+choose_random_port() {
+    local i p
+    for i in $(seq 1 150); do
+        p="$(shuf -i 20000-60000 -n 1)"
+        if ! port_in_use "$p"; then
+            echo "$p"
+            return 0
+        fi
+    done
+    return 1
 }
 
-# ------------------------------------------------------------
-# 一次性收集参数
-# ------------------------------------------------------------
-
-if [[ -f "$CONFIG" ]]; then
-    read -r -p "发现现有配置。输入 R 重新配置，直接回车继续使用：" RECONFIG
-else
-    RECONFIG="R"
-fi
-
-if [[ "${RECONFIG^^}" == "R" ]]; then
-    while true; do
-        read -r -p "节点域名（例如 node.example.com）：" DOMAIN
-        DOMAIN="${DOMAIN,,}"
-        valid_domain "$DOMAIN" && break
-        warn "域名格式不正确。"
+inspect_existing_services() {
+    info "检查现有代理、面板及 Web 服务。"
+    local svc
+    for svc in x-ui 3x-ui sing-box xray nginx apache2 caddy haproxy; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            info "检测到运行中的服务：$svc（不会停止或覆盖）"
+        fi
     done
 
-    while true; do
-        read -r -p "3x-ui 管理用户名：" USERNAME
-        [[ "$USERNAME" =~ ^[a-zA-Z0-9_.-]{3,64}$ ]] && break
-        warn "用户名格式不正确。"
-    done
+    if command -v ss >/dev/null 2>&1; then
+        ss -lntp 2>/dev/null | tee -a "$LOG" >/dev/null || true
+    fi
+}
 
-    while true; do
-        read -r -s -p "3x-ui 管理密码（至少 12 位）：" PASSWORD
-        echo
-        [[ ${#PASSWORD} -ge 12 ]] && break
-        warn "密码至少 12 位。"
-    done
+# -------------------- 安装独立 Xray --------------------
 
-    read -r -p "3x-ui Web Base Path（无前导斜杠，例如 abc123；默认 /）：" WEB_PATH
-    WEB_PATH="${WEB_PATH#/}"
-    WEB_PATH="${WEB_PATH%/}"
-
-    if [[ -n "$WEB_PATH" ]]; then
-        [[ "$WEB_PATH" =~ ^[a-zA-Z0-9_-]+$ ]] ||
-            die "Web Base Path 只允许字母、数字、下划线和连字符。"
-        WEB_PATH="/${WEB_PATH}/"
-    else
-        WEB_PATH="/"
+install_xray() {
+    # 已有本脚本管理的二进制且可运行，则不重复下载。
+    if [[ -x "$BIN" ]] && "$BIN" version >/dev/null 2>&1; then
+        info "检测到本脚本已有 Xray，跳过重复安装。"
+        return
     fi
 
-    read -r -p "面板监听端口（已安装则输入现有端口，留空自动选择）：" PANEL_PORT
-    PANEL_PORT="${PANEL_PORT:-$(find_free_port)}"
-    [[ "$PANEL_PORT" =~ ^[0-9]+$ ]] &&
-        ((PANEL_PORT >= 1 && PANEL_PORT <= 65535)) ||
-        die "面板端口无效。"
+    mkdir -p "$BASE/bin" "$DATA"
 
-    SUB_PORT="$(find_free_port)" || die "找不到订阅端口。"
-    SUB_TOKEN="$(random_hex 24)"
+    local api tag url tmp
+    api="https://api.github.com/repos/$XRAY_REPO/releases/latest"
+    tag="$(curl -fsSL --retry 3 --max-time 30 "$api" |
+        jq -r '.tag_name // empty')"
+    [[ -n "$tag" ]] || die "无法获取 Xray 发行版本。"
 
-    export DOMAIN USERNAME PASSWORD WEB_PATH PANEL_PORT SUB_PORT SUB_TOKEN
+    case "$ARCH" in
+        64) url="https://github.com/$XRAY_REPO/releases/download/$tag/Xray-linux-64.zip" ;;
+        arm64-v8a) url="https://github.com/$XRAY_REPO/releases/download/$tag/Xray-linux-arm64-v8a.zip" ;;
+        *) die "不支持的 Xray 架构。" ;;
+    esac
 
-    python3 - "$CONFIG" <<'PY'
-import json, os, sys
-data = {
-    "domain": os.environ["DOMAIN"],
-    "username": os.environ["USERNAME"],
-    "password": os.environ["PASSWORD"],
-    "web_path": os.environ["WEB_PATH"],
-    "panel_port": int(os.environ["PANEL_PORT"]),
-    "sub_port": int(os.environ["SUB_PORT"]),
-    "sub_token": os.environ["SUB_TOKEN"],
-}
-with open(sys.argv[1], "w") as f:
-    json.dump(data, f, indent=2)
-PY
-    chmod 600 "$CONFIG"
-fi
+    tmp="$(mktemp -d)"
+    info "下载 Xray：$tag"
 
-# 配置以 JSON 保存，避免密码中有引号或特殊字符时破坏 Shell 语法。
-eval "$(
-python3 - "$CONFIG" <<'PY'
-import json, shlex, sys
-d = json.load(open(sys.argv[1]))
-for key in ("domain","username","password","web_path","panel_port","sub_port","sub_token"):
-    print(f"{key.upper()}={shlex.quote(str(d[key]))}")
-PY
-)"
+    if ! curl -fL --retry 3 --connect-timeout 10 --max-time 180 \
+        "$url" -o "$tmp/xray.zip"; then
+        rm -rf "$tmp"
+        die "Xray 下载失败。"
+    fi
 
-# ------------------------------------------------------------
-# 安装或复用 3x-ui
-# ------------------------------------------------------------
+    apt-get install -y unzip >/dev/null
+    unzip -oq "$tmp/xray.zip" -d "$tmp/unpack"
 
-if ! command -v x-ui >/dev/null 2>&1; then
-    info "未检测到 3x-ui，尝试调用官方安装器。"
-
-    INSTALLER="$(mktemp)"
-    trap 'rm -f "${INSTALLER:-}"' EXIT
-
-    curl -fL --retry 3 \
-      https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh \
-      -o "$INSTALLER"
-
-    bash -n "$INSTALLER" || die "官方安装器语法检查失败。"
-
-    export XUI_NONINTERACTIVE=1
-    export XUI_USERNAME="$USERNAME"
-    export XUI_PASSWORD="$PASSWORD"
-    export XUI_PORT="$PANEL_PORT"
-    export XUI_WEB_BASE_PATH="$WEB_PATH"
-
-    bash "$INSTALLER"
-    rm -f "$INSTALLER"
-    trap - ERR
-else
-    info "检测到已有 3x-ui，保留现有安装。"
-fi
-
-systemctl enable x-ui
-systemctl restart x-ui
-sleep 3
-systemctl is-active --quiet x-ui || die "3x-ui 服务没有启动。"
-
-# ------------------------------------------------------------
-# Python API 同步器
-# ------------------------------------------------------------
-
-cat > "$SYNC_PY" <<'PY'
-#!/usr/bin/env python3
-import base64
-import json
-import os
-import pathlib
-import sys
-import tempfile
-import time
-import requests
-
-ROOT = pathlib.Path("/opt/xiazheteng-node-manager")
-DATA = ROOT / "data"
-CONFIG = ROOT / "config.json"
-LINKS = DATA / "links.txt"
-SUB_B64 = DATA / "subscription.txt"
-STATUS = DATA / "sync-status.json"
-LOG = pathlib.Path("/var/log/xiazheteng-node-manager/sync.log")
-
-def log(message):
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{stamp}] {message}"
-    print(line, flush=True)
-    with LOG.open("a") as f:
-        f.write(line + "\n")
-
-def atomic_write(path, content):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-
-def collect_links(obj, out):
-    """兼容 allLinks 返回字符串、列表或嵌套对象的常见形式。"""
-    if isinstance(obj, str):
-        for line in obj.splitlines():
-            line = line.strip()
-            if line.startswith((
-                "vless://", "vmess://", "trojan://", "ss://",
-                "hysteria2://", "hy2://", "tuic://"
-            )):
-                out.add(line)
-    elif isinstance(obj, list):
-        for item in obj:
-            collect_links(item, out)
-    elif isinstance(obj, dict):
-        for value in obj.values():
-            collect_links(value, out)
-
-def main():
-    cfg = json.loads(CONFIG.read_text())
-    domain = cfg["domain"]
-    username = cfg["username"]
-    password = cfg["password"]
-    web_path = cfg["web_path"]
-    port = int(cfg["panel_port"])
-
-    base = f"http://127.0.0.1:{port}{web_path}"
-    if not base.endswith("/"):
-        base += "/"
-
-    session = requests.Session()
-    session.trust_env = False
-    session.headers.update({"Accept": "application/json"})
-
-    login = session.post(
-        base + "login",
-        data={"username": username, "password": password},
-        timeout=15,
-    )
-    login.raise_for_status()
-
-    try:
-        login_json = login.json()
-        if isinstance(login_json, dict) and login_json.get("success") is False:
-            raise RuntimeError("面板 API 拒绝登录：" + str(login_json.get("msg", "")))
-    except ValueError:
-        pass
-
-    endpoint = base + "panel/api/inbounds/allLinks"
-    response = session.get(endpoint, timeout=30)
-    response.raise_for_status()
-    result = response.json()
-
-    if not isinstance(result, dict) or result.get("success") is False:
-        raise RuntimeError("allLinks API 返回失败：" + str(result))
-
-    links = set()
-    collect_links(result.get("obj"), links)
-    ordered = sorted(links)
-
-    # API 成功返回空集合也属于有效结果，可能是面板当前没有节点。
-    # 请求失败时不会执行此处，不会覆盖上次有效订阅。
-    plain = "".join(link + "\n" for link in ordered)
-    encoded = base64.b64encode(plain.encode()).decode() if plain else ""
-
-    atomic_write(LINKS, plain)
-    atomic_write(SUB_B64, encoded + ("\n" if encoded else ""))
-
-    status = {
-        "last_sync": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "link_count": len(ordered),
-        "success": True,
-        "message": "同步成功",
+    [[ -f "$tmp/unpack/xray" ]] || {
+        rm -rf "$tmp"
+        die "发行包中没有找到 xray 二进制。"
     }
-    atomic_write(STATUS, json.dumps(status, ensure_ascii=False, indent=2) + "\n")
-    log(f"同步成功：发现 {len(ordered)} 条分享链接。")
 
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log("同步失败：" + repr(e))
-        sys.exit(1)
+    # 先在临时位置验证，不覆盖系统已有的 /usr/local/bin/xray。
+    install -m 0755 "$tmp/unpack/xray" "$tmp/xray-test"
+    "$tmp/xray-test" version >/dev/null ||
+        die "下载的 Xray 无法执行。"
+
+    install -m 0755 "$tmp/unpack/xray" "$BIN"
+    rm -rf "$tmp"
+    info "Xray 安装完成：$("$BIN" version | head -n 1)"
+}
+
+# -------------------- REALITY 密钥 --------------------
+
+generate_reality_keys() {
+    local output
+    output="$("$BIN" x25519 2>&1)" ||
+        die "Xray 无法生成 REALITY 密钥。"
+
+    PRIVATE_KEY="$(sed -nE 's/^(PrivateKey|Private key):[[:space:]]*//p' <<< "$output" | head -n 1)"
+    PUBLIC_KEY="$(sed -nE 's/^(Password|PublicKey|Public key):[[:space:]]*//p' <<< "$output" | head -n 1)"
+
+    # 新旧版本输出格式存在差异，失败时不生成伪造节点。
+    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+        warn "当前 Xray 的密钥输出格式无法自动识别。"
+        warn "REALITY 节点将跳过，不会写入无效参数。"
+        PRIVATE_KEY=""
+        PUBLIC_KEY=""
+        return 0
+    fi
+}
+
+# -------------------- 可选 TLS 证书 --------------------
+
+obtain_tls_certificate() {
+    TLS_OK=0
+    [[ "${DOMAIN_OK:-0}" == 1 ]] || return 0
+
+    # standalone ACME 需要占用 TCP 80；绝不抢占已有服务的端口。
+    if port_in_use 80; then
+        warn "TCP 80 已被占用；为保护现有服务，跳过自动 TLS 证书申请。"
+        return 0
+    fi
+
+    local email
+    email="admin@$DOMAIN"
+
+    if ! command -v socat >/dev/null 2>&1; then
+        apt-get install -y socat >/dev/null || {
+            warn "无法安装 socat，跳过 TLS。"
+            return 0
+        }
+    fi
+
+    if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then
+        curl -fsSL --retry 2 --max-time 60 \
+            https://get.acme.sh -o "$BASE/acme-install.sh" || {
+            warn "无法下载 acme.sh，跳过 TLS。"
+            return 0
+        }
+
+        if ! sh "$BASE/acme-install.sh" email="$email"; then
+            warn "acme.sh 安装失败，跳过 TLS。"
+            return 0
+        fi
+    fi
+
+    local acme="$HOME/.acme.sh/acme.sh"
+    [[ -x "$acme" ]] || {
+        warn "找不到 acme.sh，跳过 TLS。"
+        return 0
+    }
+
+    if ! "$acme" --issue --standalone -d "$DOMAIN" \
+        --server letsencrypt --keylength ec-256 --force; then
+        warn "证书签发失败；保留其他节点，跳过 TLS 节点。"
+        return 0
+    fi
+
+    mkdir -p "$BASE/certs"
+    chmod 700 "$BASE/certs"
+
+    if ! "$acme" --install-cert -d "$DOMAIN" --ecc \
+        --key-file "$BASE/certs/key.pem" \
+        --fullchain-file "$BASE/certs/fullchain.pem" \
+        --reloadcmd "systemctl restart $SERVICE 2>/dev/null || true"; then
+        warn "证书安装失败，跳过 TLS 节点。"
+        return 0
+    fi
+
+    chmod 600 "$BASE/certs/"*.pem
+    TLS_OK=1
+    info "TLS 证书安装完成。"
+}
+
+# -------------------- 配置生成 --------------------
+
+generate_configuration() {
+    local reality_port ss_port tls_port
+    local uuid ss_password short_id
+    local -a ports
+
+    reality_port="$(choose_port 443 8443 2053 2083 2087 2096 2443 10443 \
+        || choose_random_port)" || die "无法为 REALITY 选择端口。"
+
+    ss_port="$(choose_port 8388 8389 8390 18443 18444 \
+        || choose_random_port)" || die "无法为 Shadowsocks 选择端口。"
+
+    tls_port=""
+    if [[ "${TLS_OK:-0}" == 1 ]]; then
+        tls_port="$(choose_port 10443 1443 2443 3443 4443 \
+            || choose_random_port)" || {
+            warn "无可用 TLS 端口，跳过 TLS 节点。"
+            TLS_OK=0
+        }
+    fi
+
+    uuid="$(cat /proc/sys/kernel/random/uuid)"
+    ss_password="$(openssl rand -base64 24 | tr -d '\n')"
+    short_id="$(openssl rand -hex 8)"
+
+    generate_reality_keys
+
+    export REALITY_PORT="$reality_port"
+    export SS_PORT="$ss_port"
+    export TLS_PORT="${tls_port:-0}"
+    export NODE_UUID="$uuid"
+    export SS_PASSWORD="$ss_password"
+    export SHORT_ID="$short_id"
+    export PRIVATE_KEY="${PRIVATE_KEY:-}"
+    export PUBLIC_KEY="${PUBLIC_KEY:-}"
+    export DOMAIN="${DOMAIN:-}"
+    export PUBLIC_IP
+
+    mkdir -p "$DATA"
+    python3 - <<'PY'
+import json, os
+
+base = os.environ["BASE"] if "BASE" in os.environ else "/opt/xiazheteng-node"
+domain = os.environ.get("DOMAIN", "")
+ip = os.environ["PUBLIC_IP"]
+uuid = os.environ["NODE_UUID"]
+short_id = os.environ["SHORT_ID"]
+private_key = os.environ.get("PRIVATE_KEY", "")
+reality_port = int(os.environ["REALITY_PORT"])
+ss_port = int(os.environ["SS_PORT"])
+tls_port = int(os.environ["TLS_PORT"])
+ss_password = os.environ["SS_PASSWORD"]
+
+inbounds = []
+
+# REALITY: 不创建不完整的密钥配置。
+if private_key:
+    inbounds.append({
+        "tag": "in-reality",
+        "listen": "0.0.0.0",
+        "port": reality_port,
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": uuid, "flow": "xtls-rprx-vision"}],
+            "decryption": "none"
+        },
+        "streamSettings": {
+            "network": "raw",
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "dest": "www.microsoft.com:443",
+                "xver": 0,
+                "serverNames": ["www.microsoft.com"],
+                "privateKey": private_key,
+                "shortIds": [short_id]
+            }
+        },
+        "sniffing": {
+            "enabled": True,
+            "destOverride": ["http", "tls", "quic"]
+        }
+    })
+
+inbounds.append({
+    "tag": "in-shadowsocks",
+    "listen": "0.0.0.0",
+    "port": ss_port,
+    "protocol": "shadowsocks",
+    "settings": {
+        "method": "chacha20-ietf-poly1305",
+        "password": ss_password,
+        "network": "tcp,udp"
+    }
+})
+
+# TLS 只有证书已安装并验证后才启用。
+if tls_port and domain and os.path.isfile(base + "/certs/fullchain.pem") \
+        and os.path.isfile(base + "/certs/key.pem"):
+    inbounds.append({
+        "tag": "in-vless-ws-tls",
+        "listen": "0.0.0.0",
+        "port": tls_port,
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": uuid}],
+            "decryption": "none"
+        },
+        "streamSettings": {
+            "network": "ws",
+            "security": "tls",
+            "tlsSettings": {
+                "alpn": ["http/1.1"],
+                "certificates": [{
+                    "certificateFile": base + "/certs/fullchain.pem",
+                    "keyFile": base + "/certs/key.pem"
+                }]
+            },
+            "wsSettings": {"path": "/xws"}
+        }
+    })
+
+config = {
+    "log": {"loglevel": "warning"},
+    "inbounds": inbounds,
+    "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+}
+
+path = base + "/config.json"
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(config, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+
+nodes = []
+if private_key:
+    nodes.append({
+        "type": "vless-reality",
+        "address": ip,
+        "port": reality_port,
+        "uuid": uuid,
+        "flow": "xtls-rprx-vision",
+        "security": "reality",
+        "public_key": os.environ.get("PUBLIC_KEY", ""),
+        "short_id": short_id,
+        "sni": "www.microsoft.com"
+    })
+
+nodes.append({
+    "type": "shadowsocks",
+    "address": ip,
+    "port": ss_port,
+    "method": "chacha20-ietf-poly1305",
+    "password": ss_password
+})
+
+if any(x["tag"] == "in-vless-ws-tls" for x in inbounds):
+    nodes.append({
+        "type": "vless-ws-tls",
+        "address": domain,
+        "port": tls_port,
+        "uuid": uuid,
+        "path": "/xws",
+        "sni": domain
+    })
+
+with open(base + "/data/nodes.json", "w") as f:
+    json.dump(nodes, f, indent=2)
+os.chmod(base + "/data/nodes.json", 0o600)
 PY
 
-# ------------------------------------------------------------
-# Python 订阅 HTTP 服务
-# ------------------------------------------------------------
+    # 导出变量供 Python heredoc 使用。
+    # 此函数的调用方必须先 export BASE。
+    echo "$reality_port" > "$DATA/reality.port"
+    echo "$ss_port" > "$DATA/shadowsocks.port"
+    [[ -n "$tls_port" ]] && echo "$tls_port" > "$DATA/tls.port" || true
+}
 
-cat > "$SERVER_PY" <<'PY'
-#!/usr/bin/env python3
-import http.server
-import json
-import pathlib
-import time
-import urllib.parse
+# -------------------- 订阅生成 --------------------
 
-ROOT = pathlib.Path("/opt/xiazheteng-node-manager")
-CONFIG = json.loads((ROOT / "config.json").read_text())
-TOKEN = CONFIG["sub_token"]
-PORT = int(CONFIG["sub_port"])
-SUB = ROOT / "data" / "subscription.txt"
-STATUS = ROOT / "data" / "sync-status.json"
+generate_subscription() {
+    [[ -f "$SUBJSON" ]] || {
+        warn "没有节点清单；请先执行安装。"
+        return 1
+    }
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path.strip("/")
+    # 仅从当前配置中验证真实存在的入站。
+    "$BIN" run -test -config "$CONF" >/dev/null 2>&1 || {
+        warn "配置验证失败，不生成订阅。"
+        return 1
+    }
 
-        if path == "health":
-            body = b"ok\n"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
+    python3 - <<'PY'
+import base64, json, os, urllib.parse
 
-        if path != TOKEN:
-            self.send_error(404)
-            return
+base = "/opt/xiazheteng-node"
+with open(base + "/data/nodes.json") as f:
+    nodes = json.load(f)
 
-        try:
-            text = SUB.read_text().strip()
-            if not text:
-                self.send_error(503, "No node links available")
-                return
+links = []
+for n in nodes:
+    t = n["type"]
+    name = urllib.parse.quote("xiazheteng-" + t, safe="")
+    host = n["address"]
+    port = n["port"]
 
-            body = text.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        except Exception:
-            self.send_error(503, "Subscription unavailable")
+    if t == "vless-reality":
+        if not n.get("public_key") or not n.get("uuid"):
+            continue
+        q = urllib.parse.urlencode({
+            "encryption": "none",
+            "security": "reality",
+            "sni": n["sni"],
+            "fp": "chrome",
+            "pbk": n["public_key"],
+            "sid": n["short_id"],
+            "type": "raw",
+            "flow": n["flow"]
+        })
+        links.append(
+            f"vless://{n['uuid']}@{host}:{port}?{q}#{name}"
+        )
 
-    def log_message(self, *_):
-        pass
+    elif t == "shadowsocks":
+        raw = n["method"] + ":" + n["password"]
+        userinfo = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+        links.append(f"ss://{userinfo}@{host}:{port}#{name}")
 
-http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    elif t == "vless-ws-tls":
+        q = urllib.parse.urlencode({
+            "encryption": "none",
+            "security": "tls",
+            "sni": n["sni"],
+            "type": "ws",
+            "path": n["path"],
+            "host": n["sni"]
+        })
+        links.append(f"vless://{n['uuid']}@{host}:{port}?{q}#{name}")
+
+with open(base + "/data/subscription.txt", "w") as f:
+    f.write("\n".join(links) + ("\n" if links else ""))
+
+encoded = base64.b64encode("\n".join(links).encode()).decode()
+with open(base + "/data/subscription.b64", "w") as f:
+    f.write(encoded + "\n")
+
+os.chmod(base + "/data/subscription.txt", 0o600)
+os.chmod(base + "/data/subscription.b64", 0o600)
+print("订阅节点数量：", len(links))
 PY
 
-chmod 700 "$SYNC_PY" "$SERVER_PY"
+    # 订阅通过本机验证不代表已完成外部连通性测试。
+    info "订阅文件：$SUBFILE"
+    info "Base64 订阅：$DATA/subscription.b64"
+}
 
-# ------------------------------------------------------------
-# systemd 同步服务与定时器
-# ------------------------------------------------------------
+# -------------------- systemd 服务 --------------------
 
-cat > "$SYNC_SERVICE" <<EOF
+install_service() {
+    # 不接管或替换其他软件的服务文件。
+    if [[ -e "$UNIT" ]] &&
+       ! grep -q "xiazheteng-node-manager" "$UNIT"; then
+        die "服务文件已存在且不属于本脚本：$UNIT"
+    fi
+
+    cat > "$UNIT" <<EOF
+# xiazheteng-node-manager
 [Unit]
-Description=${APP} API sync
-After=network-online.target x-ui.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/python3 ${SYNC_PY}
-User=root
-UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
-EOF
-
-cat > "$SYNC_TIMER" <<EOF
-[Unit]
-Description=${APP} periodic sync
-
-[Timer]
-OnBootSec=30s
-OnUnitActiveSec=60s
-AccuracySec=5s
-Unit=${APP}-sync.service
-
-[Install]
-WantedBy=timers.target
-EOF
-
-cat > "$SERVER_SERVICE" <<EOF
-[Unit]
-Description=${APP} subscription server
+Description=Xia Zhe Teng Independent Xray Service
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 ${SERVER_PY}
-WorkingDirectory=${ROOT}
-Restart=on-failure
-RestartSec=3
 User=root
-UMask=0077
+ExecStart=$BIN run -config $CONF
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadOnlyPaths=${DATA}/subscription.txt ${CONFIG}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now "${APP}-sync.timer"
-systemctl enable --now "${APP}-subscription.service"
+    chmod 644 "$UNIT"
+    systemctl daemon-reload
 
-# 首次同步立即执行，不能把尚未验证的空订阅称为成功。
-info "立即执行首次 API 同步。"
-systemctl start "${APP}-sync.service" ||
-    die "首次 API 同步失败。请检查面板登录凭据、端口、Web Base Path 与 API 路由。"
+    # 先验证配置再启动，失败时不重启原有服务。
+    "$BIN" run -test -config "$CONF" ||
+        die "Xray 配置校验失败，拒绝启动。"
 
-sleep 2
+    systemctl enable "$SERVICE"
+    systemctl restart "$SERVICE"
+    sleep 2
 
-[[ -f "${DATA}/sync-status.json" ]] ||
-    die "没有生成同步状态文件。"
+    systemctl is-active --quiet "$SERVICE" ||
+        die "Xray 服务未能启动，请检查 journalctl -u $SERVICE。"
 
-python3 - "$DATA/sync-status.json" <<'PY'
-import json,sys
-d=json.load(open(sys.argv[1]))
-if not d.get("success"):
-    raise SystemExit("同步没有成功")
-print("已同步分享链接：",d.get("link_count",0))
-print("同步时间：",d.get("last_sync"))
-PY
+    info "独立 Xray 服务启动成功。"
+}
 
-# ------------------------------------------------------------
-# 订阅验证与结果输出
-# ------------------------------------------------------------
+# -------------------- 防火墙检测 --------------------
 
-HTTP_CODE="$(curl -sS --max-time 10 \
-  -o /dev/null -w '%{http_code}' \
-  "http://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}" || true)"
+report_firewall() {
+    local p
+    for p in "$@"; do
+        if command -v ufw >/dev/null 2>&1 &&
+           ufw status 2>/dev/null | grep -qi active; then
+            warn "检测到 UFW 已启用。请确认 TCP/UDP $p 已放行；脚本不会重置防火墙。"
+        fi
+    done
 
-[[ "$HTTP_CODE" == "200" ]] ||
-    die "订阅服务验证失败，HTTP ${HTTP_CODE}。"
+    if command -v firewall-cmd >/dev/null 2>&1 &&
+       firewall-cmd --state >/dev/null 2>&1; then
+        warn "检测到 firewalld。请确认相应端口已放行；脚本不会重置防火墙。"
+    fi
 
-cat > "${ROOT}/result.txt" <<EOF
-域名：${DOMAIN}
-面板端口：${PANEL_PORT}
-订阅端口：${SUB_PORT}
-订阅地址：http://${DOMAIN}:${SUB_PORT}/${SUB_TOKEN}
-节点链接文件：${DATA}/links.txt
-订阅文件：${DATA}/subscription.txt
-同步状态：${DATA}/sync-status.json
-管理日志：${LOG}
-同步日志：${LOG_DIR}/sync.log
-同步间隔：60 秒
+    warn "VPS 服务商安全组不一定可自动检测，请确认公网端口已放行。"
+}
+
+# -------------------- 安装主流程 --------------------
+
+do_install() {
+    detect_os
+    install_dependencies
+    detect_public_ipv4
+    inspect_existing_services
+
+    mkdir -p "$BASE" "$DATA" "$BASE/bin"
+    chmod 700 "$BASE" "$DATA"
+
+    if [[ -f "$ENVFILE" ]]; then
+        # 配置文件仅由本脚本生成，权限为 600。
+        # shellcheck disable=SC1090
+        source "$ENVFILE"
+        info "读取已有安装配置。"
+    else
+        echo
+        read -r -p "请输入已经解析到本 VPS 的域名（没有域名直接回车）：" DOMAIN
+        DOMAIN="${DOMAIN,,}"
+        DOMAIN="${DOMAIN%.}"
+        printf 'DOMAIN=%q\n' "$DOMAIN" > "$ENVFILE"
+        chmod 600 "$ENVFILE"
+    fi
+
+    DOMAIN="${DOMAIN:-}"
+    check_domain
+    install_xray
+
+    # 证书申请可能失败，不阻断其他节点安装。
+    obtain_tls_certificate
+
+    export BASE
+    generate_configuration
+    generate_subscription
+    install_service
+
+    local ports=()
+    [[ -f "$DATA/reality.port" ]] && ports+=("$(cat "$DATA/reality.port")")
+    [[ -f "$DATA/shadowsocks.port" ]] && ports+=("$(cat "$DATA/shadowsocks.port")")
+    [[ -f "$DATA/tls.port" ]] && ports+=("$(cat "$DATA/tls.port")")
+
+    report_firewall "${ports[@]}"
+
+    echo
+    echo "================ 安装结果 ================"
+    systemctl --no-pager --full status "$SERVICE" || true
+    echo
+    echo "节点订阅文件：$SUBFILE"
+    echo "Base64 订阅文件：$DATA/subscription.b64"
+    echo "日志文件：$LOG"
+    echo "==========================================="
+}
+
+# -------------------- 安全卸载 --------------------
+
+do_uninstall() {
+    echo "开始移除本脚本创建的独立服务和文件。"
+
+    if [[ -f "$UNIT" ]] &&
+       grep -q "xiazheteng-node-manager" "$UNIT"; then
+        systemctl disable --now "$SERVICE" 2>/dev/null || true
+        rm -f "$UNIT"
+        systemctl daemon-reload
+    else
+        warn "服务文件不存在或不属于本脚本，不做处理。"
+    fi
+
+    if [[ -L "$SHORTCUT" ]] ||
+       { [[ -f "$SHORTCUT" ]] &&
+         grep -q "xiazheteng-node-manager" "$SHORTCUT" 2>/dev/null; }; then
+        rm -f "$SHORTCUT"
+    fi
+
+    # 仅删除独立目录；不删除系统 Xray、面板、Nginx 或其他服务。
+    if [[ "$BASE" == "/opt/xiazheteng-node" &&
+          -d "$BASE" &&
+          -f "$ENVFILE" ]]; then
+        rm -rf -- "$BASE"
+    fi
+
+    warn "如果此前由本脚本安装了 acme.sh 或系统依赖，它们不会自动删除。"
+    warn "现有防火墙规则及服务商安全组规则不会自动清理。"
+    info "卸载操作完成。"
+}
+
+# -------------------- 快捷命令 --------------------
+
+create_shortcut() {
+    local self
+    self="$(readlink -f "$0")"
+    [[ -f "$self" ]] || die "无法定位当前脚本文件。"
+
+    # 将脚本安装到固定位置，避免用户移动原文件后快捷命令失效。
+    install -m 0755 "$self" "$BASE/manager.sh"
+
+    cat > "$SHORTCUT" <<'EOF'
+#!/usr/bin/env bash
+# xiazheteng-node-manager
+exec bash /opt/xiazheteng-node/manager.sh "$@"
 EOF
-chmod 600 "${ROOT}/result.txt"
+    chmod 755 "$SHORTCUT"
 
-printf '\n'
-printf '%s\n' '============================================================'
-printf '%s\n' '               部署与同步配置完成'
-printf '%s\n' '============================================================'
-printf '订阅地址：http://%s:%s/%s\n' "$DOMAIN" "$SUB_PORT" "$SUB_TOKEN"
-printf '结果文件：%s/result.txt\n' "$ROOT"
-printf '节点列表：%s\n' "$DATA/links.txt"
-printf '同步周期：每 60 秒\n'
-printf '\n'
-warn "本脚本的订阅端点使用 HTTP。请勿在不可信网络中公开传输订阅令牌。"
-warn "请在云厂商安全组放行订阅端口，以及实际节点监听端口。"
-warn "此脚本负责扫描和同步现有节点，不会在首次安装时自动创建所有协议节点。"
-warn "如果面板使用自签证书或非标准 Web Base Path，请先确认本机 API 登录成功。"
+    info "快捷命令创建完成。以后输入 x 即可启动管理菜单。"
+}
+
+# -------------------- 菜单 --------------------
+
+menu() {
+    while true; do
+        echo
+        echo "=========================================="
+        echo "       VPS 节点一键部署管理系统"
+        echo "=========================================="
+        echo "[1] 一键安装 / 自动修复"
+        echo "[2] 卸载脚本管理的组件"
+        echo "[3] 整合订阅 / 刷新订阅"
+        echo "[4] 创建快捷命令 x"
+        echo "[0] 退出"
+        echo "=========================================="
+        read -r -p "请选择：" choice
+
+        case "$choice" in
+            1) do_install ;;
+            2) do_uninstall ;;
+            3)
+                if [[ -x "$BIN" && -f "$CONF" ]]; then
+                    generate_subscription
+                else
+                    warn "尚未安装本脚本的节点。"
+                fi
+                ;;
+            4) create_shortcut ;;
+            0) echo "已退出。"; exit 0 ;;
+            *) echo "无效选项。" ;;
+        esac
+    done
+}
+
+main() {
+    need_root
+    detect_os
+
+    # 首次初始化询问域名；之后读取配置，不重复询问。
+    if [[ ! -f "$ENVFILE" ]]; then
+        mkdir -p "$BASE"
+        echo "首次初始化："
+        read -r -p "请输入已解析到本 VPS 的域名（无域名直接回车）：" DOMAIN
+        DOMAIN="${DOMAIN,,}"
+        DOMAIN="${DOMAIN%.}"
+        printf 'DOMAIN=%q\n' "$DOMAIN" > "$ENVFILE"
+        chmod 600 "$ENVFILE"
+    fi
+
+    # shellcheck disable=SC1090
+    source "$ENVFILE"
+    menu
+}
+
+main "$@"
