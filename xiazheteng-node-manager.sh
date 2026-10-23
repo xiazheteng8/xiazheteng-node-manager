@@ -1,422 +1,440 @@
 
 #!/usr/bin/env bash
 # ============================================================
-# 瞎折腾吧 | VPS 自动部署管理器
-# 3x-ui + Xray + 多协议节点 + 独立订阅服务
-# 目标系统：Debian / Ubuntu
+# 瞎折腾吧 | 3x-ui VPS 节点管理器
+# 功能：
+#   1. 自动安装或复用 3x-ui
+#   2. 检查面板 API 登录
+#   3. 自动同步面板中的节点分享链接
+#   4. 独立订阅 HTTP 服务
+#   5. systemd 定时同步，面板手动新增节点自动进入订阅
+#   6. 日志、配置备份、失败保护
+#
+# 支持 Debian / Ubuntu
 # ============================================================
 
 set -Eeuo pipefail
 umask 077
 
-APP="xiazheteng-vps"
+APP="xiazheteng-node-manager"
 ROOT="/opt/${APP}"
-LOG="/var/log/${APP}.log"
 DATA="${ROOT}/data"
-LINKS="${DATA}/links.txt"
-SUBSCRIPT="${ROOT}/subscription_server.py"
-SERVICE="/etc/systemd/system/${APP}-subscription.service"
-OFFICIAL="https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh"
+BIN="${ROOT}/bin"
+LOG_DIR="/var/log/${APP}"
+LOG="${LOG_DIR}/manager.log"
 
-mkdir -p "$ROOT" "$DATA"
-chmod 700 "$ROOT" "$DATA"
+SYNC_PY="${BIN}/sync.py"
+SERVER_PY="${BIN}/server.py"
+CONFIG="${ROOT}/config.json"
+
+SYNC_SERVICE="/etc/systemd/system/${APP}-sync.service"
+SYNC_TIMER="/etc/systemd/system/${APP}-sync.timer"
+SERVER_SERVICE="/etc/systemd/system/${APP}-subscription.service"
+
+mkdir -p "$DATA" "$BIN" "$LOG_DIR"
+chmod 700 "$ROOT" "$DATA" "$BIN" "$LOG_DIR"
 touch "$LOG"
 chmod 600 "$LOG"
+
 exec > >(tee -a "$LOG") 2>&1
 
-info(){ echo "[信息] $*"; }
-ok(){ echo "[成功] $*"; }
-warn(){ echo "[警告] $*"; }
-die(){ echo "[错误] $*" >&2; exit 1; }
+info() { printf '[信息] %s\n' "$*"; }
+ok() { printf '[成功] %s\n' "$*"; }
+warn() { printf '[警告] %s\n' "$*"; }
+die() { printf '[错误] %s\n' "$*" >&2; exit 1; }
 
-trap 'rc=$?; echo "[错误] 第 ${LINENO} 行失败，退出码 ${rc}；日志：'"$LOG" >&2; exit "$rc"' ERR
+trap 'rc=$?; echo "[错误] 第 ${LINENO} 行失败，退出码 ${rc}；查看日志：'"$LOG" >&2; exit "$rc"' ERR
 
 [[ $EUID -eq 0 ]] || die "请以 root 身份运行。"
-[[ -t 0 ]] || die "首次运行需要终端。请在 SSH 终端执行。"
+[[ -t 0 ]] || die "首次配置需要交互终端。"
 
+[[ -r /etc/os-release ]] || die "无法识别操作系统。"
+# shellcheck disable=SC1091
 source /etc/os-release
+
 case "${ID:-}" in
   debian|ubuntu|armbian) ;;
-  *) die "当前脚本仅自动处理 Debian、Ubuntu、Armbian。" ;;
+  *) die "仅支持 Debian、Ubuntu、Armbian。" ;;
 esac
 
 export DEBIAN_FRONTEND=noninteractive
+
 apt-get update -y
-apt-get install -y curl ca-certificates openssl python3 python3-venv \
-  iproute2 util-linux sqlite3
+apt-get install -y curl ca-certificates python3 python3-requests \
+  openssl iproute2 util-linux
 
 # ------------------------------------------------------------
-# 一次性输入
+# 工具函数
 # ------------------------------------------------------------
 
-while true; do
-  read -r -p "绑定域名：" DOMAIN
-  DOMAIN="${DOMAIN,,}"
-  if [[ "$DOMAIN" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
-    break
-  fi
-  warn "域名格式不正确。"
-done
-
-while true; do
-  read -r -p "3x-ui 管理用户名：" USERNAME
-  [[ "$USERNAME" =~ ^[a-zA-Z0-9_.-]{3,64}$ ]] && break
-  warn "用户名只能包含字母、数字、点、下划线和连字符，长度 3–64。"
-done
-
-while true; do
-  read -r -s -p "3x-ui 管理密码（至少 12 位）：" PASSWORD
-  echo
-  [[ ${#PASSWORD} -ge 12 && "$PASSWORD" != *$'\n'* ]] && break
-  warn "密码至少需要 12 个字符。"
-done
-
-read -r -p "订阅令牌（留空自动生成）：" SUB_TOKEN
-SUB_TOKEN="${SUB_TOKEN:-$(openssl rand -hex 24)}"
-[[ "$SUB_TOKEN" =~ ^[a-zA-Z0-9_-]{24,128}$ ]] || die "订阅令牌格式错误。"
-
-# 避免后续意外打印密码。
-set +x
-
-# ------------------------------------------------------------
-# 基础函数
-# ------------------------------------------------------------
-
-random_port(){
-  shuf -i 20000-55000 -n 1
+random_hex() {
+    openssl rand -hex "$1"
 }
 
-free_port(){
-  local p i
-  for i in $(seq 1 300); do
-    p="$(random_port)"
-    if ! ss -H -lnt 2>/dev/null |
-      awk '{print $4}' |
-      grep -Eq "[:.]${p}$"; then
-      echo "$p"
-      return 0
+find_free_port() {
+    local p i
+    for i in $(seq 1 300); do
+        p="$(shuf -i 20000-55000 -n 1)"
+        if ! ss -H -lnt 2>/dev/null |
+            awk '{print $4}' |
+            grep -Eq "[:.]${p}$"; then
+            printf '%s\n' "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+valid_domain() {
+    [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]
+}
+
+# ------------------------------------------------------------
+# 一次性收集参数
+# ------------------------------------------------------------
+
+if [[ -f "$CONFIG" ]]; then
+    read -r -p "发现现有配置。输入 R 重新配置，直接回车继续使用：" RECONFIG
+else
+    RECONFIG="R"
+fi
+
+if [[ "${RECONFIG^^}" == "R" ]]; then
+    while true; do
+        read -r -p "节点域名（例如 node.example.com）：" DOMAIN
+        DOMAIN="${DOMAIN,,}"
+        valid_domain "$DOMAIN" && break
+        warn "域名格式不正确。"
+    done
+
+    while true; do
+        read -r -p "3x-ui 管理用户名：" USERNAME
+        [[ "$USERNAME" =~ ^[a-zA-Z0-9_.-]{3,64}$ ]] && break
+        warn "用户名格式不正确。"
+    done
+
+    while true; do
+        read -r -s -p "3x-ui 管理密码（至少 12 位）：" PASSWORD
+        echo
+        [[ ${#PASSWORD} -ge 12 ]] && break
+        warn "密码至少 12 位。"
+    done
+
+    read -r -p "3x-ui Web Base Path（无前导斜杠，例如 abc123；默认 /）：" WEB_PATH
+    WEB_PATH="${WEB_PATH#/}"
+    WEB_PATH="${WEB_PATH%/}"
+
+    if [[ -n "$WEB_PATH" ]]; then
+        [[ "$WEB_PATH" =~ ^[a-zA-Z0-9_-]+$ ]] ||
+            die "Web Base Path 只允许字母、数字、下划线和连字符。"
+        WEB_PATH="/${WEB_PATH}/"
+    else
+        WEB_PATH="/"
     fi
-  done
-  return 1
-}
 
-random_hex(){
-  openssl rand -hex "$1"
-}
+    read -r -p "面板监听端口（已安装则输入现有端口，留空自动选择）：" PANEL_PORT
+    PANEL_PORT="${PANEL_PORT:-$(find_free_port)}"
+    [[ "$PANEL_PORT" =~ ^[0-9]+$ ]] &&
+        ((PANEL_PORT >= 1 && PANEL_PORT <= 65535)) ||
+        die "面板端口无效。"
 
-json_escape(){
-  python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
-}
+    SUB_PORT="$(find_free_port)" || die "找不到订阅端口。"
+    SUB_TOKEN="$(random_hex 24)"
 
-info "检查域名 DNS。"
-python3 - "$DOMAIN" <<'PY' || warn "DNS 当前不可用；TLS 与域名连通性需要后续复查。"
-import socket,sys
-try:
-    for item in sorted({x[4][0] for x in socket.getaddrinfo(sys.argv[1], None)}):
-        print(item)
-except Exception as e:
-    print(e)
-    sys.exit(1)
+    export DOMAIN USERNAME PASSWORD WEB_PATH PANEL_PORT SUB_PORT SUB_TOKEN
+
+    python3 - "$CONFIG" <<'PY'
+import json, os, sys
+data = {
+    "domain": os.environ["DOMAIN"],
+    "username": os.environ["USERNAME"],
+    "password": os.environ["PASSWORD"],
+    "web_path": os.environ["WEB_PATH"],
+    "panel_port": int(os.environ["PANEL_PORT"]),
+    "sub_port": int(os.environ["SUB_PORT"]),
+    "sub_token": os.environ["SUB_TOKEN"],
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(data, f, indent=2)
 PY
+    chmod 600 "$CONFIG"
+fi
 
-IP4="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
-IP6="$(curl -6 -fsS --max-time 8 https://api64.ipify.org 2>/dev/null || true)"
-info "公网 IPv4：${IP4:-不可用}"
-info "公网 IPv6：${IP6:-不可用}"
-
-info "现有监听端口："
-ss -lntup || true
-
-PANEL_PORT="$(free_port)" || die "无法找到面板端口。"
-SUB_PORT="$(free_port)" || die "无法找到订阅端口。"
+# 配置以 JSON 保存，避免密码中有引号或特殊字符时破坏 Shell 语法。
+eval "$(
+python3 - "$CONFIG" <<'PY'
+import json, shlex, sys
+d = json.load(open(sys.argv[1]))
+for key in ("domain","username","password","web_path","panel_port","sub_port","sub_token"):
+    print(f"{key.upper()}={shlex.quote(str(d[key]))}")
+PY
+)"
 
 # ------------------------------------------------------------
-# 官方安装器：非交互模式
+# 安装或复用 3x-ui
 # ------------------------------------------------------------
 
-WEB_PATH="$(random_hex 18)"
-WEB_PATH="/${WEB_PATH}"
+if ! command -v x-ui >/dev/null 2>&1; then
+    info "未检测到 3x-ui，尝试调用官方安装器。"
 
-export XUI_NONINTERACTIVE=1
-export XUI_USERNAME="$USERNAME"
-export XUI_PASSWORD="$PASSWORD"
-export XUI_PANEL_PORT="$PANEL_PORT"
-export XUI_WEB_BASE_PATH="$WEB_PATH"
-export XUI_SSL_MODE=none
-export XUI_DOMAIN="$DOMAIN"
+    INSTALLER="$(mktemp)"
+    trap 'rm -f "${INSTALLER:-}"' EXIT
 
-info "下载官方 3x-ui 安装器。"
-INSTALLER="$(mktemp)"
-curl -fL --retry 3 "$OFFICIAL" -o "$INSTALLER"
-bash -n "$INSTALLER" || die "官方安装脚本语法检查失败。"
+    curl -fL --retry 3 \
+      https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh \
+      -o "$INSTALLER"
 
-info "开始无人值守安装 3x-ui。"
-bash "$INSTALLER"
-rm -f "$INSTALLER"
+    bash -n "$INSTALLER" || die "官方安装器语法检查失败。"
 
-[[ -f /etc/x-ui/install-result.env ]] ||
-  die "官方安装器没有生成 install-result.env。"
+    export XUI_NONINTERACTIVE=1
+    export XUI_USERNAME="$USERNAME"
+    export XUI_PASSWORD="$PASSWORD"
+    export XUI_PORT="$PANEL_PORT"
+    export XUI_WEB_BASE_PATH="$WEB_PATH"
 
-# 官方结果文件由官方安装器生成，限制权限后读取。
-chmod 600 /etc/x-ui/install-result.env
-# shellcheck disable=SC1091
-source /etc/x-ui/install-result.env
-
-PANEL_PORT="${XUI_PANEL_PORT:-$PANEL_PORT}"
-WEB_PATH="${XUI_WEB_BASE_PATH:-$WEB_PATH}"
+    bash "$INSTALLER"
+    rm -f "$INSTALLER"
+    trap - ERR
+else
+    info "检测到已有 3x-ui，保留现有安装。"
+fi
 
 systemctl enable x-ui
 systemctl restart x-ui
 sleep 3
-systemctl is-active --quiet x-ui || die "3x-ui 服务未启动。"
+systemctl is-active --quiet x-ui || die "3x-ui 服务没有启动。"
 
 # ------------------------------------------------------------
-# API 登录
+# Python API 同步器
 # ------------------------------------------------------------
 
-COOKIE="${DATA}/cookies.txt"
-API_BASE="http://127.0.0.1:${PANEL_PORT}${WEB_PATH}"
-
-info "登录面板 API。"
-LOGIN_CODE="$(
-  curl -sS --max-time 15 \
-    -c "$COOKIE" -o "${DATA}/login.json" \
-    -w '%{http_code}' \
-    -H "Host: ${DOMAIN}:${PANEL_PORT}" \
-    -X POST "${API_BASE}/login" \
-    --data-urlencode "username=${USERNAME}" \
-    --data-urlencode "password=${PASSWORD}" || true
-)"
-
-if [[ "$LOGIN_CODE" != "200" ]]; then
-  die "面板 API 登录失败（HTTP ${LOGIN_CODE}）。检查凭据、Web 路径和面板日志。"
-fi
-
-API_GET(){
-  curl -fsS --max-time 20 \
-    -b "$COOKIE" \
-    -H "Host: ${DOMAIN}:${PANEL_PORT}" \
-    "$1"
-}
-
-API_POST(){
-  curl -fsS --max-time 30 \
-    -b "$COOKIE" \
-    -H "Host: ${DOMAIN}:${PANEL_PORT}" \
-    -H "Content-Type: application/json" \
-    -X POST "$1" \
-    --data-binary "@${DATA}/payload.json"
-}
-
-# ------------------------------------------------------------
-# 节点创建
-# ------------------------------------------------------------
-
-CREATED=0
-: > "$LINKS"
-chmod 600 "$LINKS"
-
-new_uuid(){
-  python3 -c 'import uuid; print(uuid.uuid4())'
-}
-
-add_inbound(){
-  local name="$1" port="$2" proto="$3" settings="$4" stream="$5"
-  local payload response
-
-  python3 - "$name" "$port" "$proto" "$settings" "$stream" > "${DATA}/payload.json" <<'PY'
-import json,sys
-name,port,proto,settings,stream=sys.argv[1:]
-obj={
- "enable":True,
- "remark":name,
- "listen":"",
- "port":int(port),
- "protocol":proto,
- "expiryTime":0,
- "total":0,
- "settings":json.loads(settings),
- "streamSettings":json.loads(stream),
- "sniffing":{"enabled":True,"destOverride":["http","tls"]}
-}
-print(json.dumps(obj))
-PY
-
-  response="$(API_POST "${API_BASE}/panel/api/inbounds/add")" || {
-    warn "${name} API 请求失败。"
-    return 1
-  }
-
-  if ! python3 -c '
-import json,sys
-d=json.load(sys.stdin)
-sys.exit(0 if d.get("success") is True else 1)
-' <<< "$response"; then
-    warn "${name} 创建失败：$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("msg","未知错误"))' <<< "$response")"
-    return 1
-  fi
-
-  ok "${name} 入站已被面板接受。"
-  CREATED=$((CREATED+1))
-}
-
-# VLESS REALITY
-VLESS_PORT="$(free_port)" || die "没有可用 VLESS 端口。"
-VLESS_UUID="$(new_uuid)"
-SHORT_ID="$(random_hex 8)"
-
-XRAY_BIN="$(find /usr/local/x-ui -type f -name 'xray*' -perm /111 2>/dev/null | head -n1 || true)"
-PRIVATE_KEY=""
-PUBLIC_KEY=""
-
-if [[ -n "$XRAY_BIN" ]]; then
-  KEY_OUTPUT="$("$XRAY_BIN" x25519 2>/dev/null || true)"
-  PRIVATE_KEY="$(sed -nE 's/^(Private key|PrivateKey):[[:space:]]*//p' <<< "$KEY_OUTPUT" | head -n1)"
-  PUBLIC_KEY="$(sed -nE 's/^(Public key|Password|PublicKey):[[:space:]]*//p' <<< "$KEY_OUTPUT" | head -n1)"
-fi
-
-if [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]]; then
-  SETTINGS="$(python3 - "$VLESS_UUID" <<'PY'
-import json,sys
-print(json.dumps({"clients":[{"id":sys.argv[1],"email":"auto-vless"}],"decryption":"none","fallbacks":[]}))
-PY
-)"
-  STREAM="$(python3 - "$PRIVATE_KEY" "$SHORT_ID" <<'PY'
-import json,sys
-print(json.dumps({
- "network":"tcp","security":"reality",
- "realitySettings":{
-  "show":False,"dest":"www.microsoft.com:443",
-  "xver":0,"serverNames":["www.microsoft.com"],
-  "privateKey":sys.argv[1],"shortIds":[sys.argv[2]]
- }
-}))
-PY
-)"
-  if add_inbound "AUTO-VLESS-REALITY" "$VLESS_PORT" "vless" "$SETTINGS" "$STREAM"; then
-    printf '%s\n' "$VLESS_UUID" > "${DATA}/vless_uuid"
-    printf '%s\n' "$PUBLIC_KEY" > "${DATA}/reality_public_key"
-    printf '%s\n' "$SHORT_ID" > "${DATA}/reality_short_id"
-  fi
-else
-  warn "无法从 Xray 获取 REALITY 密钥，跳过该节点。"
-fi
-
-# VMess TCP
-VMESS_PORT="$(free_port)" || die "没有可用 VMess 端口。"
-VMESS_UUID="$(new_uuid)"
-VMESS_SETTINGS="$(python3 - "$VMESS_UUID" <<'PY'
-import json,sys
-print(json.dumps({"clients":[{"id":sys.argv[1],"alterId":0,"email":"auto-vmess"}]}))
-PY
-)"
-VMESS_STREAM='{"network":"tcp","security":"none","tcpSettings":{"acceptProxyProtocol":false,"header":{"type":"none"}}}'
-
-add_inbound "AUTO-VMESS-TCP" "$VMESS_PORT" "vmess" "$VMESS_SETTINGS" "$VMESS_STREAM" || true
-
-# Shadowsocks
-SS_PORT="$(free_port)" || die "没有可用 Shadowsocks 端口。"
-SS_PASSWORD="$(random_hex 18)"
-SS_SETTINGS="$(python3 - "$SS_PASSWORD" <<'PY'
-import json,sys
-print(json.dumps({"method":"aes-128-gcm","password":sys.argv[1],"network":"tcp,udp"}))
-PY
-)"
-SS_STREAM='{"network":"tcp","security":"none"}'
-
-add_inbound "AUTO-SHADOWSOCKS" "$SS_PORT" "shadowsocks" "$SS_SETTINGS" "$SS_STREAM" || true
-
-# ------------------------------------------------------------
-# 读取实际创建结果和分享链接
-# ------------------------------------------------------------
-
-info "读取面板实际入站列表。"
-API_GET "${API_BASE}/panel/api/inbounds/list" > "${DATA}/inbounds.json"
-
-python3 - "$DATA/inbounds.json" <<'PY'
-import json,sys
-d=json.load(open(sys.argv[1]))
-if not d.get("success"):
-    raise SystemExit("面板没有成功返回入站列表")
-items=d.get("obj") or []
-print("当前面板入站数量：",len(items))
-for item in items:
-    print("ID:",item.get("id"),"协议:",item.get("protocol"),"端口:",item.get("port"),"启用:",item.get("enable"))
-PY
-
-API_GET "${API_BASE}/panel/api/inbounds/allLinks" > "${DATA}/allLinks.json"
-
-python3 - "$DATA/allLinks.json" "$LINKS" <<'PY'
-import json,sys
-d=json.load(open(sys.argv[1]))
-if not d.get("success"):
-    raise SystemExit("无法获取真实分享链接："+str(d.get("msg","")))
-links=d.get("obj") or []
-with open(sys.argv[2],"w") as f:
-    for link in links:
-        if isinstance(link,str) and link.startswith(("vless://","vmess://","trojan://","ss://","hysteria2://")):
-            f.write(link+"\n")
-print("有效分享链接数量：",len(links))
-PY
-
-chmod 600 "$LINKS"
-
-# ------------------------------------------------------------
-# 独立订阅服务器：返回 base64 编码的真实分享链接
-# ------------------------------------------------------------
-
-cat > "$SUBSCRIPT" <<'PY'
+cat > "$SYNC_PY" <<'PY'
 #!/usr/bin/env python3
-import base64, os
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+import base64
+import json
+import os
+import pathlib
+import sys
+import tempfile
+import time
+import requests
 
-TOKEN=os.environ["SUB_TOKEN"]
-LINKS=os.environ["LINKS_FILE"]
-PORT=int(os.environ["SUB_PORT"])
+ROOT = pathlib.Path("/opt/xiazheteng-node-manager")
+DATA = ROOT / "data"
+CONFIG = ROOT / "config.json"
+LINKS = DATA / "links.txt"
+SUB_B64 = DATA / "subscription.txt"
+STATUS = DATA / "sync-status.json"
+LOG = pathlib.Path("/var/log/xiazheteng-node-manager/sync.log")
 
-class Handler(BaseHTTPRequestHandler):
+def log(message):
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{stamp}] {message}"
+    print(line, flush=True)
+    with LOG.open("a") as f:
+        f.write(line + "\n")
+
+def atomic_write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+def collect_links(obj, out):
+    """兼容 allLinks 返回字符串、列表或嵌套对象的常见形式。"""
+    if isinstance(obj, str):
+        for line in obj.splitlines():
+            line = line.strip()
+            if line.startswith((
+                "vless://", "vmess://", "trojan://", "ss://",
+                "hysteria2://", "hy2://", "tuic://"
+            )):
+                out.add(line)
+    elif isinstance(obj, list):
+        for item in obj:
+            collect_links(item, out)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            collect_links(value, out)
+
+def main():
+    cfg = json.loads(CONFIG.read_text())
+    domain = cfg["domain"]
+    username = cfg["username"]
+    password = cfg["password"]
+    web_path = cfg["web_path"]
+    port = int(cfg["panel_port"])
+
+    base = f"http://127.0.0.1:{port}{web_path}"
+    if not base.endswith("/"):
+        base += "/"
+
+    session = requests.Session()
+    session.trust_env = False
+    session.headers.update({"Accept": "application/json"})
+
+    login = session.post(
+        base + "login",
+        data={"username": username, "password": password},
+        timeout=15,
+    )
+    login.raise_for_status()
+
+    try:
+        login_json = login.json()
+        if isinstance(login_json, dict) and login_json.get("success") is False:
+            raise RuntimeError("面板 API 拒绝登录：" + str(login_json.get("msg", "")))
+    except ValueError:
+        pass
+
+    endpoint = base + "panel/api/inbounds/allLinks"
+    response = session.get(endpoint, timeout=30)
+    response.raise_for_status()
+    result = response.json()
+
+    if not isinstance(result, dict) or result.get("success") is False:
+        raise RuntimeError("allLinks API 返回失败：" + str(result))
+
+    links = set()
+    collect_links(result.get("obj"), links)
+    ordered = sorted(links)
+
+    # API 成功返回空集合也属于有效结果，可能是面板当前没有节点。
+    # 请求失败时不会执行此处，不会覆盖上次有效订阅。
+    plain = "".join(link + "\n" for link in ordered)
+    encoded = base64.b64encode(plain.encode()).decode() if plain else ""
+
+    atomic_write(LINKS, plain)
+    atomic_write(SUB_B64, encoded + ("\n" if encoded else ""))
+
+    status = {
+        "last_sync": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "link_count": len(ordered),
+        "success": True,
+        "message": "同步成功",
+    }
+    atomic_write(STATUS, json.dumps(status, ensure_ascii=False, indent=2) + "\n")
+    log(f"同步成功：发现 {len(ordered)} 条分享链接。")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log("同步失败：" + repr(e))
+        sys.exit(1)
+PY
+
+# ------------------------------------------------------------
+# Python 订阅 HTTP 服务
+# ------------------------------------------------------------
+
+cat > "$SERVER_PY" <<'PY'
+#!/usr/bin/env python3
+import http.server
+import json
+import pathlib
+import time
+import urllib.parse
+
+ROOT = pathlib.Path("/opt/xiazheteng-node-manager")
+CONFIG = json.loads((ROOT / "config.json").read_text())
+TOKEN = CONFIG["sub_token"]
+PORT = int(CONFIG["sub_port"])
+SUB = ROOT / "data" / "subscription.txt"
+STATUS = ROOT / "data" / "sync-status.json"
+
+class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        path=urlparse(self.path).path.strip("/")
+        path = urllib.parse.urlparse(self.path).path.strip("/")
+
+        if path == "health":
+            body = b"ok\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if path != TOKEN:
             self.send_error(404)
             return
+
         try:
-            with open(LINKS,"rb") as f:
-                data=f.read()
+            text = SUB.read_text().strip()
+            if not text:
+                self.send_error(503, "No node links available")
+                return
+
+            body = text.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         except Exception:
-            self.send_error(503)
-            return
-        if not data.strip():
-            self.send_error(503,"No generated node links")
-            return
-        body=base64.b64encode(data)
-        self.send_response(200)
-        self.send_header("Content-Type","text/plain; charset=utf-8")
-        self.send_header("Content-Length",str(len(body)))
-        self.send_header("Cache-Control","no-store")
-        self.end_headers()
-        self.wfile.write(body)
-    def log_message(self,*args):
+            self.send_error(503, "Subscription unavailable")
+
+    def log_message(self, *_):
         pass
 
-ThreadingHTTPServer(("0.0.0.0",PORT),Handler).serve_forever()
+http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 PY
 
-chmod 700 "$SUBSCRIPT"
+chmod 700 "$SYNC_PY" "$SERVER_PY"
 
-cat > "$SERVICE" <<EOF
+# ------------------------------------------------------------
+# systemd 同步服务与定时器
+# ------------------------------------------------------------
+
+cat > "$SYNC_SERVICE" <<EOF
 [Unit]
-Description=${APP} Subscription Service
+Description=${APP} API sync
+After=network-online.target x-ui.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 ${SYNC_PY}
+User=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+EOF
+
+cat > "$SYNC_TIMER" <<EOF
+[Unit]
+Description=${APP} periodic sync
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=${APP}-sync.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+cat > "$SERVER_SERVICE" <<EOF
+[Unit]
+Description=${APP} subscription server
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-Environment="SUB_TOKEN=${SUB_TOKEN}"
-Environment="LINKS_FILE=${LINKS}"
-Environment="SUB_PORT=${SUB_PORT}"
-ExecStart=/usr/bin/python3 ${SUBSCRIPT}
+ExecStart=/usr/bin/python3 ${SERVER_PY}
+WorkingDirectory=${ROOT}
 Restart=on-failure
 RestartSec=3
 User=root
@@ -424,58 +442,71 @@ UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadOnlyPaths=${LINKS}
 ProtectHome=true
+ReadOnlyPaths=${DATA}/subscription.txt ${CONFIG}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now "${APP}-subscription"
+systemctl enable --now "${APP}-sync.timer"
+systemctl enable --now "${APP}-subscription.service"
 
-# ------------------------------------------------------------
-# 最终验证与结果
-# ------------------------------------------------------------
+# 首次同步立即执行，不能把尚未验证的空订阅称为成功。
+info "立即执行首次 API 同步。"
+systemctl start "${APP}-sync.service" ||
+    die "首次 API 同步失败。请检查面板登录凭据、端口、Web Base Path 与 API 路由。"
 
 sleep 2
-systemctl is-active --quiet "${APP}-subscription" ||
-  die "订阅服务没有启动。"
+
+[[ -f "${DATA}/sync-status.json" ]] ||
+    die "没有生成同步状态文件。"
+
+python3 - "$DATA/sync-status.json" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+if not d.get("success"):
+    raise SystemExit("同步没有成功")
+print("已同步分享链接：",d.get("link_count",0))
+print("同步时间：",d.get("last_sync"))
+PY
+
+# ------------------------------------------------------------
+# 订阅验证与结果输出
+# ------------------------------------------------------------
 
 HTTP_CODE="$(curl -sS --max-time 10 \
-  -o "${DATA}/subscription-test.txt" \
-  -w '%{http_code}' \
+  -o /dev/null -w '%{http_code}' \
   "http://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}" || true)"
 
 [[ "$HTTP_CODE" == "200" ]] ||
-  die "订阅 HTTP 验证失败，状态码：${HTTP_CODE}"
+    die "订阅服务验证失败，HTTP ${HTTP_CODE}。"
 
-chmod 600 "${DATA}/subscription-test.txt"
-
-# 密码和令牌单独存储。
-cat > "${ROOT}/credentials.txt" <<EOF
-Panel URL: http://${DOMAIN}:${PANEL_PORT}${WEB_PATH}
-Panel username: ${USERNAME}
-Panel password: ${PASSWORD}
-Subscription URL: http://${DOMAIN}:${SUB_PORT}/${SUB_TOKEN}
-Subscription port: ${SUB_PORT}
-Node links file: ${LINKS}
-Log file: ${LOG}
+cat > "${ROOT}/result.txt" <<EOF
+域名：${DOMAIN}
+面板端口：${PANEL_PORT}
+订阅端口：${SUB_PORT}
+订阅地址：http://${DOMAIN}:${SUB_PORT}/${SUB_TOKEN}
+节点链接文件：${DATA}/links.txt
+订阅文件：${DATA}/subscription.txt
+同步状态：${DATA}/sync-status.json
+管理日志：${LOG}
+同步日志：${LOG_DIR}/sync.log
+同步间隔：60 秒
 EOF
-chmod 600 "${ROOT}/credentials.txt"
+chmod 600 "${ROOT}/result.txt"
 
 printf '\n'
 printf '%s\n' '============================================================'
-printf '%s\n' '               部署结果'
+printf '%s\n' '               部署与同步配置完成'
 printf '%s\n' '============================================================'
-printf '面板地址： http://%s:%s%s\n' "$DOMAIN" "$PANEL_PORT" "$WEB_PATH"
-printf '订阅地址： http://%s:%s/%s\n' "$DOMAIN" "$SUB_PORT" "$SUB_TOKEN"
-printf '节点链接： %s\n' "$LINKS"
-printf '凭据文件： %s/credentials.txt\n' "$ROOT"
-printf '日志文件： %s\n' "$LOG"
-printf '成功创建的入站请求数：%s\n' "$CREATED"
-printf '订阅 HTTP 状态：%s\n' "$HTTP_CODE"
+printf '订阅地址：http://%s:%s/%s\n' "$DOMAIN" "$SUB_PORT" "$SUB_TOKEN"
+printf '结果文件：%s/result.txt\n' "$ROOT"
+printf '节点列表：%s\n' "$DATA/links.txt"
+printf '同步周期：每 60 秒\n'
 printf '\n'
-warn "订阅当前使用 HTTP，不包含 TLS 加密。不要在不可信网络中公开传输订阅令牌。"
-warn "请在云厂商安全组中开放实际使用的 TCP/UDP 端口。"
-warn "本脚本不会修改云安全组，也不会自动占用已有的 80/443 端口。"
+warn "本脚本的订阅端点使用 HTTP。请勿在不可信网络中公开传输订阅令牌。"
+warn "请在云厂商安全组放行订阅端口，以及实际节点监听端口。"
+warn "此脚本负责扫描和同步现有节点，不会在首次安装时自动创建所有协议节点。"
+warn "如果面板使用自签证书或非标准 Web Base Path，请先确认本机 API 登录成功。"
