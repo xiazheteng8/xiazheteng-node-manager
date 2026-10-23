@@ -634,6 +634,16 @@ PY
 # -------------------- 在线订阅 HTTP/HTTPS 服务 --------------------
 
 install_subscription_server() {
+    # 刷新订阅时也从已保存的配置中读取端口，避免 set -u 下变量未定义。
+    if [[ -f "$SUB_PORT_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$SUB_PORT_FILE"
+    fi
+
+    [[ "${SUB_PORT:-}" =~ ^[0-9]+$ ]] &&
+        (( SUB_PORT >= 1 && SUB_PORT <= 65535 )) ||
+        die "订阅端口未配置或无效，请先执行一键安装 / 自动修复。"
+
     [[ -f "$SUB_TOKEN_FILE" ]] ||
         openssl rand -hex 32 > "$SUB_TOKEN_FILE"
     chmod 600 "$SUB_TOKEN_FILE"
