@@ -135,12 +135,12 @@ check_domain() {
         awk '{print $1}' | sort -u || true)"
 
     if [[ -z "$ips" ]]; then
-        warn "$DOMAIN 没有 IPv4 解析，跳过依赖域名的 TLS 节点。"
+        warn "$DOMAIN 没有可查询到的 IPv4 A 记录；跳过 TLS 证书申请及 TLS 节点。请确认 DNS 已生效。"
         return 0
     fi
 
     if ! grep -Fxq "$PUBLIC_IP" <<< "$ips"; then
-        warn "$DOMAIN 的 A 记录不包含本机公网 IPv4，跳过 TLS 节点。"
+        warn "$DOMAIN 的 A 记录为：$(tr '\n' ' ' <<< "$ips")；不包含本机公网 IPv4 $PUBLIC_IP，跳过 TLS 节点。请检查 DNS/CDN 与源站配置。"
         return 0
     fi
 
@@ -243,18 +243,52 @@ install_xray() {
 # -------------------- REALITY 密钥 --------------------
 
 generate_reality_keys() {
-    local output
-    output="$("$BIN" x25519 2>&1)" ||
-        die "Xray 无法生成 REALITY 密钥。"
+    local output line label value
+    PRIVATE_KEY=""
+    PUBLIC_KEY=""
 
-    PRIVATE_KEY="$(sed -nE 's/^(PrivateKey|Private key):[[:space:]]*//p' <<< "$output" | head -n 1)"
-    PUBLIC_KEY="$(sed -nE 's/^(Password|PublicKey|Public key):[[:space:]]*//p' <<< "$output" | head -n 1)"
+    if ! output="$("$BIN" x25519 2>&1)"; then
+        warn "Xray x25519 密钥生成失败：$output"
+        return 0
+    fi
+
+    # 兼容不同 Xray 版本的密钥标签与大小写格式。
+    while IFS= read -r line; do
+        [[ "$line" == *:* ]] || continue
+        label="${line%%:*}"
+        value="${line#*:}"
+        value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        label="$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+        case "$label" in
+            privatekey|private)
+                [[ -n "$value" ]] && PRIVATE_KEY="$value"
+                ;;
+            password|publickey|public)
+                [[ -n "$value" ]] && PUBLIC_KEY="$value"
+                ;;
+        esac
+    done <<< "$output"
+
+    # 兼容标签未知但按私钥、公钥顺序输出的版本。
+    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+        local -a values=()
+        while IFS= read -r line; do
+            [[ "$line" == *:* ]] || continue
+            value="${line#*:}"
+            value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [[ -n "$value" ]] && values+=("$value")
+        done <<< "$output"
+        [[ -n "$PRIVATE_KEY" ]] || PRIVATE_KEY="${values[0]:-}"
+        [[ -n "$PUBLIC_KEY" ]] || PUBLIC_KEY="${values[1]:-}"
+    fi
 
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        warn "当前 Xray 的密钥输出格式无法自动识别，跳过 REALITY 节点。"
+        warn "无法识别 Xray x25519 输出中的密钥，REALITY 节点将被跳过。原始输出：$output"
         PRIVATE_KEY=""
         PUBLIC_KEY=""
+        return 0
     fi
+    info "REALITY 密钥生成并解析成功。"
 }
 
 # -------------------- TLS 证书 --------------------
@@ -579,7 +613,22 @@ with open(base + "/data/subscription.b64", "w") as f:
 os.chmod(base + "/data/subscription.txt", 0o600)
 os.chmod(base + "/data/subscription.b64", 0o600)
 print("订阅节点数量：", len(links))
+if not links:
+    raise SystemExit("错误：订阅中没有任何节点")
 PY
+
+    local node_count reality_count ss_count tls_count
+    node_count="$(jq 'length' "$SUBJSON")"
+    reality_count="$(jq '[.[] | select(.type == "vless-reality")] | length' "$SUBJSON")"
+    ss_count="$(jq '[.[] | select(.type == "shadowsocks")] | length' "$SUBJSON")"
+    tls_count="$(jq '[.[] | select(.type == "vless-ws-tls")] | length' "$SUBJSON")"
+    info "节点清单统计：总计=$node_count，REALITY=$reality_count，SS=$ss_count，TLS=$tls_count"
+    if [[ "$reality_count" -eq 0 ]]; then
+        warn "未生成 VLESS REALITY。请检查前面的 x25519 密钥生成/解析日志。"
+    fi
+    if [[ "${DOMAIN_OK:-0}" == 1 && "${TLS_OK:-0}" != 1 ]]; then
+        warn "域名检查通过，但 TLS 节点未生成；请查看证书申请、80 端口及证书安装日志。"
+    fi
 }
 
 # -------------------- 在线订阅 HTTP/HTTPS 服务 --------------------
@@ -865,12 +914,20 @@ do_install() {
     setup_subscription_port
 
     export BASE
+    # 清理上次安装留下的可选节点标记，避免 TLS 本轮失败却显示旧端口。
+    rm -f "$DATA/tls.port" "$DATA/reality.port" "$DATA/shadowsocks.port"
     generate_configuration
     generate_subscription
     install_service
 
     # Xray 启动后再启动在线订阅服务。
     install_subscription_server
+
+    # 安装后最终校验：配置有效、服务运行、订阅内容非空。
+    "$BIN" run -test -config "$CONF" >/dev/null || die "安装后检查失败：Xray 配置验证未通过。"
+    systemctl is-active --quiet "$SERVICE" || die "安装后检查失败：Xray 服务未运行。"
+    [[ -s "$SUBFILE" ]] || die "安装后检查失败：订阅文件为空。"
+    info "安装后检查通过：Xray 配置有效、服务运行中、订阅文件非空。"
 
     local ports=()
     [[ -f "$DATA/reality.port" ]] && ports+=("$(cat "$DATA/reality.port")")
