@@ -472,7 +472,7 @@ generate_subscription() {
     if [[ -f "$CF_SETTINGS" ]]; then
         # shellcheck disable=SC1090
         source "$CF_SETTINGS"
-        if [[ "${CF_MODE:-}" == "1" || "${CF_MODE:-}" == "2" ]] &&
+        if [[ "${CF_MODE:-}" == "1" ]] &&
            [[ -n "${CF_DOMAIN:-}" && "${CF_PORT:-}" =~ ^[0-9]+$ && -n "${CF_UUID:-}" && "${CF_PATH:-}" == /* ]]; then
             export CF_MODE CF_DOMAIN CF_PORT CF_UUID CF_PATH
             python3 - <<'PYCFSYNC'
@@ -483,7 +483,7 @@ with open(path, encoding="utf-8") as f:
 if not isinstance(nodes, list):
     raise SystemExit("nodes.json 格式错误：预期为 JSON 数组")
 mode = os.environ["CF_MODE"]
-node_type = "vless-ws-cf-tunnel" if mode == "2" else "vless-ws-cf-tunnel-temp"
+node_type = "vless-ws-cf-tunnel-temp"
 cf_types = {"vless-ws-cf-tunnel", "vless-ws-cf-tunnel-temp"}
 nodes = [n for n in nodes if not (isinstance(n, dict) and n.get("type") in cf_types)]
 nodes.append({
@@ -870,27 +870,27 @@ install_cloudflared() {
 }
 cf_tunnel_status() {
     echo
-    echo "============== CF Tunnel 状态 =============="
-    echo "Xray 服务：$(systemctl is-active "$CF_SERVICE" 2>/dev/null || true)"
-    echo "固定隧道服务：$(systemctl is-active "$CF_TUNNEL_SERVICE" 2>/dev/null || true)"
+    echo "============== Cloudflare 临时隧道状态 =============="
+    echo "CF Xray 服务：$(systemctl is-active "$CF_SERVICE" 2>/dev/null || true)"
     echo "临时隧道服务：$(systemctl is-active "$CF_TEMP_SERVICE" 2>/dev/null || true)"
+    echo "固定隧道服务（已弃用，应该停止）：$(systemctl is-active "$CF_TUNNEL_SERVICE" 2>/dev/null || true)"
     if [[ -f "$CF_SETTINGS" ]]; then
+        # shellcheck disable=SC1090
         source "$CF_SETTINGS"
-        echo "最近配置域名：${CF_DOMAIN:-未知}"
+        echo "保存的临时域名：${CF_DOMAIN:-未知}"
         echo "本机 WebSocket 端口：${CF_PORT:-未知}"
         echo "WebSocket 路径：${CF_PATH:-未知}"
+        echo "VLESS UUID：${CF_UUID:-未知}"
     fi
     if [[ -f "$CF_TEMP_LOG" ]]; then
         local temp_domain
-        temp_domain="$(grep -Eo 'https://[[:alnum:]-]+\.trycloudflare\.com' "$CF_TEMP_LOG" | tail -n 1 | sed 's#^https://##')"
-        echo "临时隧道域名：${temp_domain:-尚未获取}"
+        temp_domain="$(grep -Eo 'https://[[:alnum:]-]+\.trycloudflare\.com' "$CF_TEMP_LOG" 2>/dev/null | tail -n 1 | sed 's#^https://##' || true)"
+        echo "日志中的临时域名：${temp_domain:-尚未获取}"
     fi
-    echo "订阅中的 CF 节点：$(jq '[.[] | select(.type == "vless-ws-cf-tunnel" or .type == "vless-ws-cf-tunnel-temp")] | length' "$SUBJSON" 2>/dev/null || echo 0)"
-    echo "============================================"
-    echo "固定隧道需在 Cloudflare Zero Trust 配置 Public Hostname → HTTP → http://127.0.0.1:本机端口。"
-    echo "临时隧道由 cloudflared 自动申请 trycloudflare.com 域名，无需配置 DNS/Public Hostname。"
-    echo "============================================"
+    echo "订阅中的 CF 临时节点：$(jq '[.[] | select(.type == "vless-ws-cf-tunnel-temp")] | length' "$SUBJSON" 2>/dev/null || echo 0)"
+    echo "====================================================="
 }
+
 cf_tunnel_deploy() {
     need_root
     detect_os
@@ -899,43 +899,32 @@ cf_tunnel_deploy() {
     chmod 700 "$BASE" "$DATA" "$BASE/bin"
     install_xray
     install_cloudflared
-    local mode cf_domain cf_token cf_path cf_port cf_uuid input_domain input_path temp_domain node_type
+
+    local cf_domain="" cf_path="/cfws" cf_port="" cf_uuid="" input_path="" temp_domain=""
+    local settings_tmp node_type
+
     echo
-    echo "选择 Cloudflare Tunnel 模式（参考 sing-box-yg 的 Argo 规则）："
-    echo "[1] 临时隧道：自动申请 trycloudflare.com 域名，无需 Token 和 DNS（域名可能变化）"
-    echo "[2] 固定隧道：使用 Cloudflare Zero Trust Token + 自定义域名（需预先配置 Public Hostname）"
-    read -r -p "请选择 [1-2，默认 1]：" mode
-    mode="${mode:-1}"
-    [[ "$mode" == "1" || "$mode" == "2" ]] || die "无效模式，请选择 1 或 2。"
-    cf_port=""
-    cf_uuid=""
-    cf_path="/cfws"
+    echo "Cloudflare Tunnel：仅使用临时隧道（Quick Tunnel）"
+    echo "Cloudflare 会自动分配 trycloudflare.com 域名；重新创建隧道时域名可能变化。"
+
     if [[ -f "$CF_SETTINGS" ]]; then
+        # shellcheck disable=SC1090
         source "$CF_SETTINGS"
         cf_port="${CF_PORT:-}"
         cf_uuid="${CF_UUID:-}"
         cf_path="${CF_PATH:-/cfws}"
     fi
+
     read -r -p "WebSocket 路径 [$cf_path]：" input_path
     cf_path="${input_path:-$cf_path}"
     [[ "$cf_path" == /* && "$cf_path" != *' '* && "$cf_path" != *'?'* && "$cf_path" != *'#'* ]] || die "WebSocket 路径必须以 / 开头，且不能包含空格、? 或 #。"
+
     if [[ ! "$cf_port" =~ ^[0-9]+$ ]] || (( cf_port < 1 || cf_port > 65535 )); then
         cf_port="$(choose_random_port)" || die "无法为 CF Xray 选择本机端口。"
     fi
     [[ -n "$cf_uuid" ]] || cf_uuid="$(cat /proc/sys/kernel/random/uuid)"
-    if [[ "$mode" == "2" ]]; then
-        read -r -p "请输入 Cloudflare Tunnel 固定域名（例如 cf.example.com）: " cf_domain
-        cf_domain="${cf_domain,,}"
-        cf_domain="${cf_domain%.}"
-        [[ "$cf_domain" =~ ^[a-zA-Z0-9.-]+$ && "$cf_domain" != *..* && "$cf_domain" != .* && "$cf_domain" != *. ]] || die "域名格式不合法。"
-        read -r -s -p "请输入 Cloudflare Tunnel Token（输入内容不会显示）: " cf_token
-        echo
-        [[ -n "$cf_token" && "$cf_token" != *$'\n'* && "$cf_token" != *$'\r'* ]] || die "Tunnel Token 不能为空或包含换行。"
-    else
-        cf_domain=""
-        cf_token=""
-    fi
-    export CF_DOMAIN="${cf_domain:-pending.trycloudflare.com}" CF_PORT="$cf_port" CF_UUID="$cf_uuid" CF_PATH="$cf_path"
+
+    export CF_DOMAIN="pending.trycloudflare.com" CF_PORT="$cf_port" CF_UUID="$cf_uuid" CF_PATH="$cf_path"
     python3 - <<'PYCF'
 import json, os
 base = "/opt/xiazheteng-node"
@@ -956,19 +945,19 @@ config = {
 }
 path = base + "/cf-tunnel-xray.json"
 tmp = path + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(config, f, indent=2)
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(config, f, ensure_ascii=False, indent=2)
 os.chmod(tmp, 0o600)
 os.replace(tmp, path)
 PYCF
-    printf 'CF_DOMAIN=%q\nCF_PORT=%q\nCF_UUID=%q\nCF_PATH=%q\nCF_MODE=%q\n' \
-        "${cf_domain:-}" "$cf_port" "$cf_uuid" "$cf_path" "$mode" > "$CF_SETTINGS"
-    chmod 600 "$CF_SETTINGS"
-    if [[ "$mode" == "2" ]]; then
-        printf 'TUNNEL_TOKEN=%s\n' "$cf_token" > "$CF_TOKEN_FILE"
-        chmod 600 "$CF_TOKEN_FILE"
-        unset cf_token
+
+    # 清理旧固定隧道，脚本今后不再部署或启动固定隧道。
+    systemctl disable --now "$CF_TUNNEL_SERVICE" 2>/dev/null || true
+    if [[ -f "$CF_TUNNEL_UNIT" ]] && grep -q 'Xia Zhe Teng Cloudflare Fixed Tunnel' "$CF_TUNNEL_UNIT"; then
+        rm -f "$CF_TUNNEL_UNIT"
     fi
+    rm -f "$CF_TOKEN_FILE"
+
     cat > "$CF_UNIT" <<EOF
 [Unit]
 Description=Xia Zhe Teng Cloudflare Tunnel VLESS WebSocket Inbound
@@ -993,36 +982,8 @@ EOF
     systemctl restart "$CF_SERVICE"
     sleep 1
     systemctl is-active --quiet "$CF_SERVICE" || die "CF 专用 Xray 服务启动失败，请查看 journalctl -u $CF_SERVICE。"
-    if [[ "$mode" == "2" ]]; then
-        # 固定模式必须停止临时隧道，避免两个模式同时运行、旧域名继续可用但订阅指向另一域名。
-        systemctl disable --now "$CF_TEMP_SERVICE" 2>/dev/null || true
-        cat > "$CF_TUNNEL_UNIT" <<EOF
-[Unit]
-Description=Xia Zhe Teng Cloudflare Fixed Tunnel
-After=network-online.target $CF_SERVICE.service
-Wants=network-online.target
-[Service]
-Type=simple
-EnvironmentFile=$CF_TOKEN_FILE
-ExecStart=$CLOUDFLARED_BIN tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token \${TUNNEL_TOKEN}
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=true
-PrivateTmp=true
-[Install]
-WantedBy=multi-user.target
-EOF
-        chmod 644 "$CF_TUNNEL_UNIT"
-        systemctl daemon-reload
-        systemctl enable "$CF_TUNNEL_SERVICE"
-        systemctl restart "$CF_TUNNEL_SERVICE"
-        sleep 2
-        systemctl is-active --quiet "$CF_TUNNEL_SERVICE" || warn "固定隧道服务未处于 active 状态；请检查 Token 和 journalctl -u $CF_TUNNEL_SERVICE。"
-        node_type="vless-ws-cf-tunnel"
-    else
-        # 临时模式必须停止固定隧道，避免固定/临时模式的域名与节点记录混用。
-        systemctl disable --now "$CF_TUNNEL_SERVICE" 2>/dev/null || true
-        cat > "$CF_TEMP_UNIT" <<EOF
+
+    cat > "$CF_TEMP_UNIT" <<EOF
 [Unit]
 Description=Xia Zhe Teng Cloudflare Temporary Tunnel
 After=network-online.target $CF_SERVICE.service
@@ -1037,29 +998,30 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
-        chmod 644 "$CF_TEMP_UNIT"
-        : > "$CF_TEMP_LOG"
-        chmod 600 "$CF_TEMP_LOG"
-        systemctl daemon-reload
-        systemctl enable "$CF_TEMP_SERVICE"
-        systemctl restart "$CF_TEMP_SERVICE"
-        temp_domain=""
-        for _ in $(seq 1 30); do
-            sleep 1
-            temp_domain="$(grep -Eo 'https://[[:alnum:]-]+\.trycloudflare\.com' "$CF_TEMP_LOG" 2>/dev/null | tail -n 1 | sed 's#^https://##' || true)"
-            [[ -n "$temp_domain" ]] && break
-        done
-        [[ -n "$temp_domain" ]] || die "临时隧道服务已启动，但未能从 cloudflared 日志提取 trycloudflare.com 域名。请查看：journalctl -u $CF_TEMP_SERVICE -n 100。"
-        cf_domain="$temp_domain"
-        node_type="vless-ws-cf-tunnel-temp"
-        info "Cloudflare 临时隧道域名：$cf_domain"
-    fi
-    local settings_tmp="${CF_SETTINGS}.tmp"
-    printf 'CF_DOMAIN=%q\nCF_PORT=%q\nCF_UUID=%q\nCF_PATH=%q\nCF_MODE=%q\n' \
-        "$cf_domain" "$cf_port" "$cf_uuid" "$cf_path" "$mode" > "$settings_tmp"
+    chmod 644 "$CF_TEMP_UNIT"
+    : > "$CF_TEMP_LOG"
+    chmod 600 "$CF_TEMP_LOG"
+    systemctl daemon-reload
+    systemctl enable "$CF_TEMP_SERVICE"
+    systemctl restart "$CF_TEMP_SERVICE"
+
+    temp_domain=""
+    for _ in $(seq 1 45); do
+        sleep 1
+        temp_domain="$(grep -Eo 'https://[[:alnum:]-]+\.trycloudflare\.com' "$CF_TEMP_LOG" 2>/dev/null | tail -n 1 | sed 's#^https://##' || true)"
+        [[ -n "$temp_domain" ]] && break
+        systemctl is-active --quiet "$CF_TEMP_SERVICE" || break
+    done
+    [[ -n "$temp_domain" ]] || die "临时隧道未能取得 trycloudflare.com 域名。请检查：journalctl -u $CF_TEMP_SERVICE -n 100。"
+    cf_domain="$temp_domain"
+    node_type="vless-ws-cf-tunnel-temp"
+
+    settings_tmp="${CF_SETTINGS}.tmp"
+    printf 'CF_DOMAIN=%q\nCF_PORT=%q\nCF_UUID=%q\nCF_PATH=%q\nCF_MODE=1\nCF_NODE_TYPE=%q\n' \
+        "$cf_domain" "$cf_port" "$cf_uuid" "$cf_path" "$node_type" > "$settings_tmp"
     chmod 600 "$settings_tmp"
     mv -f "$settings_tmp" "$CF_SETTINGS"
-    # 部署完成前核对 Xray 本地入站路径与本次输入一致。
+
     python3 - "$CF_CONF" "$cf_port" "$cf_uuid" "$cf_path" <<'PYCFVERIFY'
 import json, sys
 cfg_path, expected_port, expected_uuid, expected_path = sys.argv[1:]
@@ -1073,25 +1035,25 @@ actual_path = x.get("streamSettings", {}).get("wsSettings", {}).get("path")
 actual_port = str(x.get("port", ""))
 actual_uuid = x.get("settings", {}).get("clients", [{}])[0].get("id", "")
 if actual_port != expected_port or actual_uuid != expected_uuid or actual_path != expected_path:
-    raise SystemExit(f"校验失败：输入端口/UUID/路径与 Xray 配置不一致。实际端口={actual_port}，路径={actual_path}")
+    raise SystemExit(f"校验失败：CF Xray 配置不一致。实际端口={actual_port}，路径={actual_path}")
 print(f"Xray 配置一致性校验通过：端口={actual_port}，路径={actual_path}")
 PYCFVERIFY
+
     export CF_DOMAIN="$cf_domain" CF_PORT="$cf_port" CF_UUID="$cf_uuid" CF_PATH="$cf_path" CF_NODE_TYPE="$node_type"
     python3 - <<'PYCFNODE'
 import json, os
 path = "/opt/xiazheteng-node/data/nodes.json"
 try:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         nodes = json.load(f)
-    if not isinstance(nodes, list): nodes = []
-except (OSError, json.JSONDecodeError):
+    if not isinstance(nodes, list):
+        raise SystemExit("nodes.json 格式错误：预期 JSON 数组")
+except FileNotFoundError:
     nodes = []
-node_type = os.environ["CF_NODE_TYPE"]
 cf_types = {"vless-ws-cf-tunnel", "vless-ws-cf-tunnel-temp"}
-# CF Tunnel 只保留当前模式的一个节点，清除另一模式残留的旧域名/路径。
 nodes = [n for n in nodes if not (isinstance(n, dict) and n.get("type") in cf_types)]
 nodes.append({
-    "type": node_type,
+    "type": "vless-ws-cf-tunnel-temp",
     "address": os.environ["CF_DOMAIN"],
     "port": 443,
     "uuid": os.environ["CF_UUID"],
@@ -1099,78 +1061,78 @@ nodes.append({
     "sni": os.environ["CF_DOMAIN"]
 })
 tmp = path + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(nodes, f, indent=2)
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(nodes, f, ensure_ascii=False, indent=2)
 os.chmod(tmp, 0o600)
 os.replace(tmp, path)
 PYCFNODE
-    info "CF Tunnel 节点配置已写入统一节点清单。"
-    python3 - <<'PYCFCHECK'
-import json
-p = "/opt/xiazheteng-node/data/nodes.json"
-with open(p, encoding="utf-8") as f:
-    nodes = json.load(f)
-cf = [n for n in nodes if isinstance(n, dict) and n.get("type") in {"vless-ws-cf-tunnel", "vless-ws-cf-tunnel-temp"}]
-if len(cf) != 1:
-    raise SystemExit(f"节点一致性校验失败：预期 1 个 CF Tunnel 节点，实际 {len(cf)} 个")
-n = cf[0]
-print("节点一致性校验通过：")
-print("  类型：", n.get("type"))
-print("  域名：", n.get("address"))
-print("  路径：", n.get("path"))
-print("  SNI：", n.get("sni"))
-print("  端口：", n.get("port"))
-if n.get("address") != n.get("sni"):
-    raise SystemExit("节点一致性校验失败：域名与 SNI 不一致")
-PYCFCHECK
+
+    info "Cloudflare 临时隧道节点已写入统一节点清单。"
     echo
-    echo "================ CF Tunnel 配置结果 ================"
-    echo "模式：$([[ "$mode" == "1" ]] && echo '临时隧道（Quick Tunnel）' || echo '固定隧道（Token）')"
+    echo "============= Cloudflare 临时隧道配置结果 ============="
+    echo "模式：临时隧道（Quick Tunnel）"
     echo "域名：$cf_domain"
     echo "本机 WebSocket 源站：http://127.0.0.1:$cf_port$cf_path"
     echo "WebSocket 路径：$cf_path"
     echo "VLESS UUID：$cf_uuid"
-    if [[ "$mode" == "2" ]]; then
-        echo
-        echo "请在 Cloudflare Zero Trust 中为此固定隧道添加 Public Hostname："
-        echo "Hostname：$cf_domain"
-        echo "Service Type：HTTP"
-        echo "Service URL：http://127.0.0.1:$cf_port"
-        echo "注意：不要填写 https://127.0.0.1:$cf_port，因为本机 Xray 监听的是明文 WebSocket。"
-    else
-        echo
-        echo "临时隧道域名由 Cloudflare 自动生成；无需创建 DNS 记录或 Public Hostname。"
-        echo "临时域名可能在隧道重建后变化，若变化需重新部署以刷新订阅。"
-    fi
-    echo "====================================================="
-    echo "完成后选择菜单 [3] 整合订阅 / 刷新订阅。"
+    echo "注意：临时域名可能在隧道重建后变化；重新部署会同步更新订阅节点。"
+    echo "========================================================"
+    echo "正在刷新订阅……"
+    generate_subscription
 }
+
 cf_tunnel_menu() {
     while true; do
         echo
-        echo "========== Cloudflare Tunnel 管理 =========="
-        echo "[1] 部署 / 更新 CF Tunnel 节点（选择临时或固定隧道）"
-        echo "[2] 查看 CF Tunnel 服务状态"
-        echo "[3] 重启当前 CF Tunnel 服务"
+        echo "========== Cloudflare 临时隧道管理 =========="
+        echo "[1] 部署 / 更新临时隧道节点"
+        echo "[2] 查看临时隧道服务状态"
+        echo "[3] 重启临时隧道并刷新订阅"
         echo "[0] 返回主菜单"
         read -r -p "请选择：" cf_choice
         case "$cf_choice" in
             1) cf_tunnel_deploy ;;
             2) cf_tunnel_status ;;
             3)
-                local saved_mode=""
-                if [[ -f "$CF_SETTINGS" ]]; then
-                    # shellcheck disable=SC1090
-                    source "$CF_SETTINGS"
-                    saved_mode="${CF_MODE:-}"
-                fi
+                # 清空旧日志，避免把上一次 Quick Tunnel 的域名误认为本次域名。
+                : > "$CF_TEMP_LOG"
+                chmod 600 "$CF_TEMP_LOG"
                 systemctl restart "$CF_SERVICE" 2>/dev/null || true
-                if [[ "$saved_mode" == "2" ]]; then
-                    systemctl restart "$CF_TUNNEL_SERVICE" 2>/dev/null || true
-                elif [[ "$saved_mode" == "1" ]]; then
-                    systemctl restart "$CF_TEMP_SERVICE" 2>/dev/null || true
+                systemctl restart "$CF_TEMP_SERVICE" 2>/dev/null || true
+                # 重启后的 Quick Tunnel 域名可能变化，最多等待 30 秒提取新域名。
+                local refreshed_domain=""
+                for _ in $(seq 1 30); do
+                    sleep 1
+                    refreshed_domain="$(grep -Eo 'https://[[:alnum:]-]+\.trycloudflare\.com' "$CF_TEMP_LOG" 2>/dev/null | tail -n 1 | sed 's#^https://##' || true)"
+                    [[ -n "$refreshed_domain" ]] && break
+                    systemctl is-active --quiet "$CF_TEMP_SERVICE" || break
+                done
+                if [[ -f "$CF_TEMP_LOG" ]]; then
+                    if [[ -n "$refreshed_domain" && -f "$CF_SETTINGS" ]]; then
+                        # shellcheck disable=SC1090
+                        source "$CF_SETTINGS"
+                        printf 'CF_DOMAIN=%q\nCF_PORT=%q\nCF_UUID=%q\nCF_PATH=%q\nCF_MODE=1\nCF_NODE_TYPE=vless-ws-cf-tunnel-temp\n' \
+                            "$refreshed_domain" "$CF_PORT" "$CF_UUID" "$CF_PATH" > "${CF_SETTINGS}.tmp"
+                        chmod 600 "${CF_SETTINGS}.tmp"
+                        mv -f "${CF_SETTINGS}.tmp" "$CF_SETTINGS"
+                        export CF_DOMAIN="$refreshed_domain" CF_PORT CF_UUID CF_PATH
+                        python3 - <<'PYCFREFRESH'
+import json, os
+p="/opt/xiazheteng-node/data/nodes.json"
+with open(p, encoding="utf-8") as f: nodes=json.load(f)
+if not isinstance(nodes,list): raise SystemExit("nodes.json 格式错误")
+old={"vless-ws-cf-tunnel","vless-ws-cf-tunnel-temp"}
+nodes=[n for n in nodes if not (isinstance(n,dict) and n.get("type") in old)]
+nodes.append({"type":"vless-ws-cf-tunnel-temp","address":os.environ["CF_DOMAIN"],"port":443,"uuid":os.environ["CF_UUID"],"path":os.environ["CF_PATH"],"sni":os.environ["CF_DOMAIN"]})
+tmp=p+".tmp"
+with open(tmp,"w",encoding="utf-8") as f: json.dump(nodes,f,ensure_ascii=False,indent=2)
+os.chmod(tmp,0o600); os.replace(tmp,p)
+PYCFREFRESH
+                        generate_subscription
+                    else
+                        warn "未能从隧道日志取得新域名；请使用 [1] 重新部署以更新订阅。"
+                    fi
                 fi
-                sleep 1
                 cf_tunnel_status
                 ;;
             0) return 0 ;;
@@ -1178,6 +1140,7 @@ cf_tunnel_menu() {
         esac
     done
 }
+
 do_uninstall() {
     echo "开始移除本脚本创建的独立服务和文件。"
     if [[ -f "$CF_TUNNEL_UNIT" ]] && grep -q "xiazheteng-node-manager" "$CF_TUNNEL_UNIT"; then
