@@ -69,15 +69,15 @@ detect_os() {
 }
 install_dependencies() {
     local missing=()
-    for c in curl jq openssl python3 ss base64; do
+    for c in curl jq openssl python3 ss base64 dig; do
         command -v "$c" >/dev/null 2>&1 || missing+=("$c")
     done
     if ((${#missing[@]})); then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -y
-        apt-get install -y curl jq openssl python3 iproute2 ca-certificates
+        apt-get install -y curl jq openssl python3 iproute2 ca-certificates bind9-dnsutils
     fi
-    for c in curl jq openssl python3 ss; do
+    for c in curl jq openssl python3 ss dig; do
         command -v "$c" >/dev/null 2>&1 ||
             die "依赖安装后仍缺少命令：$c"
     done
@@ -140,10 +140,16 @@ check_domain() {
         return 0
     fi
     local ips ip invalid_ips=""
-    ips="$(getent ahostsv4 "$DOMAIN" 2>/dev/null |
-        awk '{print $1}' | sort -u || true)"
+    # Use DNS directly. getent consults /etc/hosts/NSS first, so a stale
+    # 127.0.0.1 entry in /etc/hosts can falsely look like a DNS A record.
+    if ! command -v dig >/dev/null 2>&1; then
+        warn "缺少 dig，无法独立核验 $DOMAIN 的 DNS A 记录；为避免把 /etc/hosts 本地映射误判为 DNS，跳过 TLS 节点。请安装 bind9-dnsutils 后重试。"
+        return 0
+    fi
+    ips="$(dig +time=3 +tries=1 +short A "$DOMAIN" 2>/dev/null |
+        awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ {print}' | sort -u || true)"
     if [[ -z "$ips" ]]; then
-        warn "$DOMAIN 没有可查询到的 IPv4 A 记录；跳过 TLS 证书申请及 TLS 节点。请确认 DNS 已生效。"
+        warn "$DOMAIN 的 DNS 查询没有返回 IPv4 A 记录；跳过 TLS 证书申请及 TLS 节点。请检查权威 DNS 记录、解析状态及当前 VPS 的 DNS 网络连通性。"
         return 0
     fi
     # Reject loopback, private, link-local, unspecified and other non-global IPv4 answers.
@@ -163,7 +169,7 @@ PYIP
         return 0
     fi
     if ! grep -Fxq "$PUBLIC_IP" <<< "$ips"; then
-        warn "$DOMAIN 的 A 记录为：$(tr '\n' ' ' <<< "$ips")；不包含本机公网 IPv4 $PUBLIC_IP，跳过 TLS 节点。若使用 Cloudflare 代理，DNS 查询可能返回 Cloudflare 边缘 IP；请按当前 TLS 申请方式检查 DNS/CDN 与源站配置。"
+        warn "$DOMAIN 的 DNS A 记录为：$(tr '\n' ' ' <<< "$ips")；不包含本机公网 IPv4 $PUBLIC_IP，跳过 TLS 节点。若使用 Cloudflare 代理，dig 可能返回 Cloudflare 边缘 IP；请按当前 TLS 申请方式检查 DNS/CDN 与源站配置。"
         return 0
     fi
     DOMAIN_OK=1
