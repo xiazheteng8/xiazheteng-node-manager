@@ -114,15 +114,31 @@ check_domain() {
         DOMAIN=""
         return 0
     fi
-    local ips
+    local ips ip invalid_ips=""
     ips="$(getent ahostsv4 "$DOMAIN" 2>/dev/null |
         awk '{print $1}' | sort -u || true)"
     if [[ -z "$ips" ]]; then
         warn "$DOMAIN 没有可查询到的 IPv4 A 记录；跳过 TLS 证书申请及 TLS 节点。请确认 DNS 已生效。"
         return 0
     fi
+    # Reject loopback, private, link-local, unspecified and other non-global IPv4 answers.
+    while IFS= read -r ip; do
+        [[ -n "$ip" ]] || continue
+        if ! python3 - "$ip" <<'PYIP' >/dev/null 2>&1
+import ipaddress, sys
+addr = ipaddress.ip_address(sys.argv[1])
+raise SystemExit(0 if addr.version == 4 and addr.is_global else 1)
+PYIP
+        then
+            invalid_ips+=" $ip"
+        fi
+    done <<< "$ips"
+    if [[ -n "$invalid_ips" ]]; then
+        warn "$DOMAIN 的 DNS 返回了非公网 IPv4：${invalid_ips# }（例如 127.0.0.1 是回环地址，不是源站地址）；跳过 TLS 节点。请删除错误 A 记录，并检查 Cloudflare DNS 记录是否误填为 127.0.0.1。"
+        return 0
+    fi
     if ! grep -Fxq "$PUBLIC_IP" <<< "$ips"; then
-        warn "$DOMAIN 的 A 记录为：$(tr '\n' ' ' <<< "$ips")；不包含本机公网 IPv4 $PUBLIC_IP，跳过 TLS 节点。请检查 DNS/CDN 与源站配置。"
+        warn "$DOMAIN 的 A 记录为：$(tr '\n' ' ' <<< "$ips")；不包含本机公网 IPv4 $PUBLIC_IP，跳过 TLS 节点。若使用 Cloudflare 代理，DNS 查询可能返回 Cloudflare 边缘 IP；请按当前 TLS 申请方式检查 DNS/CDN 与源站配置。"
         return 0
     fi
     DOMAIN_OK=1
@@ -754,11 +770,23 @@ show_subscription_url() {
 install_service() {
     if [[ -e "$UNIT" ]] &&
        ! grep -q "xiazheteng-node-manager" "$UNIT"; then
-        die "服务文件已存在且不属于本脚本：$UNIT"
+        local backup answer
+        backup="${UNIT}.backup.$(date +%Y%m%d-%H%M%S)"
+        echo "发现同名 systemd 服务文件，但没有本脚本标记：$UNIT"
+        echo "为了允许重新部署，脚本可以先备份原文件，再写入本脚本的 Xray 服务配置。"
+        read -r -p "确认备份并覆盖该服务文件？[y/N]：" answer
+        case "${answer,,}" in
+            y|yes)
+                cp -a "$UNIT" "$backup"
+                warn "原服务文件已备份至：$backup"
+                ;;
+            *) die "用户取消覆盖。原服务文件未修改；请确认该文件归属后重新部署。" ;;
+        esac
     fi
     cat > "$UNIT" <<EOF
 [Unit]
 Description=Xia Zhe Teng Independent Xray Service
+# Managed by xiazheteng-node-manager
 After=network-online.target
 Wants=network-online.target
 [Service]
@@ -798,6 +826,33 @@ report_firewall() {
     fi
     warn "VPS 服务商安全组不一定可自动检测，请确认公网端口已放行。"
 }
+modify_domain_and_redeploy() {
+    need_root
+    local current_domain new_domain answer
+    current_domain="${DOMAIN:-}"
+    if [[ -f "$ENVFILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$ENVFILE"
+        current_domain="${DOMAIN:-$current_domain}"
+    fi
+    echo "当前保存的域名：${current_domain:-（无）}"
+    read -r -p "请输入新的域名（留空表示无域名模式）：" new_domain
+    new_domain="${new_domain,,}"
+    new_domain="${new_domain%.}"
+    read -r -p "保存新配置并重新部署？[y/N]：" answer
+    case "${answer,,}" in
+        y|yes)
+            mkdir -p "$BASE"
+            printf 'DOMAIN=%q\n' "$new_domain" > "$ENVFILE"
+            chmod 600 "$ENVFILE"
+            DOMAIN="$new_domain"
+            info "已更新域名配置，开始重新部署。"
+            do_install
+            ;;
+        *) echo "已取消，原配置保持不变。" ;;
+    esac
+}
+
 do_install() {
     detect_os
     install_dependencies
@@ -1210,7 +1265,8 @@ menu() {
         echo "[3] 整合订阅 / 刷新订阅"
         echo "[4] 创建快捷命令 x"
         echo "[5] 显示在线订阅链接"
-        echo "[6] 独立部署 / 管理 Cloudflare Tunnel 节点"
+        echo "[6] 独立部署 / 管理 Cloudflare 临时隧道节点"
+        echo "[7] 修改域名 / 重新部署节点配置"
         echo "[0] 退出"
         echo "=========================================="
         read -r -p "请选择：" choice
@@ -1233,6 +1289,7 @@ menu() {
             4) create_shortcut ;;
             5) show_subscription_url ;;
             6) cf_tunnel_menu ;;
+            7) modify_domain_and_redeploy ;;
             0) echo "已退出。"; exit 0 ;;
             *) echo "无效选项。" ;;
         esac
