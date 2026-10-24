@@ -57,6 +57,8 @@ curl -4 -fsSL \
   -o /root/xiazheteng-node-manager.sh
 chmod 700 /root/xiazheteng-node-manager.sh
 bash /root/xiazheteng-node-manager.sh
+```
+```bash
 CF隧道版
 apt update
 apt install -y curl ca-certificates
