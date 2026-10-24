@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 # ============================================================
 # 瞎折腾吧 VPS 节点自动部署管理器
@@ -248,6 +247,36 @@ install_xray() {
     rm -rf "$tmp"
     info "Xray 安装完成：$("$BIN" version | head -n 1)"
 }
+        64) url="https://github.com/$XRAY_REPO/releases/download/$tag/Xray-linux-64.zip" ;;
+        arm64-v8a) url="https://github.com/$XRAY_REPO/releases/download/$tag/Xray-linux-arm64-v8a.zip" ;;
+        *) die "不支持的 Xray 架构。" ;;
+    esac
+
+    tmp="$(mktemp -d)"
+    info "下载 Xray：$tag"
+
+    if ! curl -fL --retry 3 --connect-timeout 10 --max-time 180 \
+        "$url" -o "$tmp/xray.zip"; then
+        rm -rf "$tmp"
+        die "Xray 下载失败。"
+    fi
+
+    apt-get install -y unzip >/dev/null
+    unzip -oq "$tmp/xray.zip" -d "$tmp/unpack"
+
+    [[ -f "$tmp/unpack/xray" ]] || {
+        rm -rf "$tmp"
+        die "发行包中没有找到 xray 二进制。"
+    }
+
+    install -m 0755 "$tmp/unpack/xray" "$tmp/xray-test"
+    "$tmp/xray-test" version >/dev/null ||
+        die "下载的 Xray 无法执行。"
+
+    install -m 0755 "$tmp/unpack/xray" "$BIN"
+    rm -rf "$tmp"
+    info "Xray 安装完成：$("$BIN" version | head -n 1)"
+}
 
 # -------------------- REALITY 密钥 --------------------
 
@@ -438,7 +467,6 @@ reality_port = int(os.environ["REALITY_PORT"])
 ss_port = int(os.environ["SS_PORT"])
 tls_port = int(os.environ["TLS_PORT"])
 ss_password = os.environ["SS_PASSWORD"]
-
 inbounds = []
 
 if private_key and public_key:
@@ -658,246 +686,6 @@ prepare_tunnel_inbound() {
     # TLS 在 Cloudflare 边缘终止；临时/固定隧道均指向该本地 HTTP 服务。
     python3 - <<'PYCF'
 import json, os
-from pathlib import Path
-base = Path('/opt/xiazheteng-node')
-config_path = base / 'config.json'
-nodes_path = base / 'data/nodes.json'
-with config_path.open(encoding='utf-8') as f:
-    config = json.load(f)
-port = int(os.environ['CF_WS_PORT'])
-uuid = os.environ['CF_UUID']
-path = os.environ['CF_PATH']
-config.setdefault('inbounds', [])
-config['inbounds'] = [x for x in config['inbounds'] if x.get('tag') != 'in-vmess-argo']
-config['inbounds'].append({
-    'tag': 'in-vmess-argo',
-    'listen': '127.0.0.1',
-    'port': port,
-    'protocol': 'vmess',
-    'settings': {'clients': [{'id': uuid, 'alterId': 0}]},
-    'streamSettings': {'network': 'ws', 'security': 'none', 'wsSettings': {'path': path}}
-})
-tmp = config_path.with_suffix('.json.tmp')
-with tmp.open('w', encoding='utf-8') as f:
-    json.dump(config, f, ensure_ascii=False, indent=2)
-os.chmod(tmp, 0o600)
-tmp.replace(config_path)
-with nodes_path.open(encoding='utf-8') as f:
-    nodes = json.load(f)
-nodes = [x for x in nodes if x.get('type') != 'vmess-argo']
-host = os.environ.get('CF_HOSTNAME', '')
-nodes.append({
-    'type': 'vmess-argo', 'address': host, 'port': 443,
-    'uuid': uuid, 'path': path, 'host': host, 'sni': host,
-    'tls': True, 'mode': os.environ.get('CF_MODE', 'temporary')
-})
-tmp = nodes_path.with_suffix('.json.tmp')
-with tmp.open('w', encoding='utf-8') as f:
-    json.dump(nodes, f, ensure_ascii=False, indent=2)
-os.chmod(tmp, 0o600)
-tmp.replace(nodes_path)
-PYCF
-
-    printf '%s\n' "$CF_WS_PORT" > "$CF_WS_PORT_FILE"
-    chmod 600 "$CF_WS_PORT_FILE"
-    info "隧道本地 VMess-WS 入站已创建：127.0.0.1:$CF_WS_PORT，路径 $CF_PATH"
-}
-
-start_cloudflared_tunnel() {
-    [[ "${CF_MODE:-none}" != "none" ]] || return 0
-    [[ -s "$CF_WS_PORT_FILE" ]] || die "隧道本地端口文件不存在。"
-    CF_WS_PORT="$(cat "$CF_WS_PORT_FILE")"
-    local unit service host i
-
-    if [[ "$CF_MODE" == "temporary" ]]; then
-        service="$CF_TEMP_SERVICE"
-        unit="$CF_TEMP_UNIT"
-        systemctl disable --now "$CF_SERVICE" 2>/dev/null || true
-        cat > "$unit" <<EOF
-# xiazheteng-node-manager
-[Unit]
-Description=Xia Zhe Teng Cloudflare Temporary Tunnel
-After=network-online.target $SERVICE.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$CF_BIN tunnel --no-autoupdate --url http://127.0.0.1:$CF_WS_PORT
-Restart=always
-RestartSec=5
-StandardOutput=append:$CF_LOG
-StandardError=append:$CF_LOG
-UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        : > "$CF_LOG"
-    else
-        service="$CF_SERVICE"
-        unit="$CF_UNIT"
-        systemctl disable --now "$CF_TEMP_SERVICE" 2>/dev/null || true
-        [[ -s "$CF_TOKEN_FILE" ]] || die "固定隧道 Token 文件不存在，请重新配置固定隧道。"
-        cat > "$unit" <<EOF
-# xiazheteng-node-manager
-[Unit]
-Description=Xia Zhe Teng Cloudflare Named Tunnel
-After=network-online.target $SERVICE.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$CF_BIN tunnel --no-autoupdate run --token-file $CF_TOKEN_FILE
-Restart=always
-RestartSec=5
-UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    fi
-
-    chmod 644 "$unit"
-    systemctl daemon-reload
-    systemctl enable "$service"
-    systemctl restart "$service"
-    sleep 2
-    systemctl is-active --quiet "$service" || {
-        journalctl -u "$service" -n 40 --no-pager >&2 || true
-        die "Cloudflare Tunnel 服务启动失败，请检查上方日志。"
-    }
-
-    if [[ "$CF_MODE" == "temporary" ]]; then
-        host=""
-        for i in $(seq 1 60); do
-            host="$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | tail -n 1 | sed 's#^https://##' || true)"
-            [[ -n "$host" ]] && break
-            sleep 1
-        done
-        [[ -n "$host" ]] || {
-            journalctl -u "$service" -n 40 --no-pager >&2 || true
-            die "临时隧道已启动，但 60 秒内没有获取到 trycloudflare.com 域名。"
-        }
-        CF_HOSTNAME="$host"
-        info "Cloudflare 临时隧道域名：$CF_HOSTNAME"
-    else
-        # 固定隧道的 Public Hostname 需要在 Cloudflare Zero Trust 控制台中
-        # 指向 http://localhost:CF_WS_PORT；Token 本身不会自动创建该路由。
-        CF_HOSTNAME="${CF_HOSTNAME:-}"
-        [[ -n "$CF_HOSTNAME" ]] || die "固定隧道没有设置公网主机名。"
-        info "固定隧道已启动；请确认 Cloudflare Public Hostname 已指向 http://localhost:$CF_WS_PORT"
-    fi
-
-    export CF_HOSTNAME
-    python3 - <<'PYCFHOST'
-import json, os
-from pathlib import Path
-p = Path('/opt/xiazheteng-node/data/nodes.json')
-with p.open(encoding='utf-8') as f:
-    nodes = json.load(f)
-for n in nodes:
-    if n.get('type') == 'vmess-argo':
-        n['address'] = os.environ['CF_HOSTNAME']
-        n['host'] = os.environ['CF_HOSTNAME']
-        n['sni'] = os.environ['CF_HOSTNAME']
-        n['port'] = 443
-with p.open('w', encoding='utf-8') as f:
-    json.dump(nodes, f, ensure_ascii=False, indent=2)
-os.chmod(p, 0o600)
-PYCFHOST
-
-    printf 'CF_MODE=%q\nCF_HOSTNAME=%q\n' "$CF_MODE" "$CF_HOSTNAME" > "$CF_SETTINGS"
-    chmod 600 "$CF_SETTINGS"
-}
-
-# -------------------- 订阅内容生成 --------------------
-
-generate_subscription() {
-    [[ -f "$SUBJSON" ]] || {
-        warn "没有节点清单；请先执行安装。"
-        return 1
-    }
-
-    "$BIN" run -test -config "$CONF" >/dev/null 2>&1 || {
-        warn "配置验证失败，不生成订阅。"
-        return 1
-    }
-
-    python3 - <<'PY'
-import base64, json, os, urllib.parse
-
-base = "/opt/xiazheteng-node"
-with open(base + "/data/nodes.json") as f:
-    nodes = json.load(f)
-
-links = []
-for n in nodes:
-    t = n["type"]
-    name = urllib.parse.quote("xiazheteng-" + t, safe="")
-    host = n["address"]
-    port = n["port"]
-
-    if t == "vless-reality":
-        if not n.get("public_key") or not n.get("uuid"):
-            continue
-        q = urllib.parse.urlencode({
-            "encryption": "none",
-            "security": "reality",
-            "sni": n["sni"],
-            "fp": "chrome",
-            "pbk": n["public_key"],
-            "sid": n["short_id"],
-            "type": "raw",
-            "flow": n["flow"]
-        })
-        links.append(f"vless://{n['uuid']}@{host}:{port}?{q}#{name}")
-
-    elif t == "shadowsocks":
-        raw = n["method"] + ":" + n["password"]
-        userinfo = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
-        links.append(f"ss://{userinfo}@{host}:{port}#{name}")
-
-    elif t == "vless-ws-tls":
-        q = urllib.parse.urlencode({
-            "encryption": "none",
-            "security": "tls",
-            "sni": n["sni"],
-            "type": "ws",
-            "path": n["path"],
-            "host": n["sni"]
-        })
-        links.append(f"vless://{n['uuid']}@{host}:{port}?{q}#{name}")
-
-    elif t == "vmess-argo":
-        # Argo / Cloudflare Tunnel：客户端 TLS 连接 CF 边缘，边缘回源到本地无 TLS WS。
-        if not host or not n.get("uuid") or not n.get("path"):
-            continue
-        vmess = {
-            "v": "2",
-            "ps": "xiazheteng-vmess-argo",
-            "add": host,
-            "port": str(port),
-            "id": n["uuid"],
-            "aid": "0",
-            "scy": "auto",
-            "net": "ws",
-            "type": "none",
-            "host": n.get("host", host),
-            "path": n["path"],
-            "tls": "tls",
-            "sni": n.get("sni", host)
-        }
-        encoded_vmess = base64.b64encode(json.dumps(vmess, separators=(",", ":")).encode()).decode()
-        links.append(f"vmess://{encoded_vmess}")
-
-with open(base + "/data/subscription.txt", "w") as f:
-    f.write("\n".join(links) + ("\n" if links else ""))
-
-encoded = base64.b64encode("\n".join(links).encode()).decode()
 with open(base + "/data/subscription.b64", "w") as f:
     f.write(encoded + "\n")
 
@@ -1108,7 +896,6 @@ show_subscription_url() {
         echo
     fi
 }
-
 # -------------------- systemd Xray 服务 --------------------
 
 install_service() {
@@ -1315,6 +1102,92 @@ EOF
     info "快捷命令创建完成。输入 x 即可启动管理菜单。"
 }
 
+# -------------------- 独立 Cloudflare 隧道管理入口 --------------------
+
+do_tunnel_manage() {
+    if [[ ! -x "$BIN" || ! -s "$CONF" || ! -s "$SUBJSON" ]]; then
+        warn "请先执行 [1] 一键安装 / 自动修复，再单独管理 Cloudflare 隧道。"
+        return 0
+    fi
+
+    # 加载原安装参数，避免选项 6 覆盖原节点、域名或订阅设置。
+    if [[ -s "$ENVFILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$ENVFILE"
+    fi
+    DOMAIN="${DOMAIN:-}"
+    TLS_OK=0
+    if [[ -s "$BASE/certs/fullchain.pem" && -s "$BASE/certs/key.pem" ]]; then
+        TLS_OK=1
+    fi
+    if [[ -s "$SUB_PORT_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$SUB_PORT_FILE"
+    fi
+    if [[ ! "${SUB_PORT:-}" =~ ^[0-9]+$ ]]; then
+        setup_subscription_port
+    fi
+
+    detect_public_ipv4
+    configure_tunnel_mode
+
+    if [[ "${CF_MODE:-none}" == "none" ]]; then
+        # 单独关闭隧道时，必须同时移除 Xray 入站与订阅节点。
+        systemctl disable --now "$CF_TEMP_SERVICE" 2>/dev/null || true
+        systemctl disable --now "$CF_SERVICE" 2>/dev/null || true
+        rm -f "$CF_TEMP_UNIT" "$CF_UNIT" "$CF_SETTINGS" "$CF_TOKEN_FILE"
+        systemctl daemon-reload
+        python3 - <<'PYREMOVE'
+import json, os
+from pathlib import Path
+base = Path('/opt/xiazheteng-node')
+conf_path = base / 'config.json'
+nodes_path = base / 'data/nodes.json'
+with conf_path.open(encoding='utf-8') as f:
+    conf = json.load(f)
+conf['inbounds'] = [x for x in conf.get('inbounds', []) if x.get('tag') != 'in-vmess-argo']
+tmp = conf_path.with_suffix('.json.tmp')
+with tmp.open('w', encoding='utf-8') as f:
+    json.dump(conf, f, ensure_ascii=False, indent=2)
+os.chmod(tmp, 0o600)
+tmp.replace(conf_path)
+if nodes_path.exists():
+    with nodes_path.open(encoding='utf-8') as f:
+        nodes = json.load(f)
+    nodes = [x for x in nodes if x.get('type') != 'vmess-argo']
+    tmp = nodes_path.with_suffix('.json.tmp')
+    with tmp.open('w', encoding='utf-8') as f:
+        json.dump(nodes, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    tmp.replace(nodes_path)
+PYREMOVE
+        "$BIN" run -test -config "$CONF" >/dev/null || die "关闭隧道后，Xray 配置验证失败。"
+        systemctl restart "$SERVICE"
+        generate_subscription
+        [[ -s "$SUB_URL_FILE" ]] && install_subscription_server
+        info "Cloudflare 隧道已关闭；隧道入站及隧道订阅节点已移除。"
+        return 0
+    fi
+
+    prepare_tunnel_inbound
+    "$BIN" run -test -config "$CONF" >/dev/null || die "隧道配置检查失败，未重启 Xray。"
+    systemctl restart "$SERVICE"
+    systemctl is-active --quiet "$SERVICE" || die "Xray 重启失败，请检查 systemctl status $SERVICE。"
+    start_cloudflared_tunnel
+    generate_subscription
+    if [[ -s "$SUB_TOKEN_FILE" && -s "$SUB_URL_FILE" ]]; then
+        install_subscription_server
+    fi
+
+    echo
+    echo "========== Cloudflare 隧道管理结果 =========="
+    echo "模式：$CF_MODE"
+    echo "域名：${CF_HOSTNAME:-待获取}"
+    echo "本地回源：127.0.0.1:$(cat "$CF_WS_PORT_FILE" 2>/dev/null || echo 未配置)"
+    echo "订阅文件：$SUBFILE"
+    show_subscription_url
+}
+
 # -------------------- 菜单 --------------------
 
 menu() {
@@ -1328,7 +1201,8 @@ menu() {
         echo "[3] 整合订阅 / 刷新订阅"
         echo "[4] 创建快捷命令 x"
         echo "[5] 显示在线订阅链接"
-        echo "    安装时可选择 Cloudflare 临时/固定隧道并整合进同一订阅"
+        echo "[6] Cloudflare 隧道部署 / 管理（启用、切换或关闭，并刷新同一订阅）"
+        echo "    安装时也可选择 Cloudflare 临时/固定隧道并整合进同一订阅"
         echo "[0] 退出"
         echo "=========================================="
         read -r -p "请选择：" choice
@@ -1351,6 +1225,7 @@ menu() {
                 ;;
             4) create_shortcut ;;
             5) show_subscription_url ;;
+            6) do_tunnel_manage ;;
             0) echo "已退出。"; exit 0 ;;
             *) echo "无效选项。" ;;
         esac
