@@ -82,6 +82,31 @@ install_dependencies() {
             die "依赖安装后仍缺少命令：$c"
     done
 }
+ensure_cron_for_acme() {
+    # acme.sh relies on cron for unattended certificate renewal.
+    if command -v crontab >/dev/null 2>&1 && systemctl is-active --quiet cron 2>/dev/null; then
+        info "检测到 crontab/cron 服务可用。"
+        return 0
+    fi
+    info "未检测到可用的 cron 自动续期服务，尝试安装并启动 cron。"
+    export DEBIAN_FRONTEND=noninteractive
+    if ! command -v crontab >/dev/null 2>&1; then
+        apt-get update -y && apt-get install -y cron || {
+            warn "安装 cron 失败；将尝试以 --force 安装 acme.sh，但自动续期可能不可用。"
+            return 1
+        }
+    fi
+    systemctl enable --now cron >/dev/null 2>&1 || {
+        warn "cron 无法启动；将尝试以 --force 安装 acme.sh，但自动续期可能不可用。"
+        return 1
+    }
+    if command -v crontab >/dev/null 2>&1 && systemctl is-active --quiet cron 2>/dev/null; then
+        info "cron 已安装并运行，acme.sh 可配置自动续期。"
+        return 0
+    fi
+    warn "cron 检查仍未通过；自动续期状态无法保证。"
+    return 1
+}
 detect_public_ipv4() {
     PUBLIC_IP=""
     local ip
@@ -267,20 +292,50 @@ obtain_tls_certificate() {
     fi
     local email
     email="admin@$DOMAIN"
+    local cron_ok=0
+    ensure_cron_for_acme && cron_ok=1 || true
     if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then
-        curl -fsSL --retry 2 --max-time 60 \
-            https://get.acme.sh -o "$BASE/acme-install.sh" || {
-            warn "无法下载 acme.sh，跳过 TLS。"
+        if ! curl -fsSL --retry 2 --max-time 60 \
+            https://get.acme.sh -o "$BASE/acme-install.sh"; then
+            warn "无法下载 acme.sh 安装程序（网络/下载失败），跳过 TLS。"
             return 0
-        }
-        sh "$BASE/acme-install.sh" email="$email" || {
-            warn "acme.sh 安装失败，跳过 TLS。"
-            return 0
-        }
+        fi
+        if ! sh "$BASE/acme-install.sh" email="$email"; then
+            warn "acme.sh 标准安装失败；检查是否由 cron 缺失导致。"
+            if [[ "$cron_ok" != 1 ]]; then
+                # The official installer may have downloaded/extracted the source but
+                # stopped before installing due to missing cron. Install from archive
+                # explicitly with --force as a last resort.
+                local tmpdir="$BASE/acme-force-install"
+                rm -rf "$tmpdir"
+                mkdir -p "$tmpdir"
+                if curl -fsSL --retry 2 --max-time 90 \
+                    https://github.com/acmesh-official/acme.sh/archive/master.tar.gz -o "$tmpdir/acme.tar.gz" &&
+                    tar -xzf "$tmpdir/acme.tar.gz" -C "$tmpdir"; then
+                    local src
+                    src="$(find "$tmpdir" -maxdepth 2 -type f -name acme.sh -perm /111 -print -quit)"
+                    if [[ -n "$src" ]] && "$src" --install --force -m "$email"; then
+                        warn "acme.sh 已使用 --force 安装；由于 cron 不可用，自动续期可能不可靠，请修复 cron。"
+                    else
+                        warn "acme.sh --force 安装也失败，跳过 TLS。"
+                        rm -rf "$tmpdir"
+                        return 0
+                    fi
+                    rm -rf "$tmpdir"
+                else
+                    warn "无法下载 acme.sh 源码进行 --force 降级安装，跳过 TLS。"
+                    rm -rf "$tmpdir"
+                    return 0
+                fi
+            else
+                warn "cron 已可用但 acme.sh 仍安装失败；这不是 cron 缺失问题，跳过 TLS 并保留详细错误。"
+                return 0
+            fi
+        fi
     fi
     local acme="$HOME/.acme.sh/acme.sh"
     [[ -x "$acme" ]] || {
-        warn "找不到 acme.sh，跳过 TLS。"
+        warn "acme.sh 安装流程返回后仍未找到可执行文件：$acme；跳过 TLS。"
         return 0
     }
     "$acme" --issue --standalone -d "$DOMAIN" \
@@ -768,20 +823,31 @@ show_subscription_url() {
     fi
 }
 install_service() {
-    if [[ -e "$UNIT" ]] &&
-       ! grep -q "xiazheteng-node-manager" "$UNIT"; then
-        local backup answer
+    if [[ -e "$UNIT" ]]; then
+        local backup answer managed=0 unit_text=""
         backup="${UNIT}.backup.$(date +%Y%m%d-%H%M%S)"
-        echo "发现同名 systemd 服务文件，但没有本脚本标记：$UNIT"
-        echo "为了允许重新部署，脚本可以先备份原文件，再写入本脚本的 Xray 服务配置。"
-        read -r -p "确认备份并覆盖该服务文件？[y/N]：" answer
-        case "${answer,,}" in
-            y|yes)
-                cp -a "$UNIT" "$backup"
-                warn "原服务文件已备份至：$backup"
-                ;;
-            *) die "用户取消覆盖。原服务文件未修改；请确认该文件归属后重新部署。" ;;
-        esac
+        unit_text="$(cat "$UNIT" 2>/dev/null || true)"
+        # Recognize this manager's prior unit even if an older version omitted its marker.
+        if grep -Fq "Managed by xiazheteng-node-manager" <<< "$unit_text" ||
+           grep -Fq "ExecStart=$BIN run -config $CONF" <<< "$unit_text" ||
+           grep -Fq "Description=Xia Zhe Teng Independent Xray Service" <<< "$unit_text"; then
+            managed=1
+        fi
+        if [[ "$managed" == 1 ]]; then
+            cp -a "$UNIT" "$backup"
+            info "识别到本脚本此前创建的 Xray 服务，已备份旧配置：$backup；继续更新。"
+        else
+            echo "发现同名 systemd 服务文件，无法确认是否由本脚本创建：$UNIT"
+            echo "为避免覆盖其他程序，必须明确确认；原文件会先备份。"
+            read -r -p "确认备份并覆盖该服务文件？[y/N]：" answer || answer=""
+            case "${answer,,}" in
+                y|yes)
+                    cp -a "$UNIT" "$backup"
+                    warn "原服务文件已备份至：$backup"
+                    ;;
+                *) die "用户取消覆盖。原服务文件未修改；请确认归属后重新部署。" ;;
+            esac
+        fi
     fi
     cat > "$UNIT" <<EOF
 [Unit]
