@@ -47,9 +47,8 @@
 ## 安装与启动
 
 以 root 身份通过 SSH 登录 VPS，执行：
-
-```bash
 普通版
+```bash
 apt update
 apt install -y curl ca-certificates
 curl -4 -fsSL \
@@ -58,8 +57,8 @@ curl -4 -fsSL \
 chmod 700 /root/xiazheteng-node-manager.sh
 bash /root/xiazheteng-node-manager.sh
 ```
-```bash
 CF隧道版
+```bash
 apt update
 apt install -y curl ca-certificates
 curl -4 -fsSL \
