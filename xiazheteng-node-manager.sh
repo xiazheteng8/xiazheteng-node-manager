@@ -776,6 +776,22 @@ EOF
     if [[ "$SUB_SCHEME" == "https" && -n "${DOMAIN:-}" ]]; then
         SUB_HOST="$DOMAIN"
     else
+        # 确保 PUBLIC_IP 已初始化，避免 set -u 导致脚本退出。
+        PUBLIC_IP="${PUBLIC_IP:-}"
+
+        # 如果前面没有获取公网 IPv4，则尝试自动检测。
+        if [[ -z "$PUBLIC_IP" ]]; then
+            PUBLIC_IP="$(curl -4fsS \
+                --connect-timeout 3 \
+                --max-time 8 \
+                https://api.ipify.org 2>/dev/null || true)"
+        fi
+
+        # 检测失败时明确报错，不生成错误的订阅链接。
+        if [[ -z "$PUBLIC_IP" ]]; then
+            die "无法获取公网 IPv4，订阅链接生成失败。请检查网络或手动配置 PUBLIC_IP。"
+        fi
+
         SUB_HOST="$PUBLIC_IP"
     fi
 
