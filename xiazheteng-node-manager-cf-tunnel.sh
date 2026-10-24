@@ -696,20 +696,57 @@ configure_cloudflare_tunnel_node() {
     [[ -x "$BIN" && -f "$CONF" ]] || { warn "请先选择 [1] 完成 Xray 安装。"; return 1; }
     install_dependencies
     install_cloudflared_binary
+
     local hostname token port uuid path
-    echo
-    echo "请先在 Cloudflare Zero Trust / Networking / Tunnels 创建远程管理 Tunnel。"
-    echo "随后在该 Tunnel 的 Public Hostname 中设置：HTTP -> http://127.0.0.1:本脚本显示的端口。"
-    echo "脚本只配置 VPS 端；不会替你在 Cloudflare 控制台创建 Tunnel 或 DNS 路由。"
-    echo
-    read -r -p "输入已添加到 Tunnel 的公网主机名（例如 cf.example.com）: " hostname
-    hostname="${hostname,,}"; hostname="${hostname%.}"
-    [[ "$hostname" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ && "$hostname" == *.* && "$hostname" != *..* ]] || { warn "主机名格式无效。"; return 1; }
-    read -r -s -p "粘贴 Cloudflare Tunnel Token（输入不会显示）: " token; echo
-    [[ "$token" =~ ^[A-Za-z0-9._=-]{40,}$ ]] || { warn "Tunnel Token 格式不正确，未写入配置。"; unset token; return 1; }
-    port="$(choose_random_port)" || die "无法分配 Cloudflare Tunnel 本地端口。"
+
+    # 必须从终端交互，避免脚本标准输入不是终端时 read 直接失败。
+    [[ -r /dev/tty ]] || {
+        warn "无法访问交互终端，请直接登录 VPS 后运行脚本。"
+        return 1
+    }
+
+    # 先分配端口和节点参数，再提示用户配置 Cloudflare。
+    port="$(choose_random_port)" || {
+        warn "无法分配 Cloudflare Tunnel 本地端口。"
+        return 1
+    }
+
     uuid="$(cat /proc/sys/kernel/random/uuid)"
     path="/cfws-$(openssl rand -hex 6)"
+
+    echo
+    echo "========== Cloudflare Tunnel 配置 =========="
+    echo "本地 Xray WebSocket 端口：$port"
+    echo "WebSocket 路径：$path"
+    echo
+    echo "请先在 Cloudflare Zero Trust 中创建远程管理 Tunnel。"
+    echo "创建后，先输入 Tunnel 对应的公网主机名和 Token。"
+    echo "Public Hostname 的 Service URL 请设置为："
+    echo "http://127.0.0.1:$port"
+    echo "路径：$path"
+    echo "============================================"
+    echo
+
+    IFS= read -r -p "输入公网主机名（例如 cf.example.com）: " hostname </dev/tty
+    hostname="${hostname,,}"
+    hostname="${hostname%.}"
+
+    [[ "$hostname" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ &&
+       "$hostname" == *.* &&
+       "$hostname" != *..* ]] || {
+        warn "主机名格式无效。"
+        return 1
+    }
+
+    IFS= read -r -s -p "粘贴 Cloudflare Tunnel Token（输入不会显示）: " token </dev/tty
+    echo
+
+    [[ "$token" =~ ^[A-Za-z0-9._=-]{40,}$ ]] || {
+        warn "Tunnel Token 格式不正确，未写入配置。"
+        unset token
+        return 1
+    }
+
 
     python3 - "$CONF" "$port" "$uuid" "$path" <<'PY'
 import json, os, sys
