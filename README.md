@@ -49,8 +49,6 @@
 以 root 身份通过 SSH 登录 VPS，执行：
 普通版
 ```bash
-apt update
-apt install -y curl ca-certificates
 curl -4 -fsSL \
   https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazheteng-node-manager.sh \
   -o /root/xiazheteng-node-manager.sh
@@ -59,8 +57,6 @@ bash /root/xiazheteng-node-manager.sh
 ```
 CF隧道版
 ```bash
-apt update
-apt install -y curl ca-certificates
 curl -4 -fsSL \
   https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazheteng-node-manager-cf-tunnel.sh \
   -o /root/xiazheteng-node-manager-cf-tunnel.sh
