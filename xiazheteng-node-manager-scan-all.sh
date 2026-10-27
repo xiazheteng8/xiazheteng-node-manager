@@ -1085,20 +1085,48 @@ EOF
     fi
     printf '%s\n' "$SUB_URL" > "$SUB_URL_FILE"
     chmod 600 "$SUB_URL_FILE"
-    local local_url
-    local_url="$SUB_SCHEME://127.0.0.1:$SUB_PORT/sub?token=$token"
+
+local local_url curl_rc attempt
+local_url="$SUB_SCHEME://127.0.0.1:$SUB_PORT/sub?token=$token"
+
+# 等待订阅服务就绪，最多重试 10 次
+curl_rc=1
+
+for attempt in {1..10}; do
     if [[ "$SUB_SCHEME" == "https" ]]; then
         curl -kfsS --connect-timeout 3 --max-time 8 \
-            "$local_url" -o "$DATA/subscription-check.tmp" ||
-            die "在线 HTTPS 订阅接口本机验证失败。"
+            "$local_url" -o "$DATA/subscription-check.tmp" 2>/dev/null
+        curl_rc=$?
     else
         curl -fsS --connect-timeout 3 --max-time 8 \
-            "$local_url" -o "$DATA/subscription-check.tmp" ||
-            die "在线 HTTP 订阅接口本机验证失败。"
+            "$local_url" -o "$DATA/subscription-check.tmp" 2>/dev/null
+        curl_rc=$?
     fi
-    [[ -s "$DATA/subscription-check.tmp" ]] ||
-        die "订阅接口返回内容为空。"
+
+    if [[ "$curl_rc" -eq 0 && -s "$DATA/subscription-check.tmp" ]]; then
+        break
+    fi
+
     rm -f "$DATA/subscription-check.tmp"
+
+    if (( attempt < 10 )); then
+        sleep 1
+    fi
+done
+
+if [[ "$curl_rc" -ne 0 ]]; then
+    if [[ "$SUB_SCHEME" == "https" ]]; then
+        die "在线 HTTPS 订阅接口本机验证失败（已重试 10 次）。请检查：journalctl -u $SUB_SERVICE -n 80 --no-pager"
+    else
+        die "在线 HTTP 订阅接口本机验证失败（已重试 10 次）。请检查：journalctl -u $SUB_SERVICE -n 80 --no-pager"
+    fi
+fi
+
+[[ -s "$DATA/subscription-check.tmp" ]] ||
+    die "订阅接口返回内容为空。"
+
+rm -f "$DATA/subscription-check.tmp"
+
     info "在线订阅服务启动并通过本机 HTTP 检查。"
 }
 show_subscription_url() {
