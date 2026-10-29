@@ -685,7 +685,7 @@ def install():
          'subscription_name': custom_name}
     if tunnel == '2':
         c['cf_hostname'] = domain(ask('固定隧道域名（CF 托管的空闲子域名）：'))
-        c['cf_api_token'] = getpass.getpass('Cloudflare API Token（Tunnel Edit / DNS Edit / Zone Read）：').strip()
+        c['cf_api_token'] = ask('Cloudflare API Token（明文显示；Tunnel Edit / DNS Edit / Zone Read）：')
         if not c['cf_api_token']:
             raise ValueError('API Token 不能为空')
         resolve_cf_identity(c)
@@ -949,6 +949,5 @@ if __name__ == '__main__':
         else:
             print('失败：' + str(exc), file=sys.stderr)
         sys.exit(1)
-
 XIAZT_PYTHON_EOF_938715
 python3 "$workdir/manager.py" "$@"
