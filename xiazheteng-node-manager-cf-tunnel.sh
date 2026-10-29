@@ -1,1385 +1,869 @@
 #!/usr/bin/env bash
+# 瞎折腾一键脚本 | Debian 12/13、Ubuntu 22.04/24.04 | amd64/arm64
 set -Eeuo pipefail
-umask 077
-APP="xiazheteng-node-manager"
-BASE="/opt/xiazheteng-node"
-BIN="$BASE/bin/xray"
-CONF="$BASE/config.json"
-DATA="$BASE/data"
-LOGDIR="/var/log/$APP"
-LOG="$LOGDIR/manager.log"
-ENVFILE="$BASE/settings.env"
-MANIFEST="$BASE/managed-files.txt"
-SERVICE="xiazheteng-xray"
-UNIT="/etc/systemd/system/$SERVICE.service"
-SUB_SERVICE="xiazheteng-subscription"
-SUB_UNIT="/etc/systemd/system/$SUB_SERVICE.service"
-SUB_SERVER="$BASE/subscription_server.py"
-SUB_TOKEN_FILE="$DATA/subscription.token"
-SUB_PORT_FILE="$DATA/subscription-port.env"
-SUB_URL_FILE="$DATA/subscription-url.txt"
-SUBFILE="$DATA/subscription.txt"
-SUBJSON="$DATA/nodes.json"
-SHORTCUT="/usr/local/bin/x"
-XRAY_REPO="XTLS/Xray-core"
-CF_CONF="$BASE/cf-tunnel-xray.json"
-CF_SERVICE="xiazheteng-cf-xray"
-CF_UNIT="/etc/systemd/system/$CF_SERVICE.service"
-CF_TUNNEL_SERVICE="xiazheteng-cloudflared"
-CF_TUNNEL_UNIT="/etc/systemd/system/$CF_TUNNEL_SERVICE.service"
-CF_TEMP_SERVICE="xiazheteng-cloudflared-temp"
-CF_TEMP_UNIT="/etc/systemd/system/$CF_TEMP_SERVICE.service"
-CF_TEMP_LOG="$DATA/cloudflared-temp.log"
-CF_SETTINGS="$DATA/cf-tunnel-settings.env"
-CF_TOKEN_FILE="$DATA/cloudflared-token.env"
-CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
-mkdir -p "$LOGDIR"
-touch "$LOG"
-chmod 600 "$LOG"
-log() {
-    printf '[%s] [%s] %s\n' \
-        "$(date '+%F %T')" "$1" "$2" | tee -a "$LOG"
+[[ ${EUID} -eq 0 ]] || { echo '请使用 root 或 sudo bash x.sh'; exit 1; }
+[[ -r /etc/os-release ]] || { echo '无法识别系统'; exit 1; }
+. /etc/os-release
+case "${ID}:${VERSION_ID}" in
+  debian:12|debian:13|ubuntu:22.04|ubuntu:24.04) ;;
+  *) echo '仅支持 Debian 12/13、Ubuntu 22.04/24.04'; exit 1 ;;
+esac
+case "$(uname -m)" in x86_64|aarch64) ;; *) echo '仅支持 amd64/arm64'; exit 1 ;; esac
+command -v systemctl >/dev/null && [[ -d /run/systemd/system ]] || { echo '需要 systemd，不能在普通 Docker 容器中运行'; exit 1; }
+[[ -r /dev/tty ]] || { echo '需要交互终端，请先下载，再执行 bash x.sh'; exit 1; }
+exec </dev/tty
+export DEBIAN_FRONTEND=noninteractive
+workdir=$(mktemp -d /tmp/xiazt.XXXXXXXX)
+awake_pid=''
+cleanup() {
+  [[ -z "$awake_pid" ]] || kill "$awake_pid" 2>/dev/null || true
+  rm -f -- "$workdir/manager.py"
+  rmdir -- "$workdir" 2>/dev/null || true
 }
-info() { log INFO "$*"; }
-warn() { log WARN "$*"; }
-err()  { log ERROR "$*"; }
-die()  { err "$*"; exit 1; }
-trap 'rc=$?; err "命令执行失败，退出码=$rc，行号=${LINENO}。请检查 $LOG"; exit "$rc"' ERR
-need_root() {
-    [[ $EUID -eq 0 ]] || {
-        echo "请使用 root 运行：sudo bash $0"
-        exit 1
-    }
-}
-detect_os() {
-    [[ -r /etc/os-release ]] || die "无法识别操作系统。"
-    . /etc/os-release
-    case "${ID:-}" in
-        debian|ubuntu) ;;
-        *) die "当前系统 ${ID:-unknown} 不在自动部署支持列表中。" ;;
-    esac
-    command -v systemctl >/dev/null ||
-        die "未检测到 systemd。"
-    case "$(uname -m)" in
-        x86_64|amd64) ARCH="64" ;;
-        aarch64|arm64) ARCH="arm64-v8a" ;;
-        *) die "不支持的 CPU 架构：$(uname -m)" ;;
-    esac
-    info "系统：${PRETTY_NAME:-$ID}，架构：$(uname -m)"
-}
-install_dependencies() {
-    local missing=()
-    for c in curl jq openssl python3 ss base64 dig; do
-        command -v "$c" >/dev/null 2>&1 || missing+=("$c")
-    done
-    if ((${#missing[@]})); then
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y
-        apt-get install -y curl jq openssl python3 iproute2 ca-certificates bind9-dnsutils
-    fi
-    for c in curl jq openssl python3 ss dig; do
-        command -v "$c" >/dev/null 2>&1 ||
-            die "依赖安装后仍缺少命令：$c"
-    done
-}
-ensure_cron_for_acme() {
-    # acme.sh relies on cron for unattended certificate renewal.
-    if command -v crontab >/dev/null 2>&1 && systemctl is-active --quiet cron 2>/dev/null; then
-        info "检测到 crontab/cron 服务可用。"
-        return 0
-    fi
-    info "未检测到可用的 cron 自动续期服务，尝试安装并启动 cron。"
-    export DEBIAN_FRONTEND=noninteractive
-    if ! command -v crontab >/dev/null 2>&1; then
-        apt-get update -y && apt-get install -y cron || {
-            warn "安装 cron 失败；将尝试以 --force 安装 acme.sh，但自动续期可能不可用。"
-            return 1
-        }
-    fi
-    systemctl enable --now cron >/dev/null 2>&1 || {
-        warn "cron 无法启动；将尝试以 --force 安装 acme.sh，但自动续期可能不可用。"
-        return 1
-    }
-    if command -v crontab >/dev/null 2>&1 && systemctl is-active --quiet cron 2>/dev/null; then
-        info "cron 已安装并运行，acme.sh 可配置自动续期。"
-        return 0
-    fi
-    warn "cron 检查仍未通过；自动续期状态无法保证。"
-    return 1
-}
-detect_public_ipv4() {
-    PUBLIC_IP=""
-    local ip
-    for url in \
-        https://api.ipify.org \
-        https://ipv4.icanhazip.com \
-        https://ifconfig.me/ip; do
-        ip="$(curl -4 -fsS --connect-timeout 3 --max-time 6 "$url" 2>/dev/null || true)"
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            PUBLIC_IP="$ip"
-            break
-        fi
-    done
-    if [[ -z "$PUBLIC_IP" ]]; then
-        warn "无法获取公网 IPv4；尝试从本地路由获取地址。"
-        PUBLIC_IP="$(ip -4 route get 1.1.1.1 2>/dev/null |
-            awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-    fi
-    [[ -n "$PUBLIC_IP" ]] || die "无法确定 IPv4 地址。"
-    info "检测到 IPv4：$PUBLIC_IP"
-}
-check_domain() {
-    DOMAIN_OK=0
-    [[ -n "${DOMAIN:-}" ]] || return 0
-    if [[ "$DOMAIN" =~ [^a-zA-Z0-9.-] ]] ||
-       [[ "$DOMAIN" == *..* ]] ||
-       [[ "$DOMAIN" == .* ]] ||
-       [[ "$DOMAIN" == *. ]]; then
-        warn "域名格式不合法，将切换到无域名模式。"
-        DOMAIN=""
-        return 0
-    fi
-    local ips ip invalid_ips=""
-    # Use DNS directly. getent consults /etc/hosts/NSS first, so a stale
-    # 127.0.0.1 entry in /etc/hosts can falsely look like a DNS A record.
-    if ! command -v dig >/dev/null 2>&1; then
-        warn "缺少 dig，无法独立核验 $DOMAIN 的 DNS A 记录；为避免把 /etc/hosts 本地映射误判为 DNS，跳过 TLS 节点。请安装 bind9-dnsutils 后重试。"
-        return 0
-    fi
-    ips="$(dig +time=3 +tries=1 +short A "$DOMAIN" 2>/dev/null |
-        awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ {print}' | sort -u || true)"
-    if [[ -z "$ips" ]]; then
-        warn "$DOMAIN 的 DNS 查询没有返回 IPv4 A 记录；跳过 TLS 证书申请及 TLS 节点。请检查权威 DNS 记录、解析状态及当前 VPS 的 DNS 网络连通性。"
-        return 0
-    fi
-    # Reject loopback, private, link-local, unspecified and other non-global IPv4 answers.
-    while IFS= read -r ip; do
-        [[ -n "$ip" ]] || continue
-        if ! python3 - "$ip" <<'PYIP' >/dev/null 2>&1
-import ipaddress, sys
-addr = ipaddress.ip_address(sys.argv[1])
-raise SystemExit(0 if addr.version == 4 and addr.is_global else 1)
-PYIP
-        then
-            invalid_ips+=" $ip"
-        fi
-    done <<< "$ips"
-    if [[ -n "$invalid_ips" ]]; then
-        warn "$DOMAIN 的 DNS 返回了非公网 IPv4：${invalid_ips# }（例如 127.0.0.1 是回环地址，不是源站地址）；跳过 TLS 节点。请删除错误 A 记录，并检查 Cloudflare DNS 记录是否误填为 127.0.0.1。"
-        return 0
-    fi
-    if ! grep -Fxq "$PUBLIC_IP" <<< "$ips"; then
-        warn "$DOMAIN 的 DNS A 记录为：$(tr '\n' ' ' <<< "$ips")；不包含本机公网 IPv4 $PUBLIC_IP，跳过 TLS 节点。若使用 Cloudflare 代理，dig 可能返回 Cloudflare 边缘 IP；请按当前 TLS 申请方式检查 DNS/CDN 与源站配置。"
-        return 0
-    fi
-    DOMAIN_OK=1
-    info "域名解析检查通过：$DOMAIN"
-}
-port_in_use() {
-    ss -H -lnt "( sport = :$1 )" 2>/dev/null | grep -q .
-}
-choose_port() {
-    local p
-    for p in "$@"; do
-        [[ "${SUB_PORT:-}" == "$p" ]] && continue
-        if ! port_in_use "$p"; then
-            echo "$p"
-            return 0
-        fi
-    done
-    return 1
-}
-choose_random_port() {
-    local i p
-    for i in $(seq 1 150); do
-        p="$(shuf -i 20000-60000 -n 1)"
-        [[ "${SUB_PORT:-}" == "$p" ]] && continue
-        if ! port_in_use "$p"; then
-            echo "$p"
-            return 0
-        fi
-    done
-    return 1
-}
-inspect_existing_services() {
-    info "检查现有代理、面板及 Web 服务。"
-    local svc
-    for svc in x-ui 3x-ui sing-box xray nginx apache2 caddy haproxy; do
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            info "检测到运行中的服务：$svc（不会停止或覆盖）"
-        fi
-    done
-    ss -lntp 2>/dev/null | tee -a "$LOG" >/dev/null || true
-}
-install_xray() {
-    if [[ -x "$BIN" ]] && "$BIN" version >/dev/null 2>&1; then
-        info "检测到本脚本已有 Xray，跳过重复安装。"
-        return
-    fi
-    mkdir -p "$BASE/bin" "$DATA"
-    local api tag url tmp
-    api="https://api.github.com/repos/$XRAY_REPO/releases/latest"
-    tag="$(curl -fsSL --retry 3 --max-time 30 "$api" |
-        jq -r '.tag_name // empty')"
-    [[ -n "$tag" ]] || die "无法获取 Xray 发行版本。"
-    case "$ARCH" in
-        64) url="https://github.com/$XRAY_REPO/releases/download/$tag/Xray-linux-64.zip" ;;
-        arm64-v8a) url="https://github.com/$XRAY_REPO/releases/download/$tag/Xray-linux-arm64-v8a.zip" ;;
-        *) die "不支持的 Xray 架构。" ;;
-    esac
-    tmp="$(mktemp -d)"
-    info "下载 Xray：$tag"
-    if ! curl -fL --retry 3 --connect-timeout 10 --max-time 180 \
-        "$url" -o "$tmp/xray.zip"; then
-        rm -rf "$tmp"
-        die "Xray 下载失败。"
-    fi
-    apt-get install -y unzip >/dev/null
-    unzip -oq "$tmp/xray.zip" -d "$tmp/unpack"
-    [[ -f "$tmp/unpack/xray" ]] || {
-        rm -rf "$tmp"
-        die "发行包中没有找到 xray 二进制。"
-    }
-    install -m 0755 "$tmp/unpack/xray" "$tmp/xray-test"
-    "$tmp/xray-test" version >/dev/null ||
-        die "下载的 Xray 无法执行。"
-    install -m 0755 "$tmp/unpack/xray" "$BIN"
-    rm -rf "$tmp"
-    info "Xray 安装完成：$("$BIN" version | head -n 1)"
-}
-generate_reality_keys() {
-    local output line label value
-    PRIVATE_KEY=""
-    PUBLIC_KEY=""
-    if ! output="$("$BIN" x25519 2>&1)"; then
-        warn "Xray x25519 密钥生成失败：$output"
-        return 0
-    fi
-    while IFS= read -r line; do
-        [[ "$line" == *:* ]] || continue
-        label="${line%%:*}"
-        value="${line#*:}"
-        value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-        label="$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-        case "$label" in
-            privatekey|private)
-                [[ -n "$value" ]] && PRIVATE_KEY="$value"
-                ;;
-            password|publickey|public)
-                [[ -n "$value" ]] && PUBLIC_KEY="$value"
-                ;;
-        esac
-    done <<< "$output"
-    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        local -a values=()
-        while IFS= read -r line; do
-            [[ "$line" == *:* ]] || continue
-            value="${line#*:}"
-            value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-            [[ -n "$value" ]] && values+=("$value")
-        done <<< "$output"
-        [[ -n "$PRIVATE_KEY" ]] || PRIVATE_KEY="${values[0]:-}"
-        [[ -n "$PUBLIC_KEY" ]] || PUBLIC_KEY="${values[1]:-}"
-    fi
-    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        warn "无法识别 Xray x25519 输出中的密钥，REALITY 节点将被跳过。原始输出：$output"
-        PRIVATE_KEY=""
-        PUBLIC_KEY=""
-        return 0
-    fi
-    info "REALITY 密钥生成并解析成功。"
-}
-obtain_tls_certificate() {
-    TLS_OK=0
-    [[ "${DOMAIN_OK:-0}" == 1 ]] || return 0
-    if port_in_use 80; then
-        warn "TCP 80 已被占用；不会停止现有服务，跳过自动 TLS 证书申请。"
-        return 0
-    fi
-    local email
-    email="admin@$DOMAIN"
-    local cron_ok=0
-    ensure_cron_for_acme && cron_ok=1 || true
-    if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then
-        if ! curl -fsSL --retry 2 --max-time 60 \
-            https://get.acme.sh -o "$BASE/acme-install.sh"; then
-            warn "无法下载 acme.sh 安装程序（网络/下载失败），跳过 TLS。"
-            return 0
-        fi
-        if ! sh "$BASE/acme-install.sh" email="$email"; then
-            warn "acme.sh 标准安装失败；检查是否由 cron 缺失导致。"
-            if [[ "$cron_ok" != 1 ]]; then
-                # The official installer may have downloaded/extracted the source but
-                # stopped before installing due to missing cron. Install from archive
-                # explicitly with --force as a last resort.
-                local tmpdir="$BASE/acme-force-install"
-                rm -rf "$tmpdir"
-                mkdir -p "$tmpdir"
-                if curl -fsSL --retry 2 --max-time 90 \
-                    https://github.com/acmesh-official/acme.sh/archive/master.tar.gz -o "$tmpdir/acme.tar.gz" &&
-                    tar -xzf "$tmpdir/acme.tar.gz" -C "$tmpdir"; then
-                    local src
-                    src="$(find "$tmpdir" -maxdepth 2 -type f -name acme.sh -perm /111 -print -quit)"
-                    if [[ -n "$src" ]] && "$src" --install --force -m "$email"; then
-                        warn "acme.sh 已使用 --force 安装；由于 cron 不可用，自动续期可能不可靠，请修复 cron。"
-                    else
-                        warn "acme.sh --force 安装也失败，跳过 TLS。"
-                        rm -rf "$tmpdir"
-                        return 0
-                    fi
-                    rm -rf "$tmpdir"
-                else
-                    warn "无法下载 acme.sh 源码进行 --force 降级安装，跳过 TLS。"
-                    rm -rf "$tmpdir"
-                    return 0
-                fi
-            else
-                warn "cron 已可用但 acme.sh 仍安装失败；这不是 cron 缺失问题，跳过 TLS 并保留详细错误。"
-                return 0
-            fi
-        fi
-    fi
-    local acme="$HOME/.acme.sh/acme.sh"
-    [[ -x "$acme" ]] || {
-        warn "acme.sh 安装流程返回后仍未找到可执行文件：$acme；跳过 TLS。"
-        return 0
-    }
-    "$acme" --issue --standalone -d "$DOMAIN" \
-        --server letsencrypt --keylength ec-256 --force || {
-        warn "证书签发失败；保留其他节点，跳过 TLS 节点。"
-        return 0
-    }
-    mkdir -p "$BASE/certs"
-    chmod 700 "$BASE/certs"
-    "$acme" --install-cert -d "$DOMAIN" --ecc \
-        --key-file "$BASE/certs/key.pem" \
-        --fullchain-file "$BASE/certs/fullchain.pem" \
-        --reloadcmd "systemctl restart $SERVICE 2>/dev/null || true" || {
-        warn "证书安装失败，跳过 TLS 节点。"
-        return 0
-    }
-    chmod 600 "$BASE/certs/"*.pem
-    TLS_OK=1
-    info "TLS 证书安装完成。"
-}
-setup_subscription_port() {
-    mkdir -p "$DATA"
-    if [[ -f "$SUB_PORT_FILE" ]]; then
-        source "$SUB_PORT_FILE"
-        if [[ "${SUB_PORT:-}" =~ ^[0-9]+$ ]] &&
-           [[ "$SUB_PORT" -ge 1 && "$SUB_PORT" -le 65535 ]] &&
-           ! port_in_use "$SUB_PORT"; then
-            info "复用订阅端口：$SUB_PORT"
-            return 0
-        fi
-    fi
-    SUB_PORT=""
-    if [[ "${TLS_OK:-0}" == 1 ]]; then
-        SUB_PORT="$(choose_port 443 8443 9443 10443 18443 || true)"
-    fi
-    if [[ -z "$SUB_PORT" ]]; then
-        SUB_PORT="$(choose_port 18080 18081 18082 28080 38080 || true)"
-    fi
-    if [[ -z "$SUB_PORT" ]]; then
-        SUB_PORT="$(choose_random_port)" ||
-            die "无法为在线订阅服务选择可用端口。"
-    fi
-    printf 'SUB_PORT=%q\n' "$SUB_PORT" > "$SUB_PORT_FILE"
-    chmod 600 "$SUB_PORT_FILE"
-    info "在线订阅服务端口：$SUB_PORT"
-}
-generate_configuration() {
-    local reality_port ss_port tls_port
-    local uuid ss_password short_id
-    reality_port="$(choose_port 443 8443 2053 2083 2087 2096 2443 10443 \
-        || choose_random_port)" || die "无法为 REALITY 选择端口。"
-    ss_port="$(choose_port 8388 8389 8390 18444 28443 \
-        || choose_random_port)" || die "无法为 Shadowsocks 选择端口。"
-    tls_port=""
-    if [[ "${TLS_OK:-0}" == 1 ]]; then
-        tls_port="$(choose_port 10444 1443 2443 3443 4443 \
-            || choose_random_port)" || {
-            warn "无可用 TLS 端口，跳过 TLS 节点。"
-            TLS_OK=0
-        }
-    fi
-    uuid="$(cat /proc/sys/kernel/random/uuid)"
-    ss_password="$(openssl rand -base64 24 | tr -d '\n')"
-    short_id="$(openssl rand -hex 8)"
-    generate_reality_keys
-    export BASE REALITY_PORT="$reality_port" SS_PORT="$ss_port"
-    export TLS_PORT="${tls_port:-0}" NODE_UUID="$uuid"
-    export SS_PASSWORD="$ss_password" SHORT_ID="$short_id"
-    export PRIVATE_KEY="${PRIVATE_KEY:-}" PUBLIC_KEY="${PUBLIC_KEY:-}"
-    export DOMAIN="${DOMAIN:-}" PUBLIC_IP
-    python3 - <<'PY'
-import json, os
-base = os.environ["BASE"]
-domain = os.environ.get("DOMAIN", "")
-ip = os.environ["PUBLIC_IP"]
-uuid = os.environ["NODE_UUID"]
-short_id = os.environ["SHORT_ID"]
-private_key = os.environ.get("PRIVATE_KEY", "")
-public_key = os.environ.get("PUBLIC_KEY", "")
-reality_port = int(os.environ["REALITY_PORT"])
-ss_port = int(os.environ["SS_PORT"])
-tls_port = int(os.environ["TLS_PORT"])
-ss_password = os.environ["SS_PASSWORD"]
-inbounds = []
-if private_key and public_key:
-    inbounds.append({
-        "tag": "in-reality",
-        "listen": "0.0.0.0",
-        "port": reality_port,
-        "protocol": "vless",
-        "settings": {
-            "clients": [{"id": uuid, "flow": "xtls-rprx-vision"}],
-            "decryption": "none"
-        },
-        "streamSettings": {
-            "network": "raw",
-            "security": "reality",
-            "realitySettings": {
-                "show": False,
-                "dest": "www.microsoft.com:443",
-                "xver": 0,
-                "serverNames": ["www.microsoft.com"],
-                "privateKey": private_key,
-                "shortIds": [short_id]
-            }
-        }
-    })
-inbounds.append({
-    "tag": "in-shadowsocks",
-    "listen": "0.0.0.0",
-    "port": ss_port,
-    "protocol": "shadowsocks",
-    "settings": {
-        "method": "chacha20-ietf-poly1305",
-        "password": ss_password,
-        "network": "tcp,udp"
-    }
-})
-if tls_port and domain and os.path.isfile(base + "/certs/fullchain.pem") \
-        and os.path.isfile(base + "/certs/key.pem"):
-    inbounds.append({
-        "tag": "in-vless-ws-tls",
-        "listen": "0.0.0.0",
-        "port": tls_port,
-        "protocol": "vless",
-        "settings": {"clients": [{"id": uuid}], "decryption": "none"},
-        "streamSettings": {
-            "network": "ws",
-            "security": "tls",
-            "tlsSettings": {
-                "alpn": ["http/1.1"],
-                "certificates": [{
-                    "certificateFile": base + "/certs/fullchain.pem",
-                    "keyFile": base + "/certs/key.pem"
-                }]
-            },
-            "wsSettings": {"path": "/xws"}
-        }
-    })
-config = {
-    "log": {"loglevel": "warning"},
-    "inbounds": inbounds,
-    "outbounds": [{"protocol": "freedom", "tag": "direct"}]
-}
-path = base + "/config.json"
-tmp = path + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(config, f, indent=2)
-os.chmod(tmp, 0o600)
-os.replace(tmp, path)
-nodes_path = base + "/data/nodes.json"
-preserved_cf_nodes = []
-if os.path.isfile(nodes_path):
-    try:
-        with open(nodes_path, "r") as f:
-            old_nodes = json.load(f)
-        if isinstance(old_nodes, list):
-            preserved_cf_nodes = [n for n in old_nodes
-                                  if isinstance(n, dict) and n.get("type") in ("vless-ws-cf-tunnel", "vless-ws-cf-tunnel-temp")]
-    except (OSError, json.JSONDecodeError):
-        pass
-nodes = list(preserved_cf_nodes)
-if private_key and public_key:
-    nodes.append({
-        "type": "vless-reality",
-        "address": ip,
-        "port": reality_port,
-        "uuid": uuid,
-        "flow": "xtls-rprx-vision",
-        "security": "reality",
-        "public_key": public_key,
-        "short_id": short_id,
-        "sni": "www.microsoft.com"
-    })
-nodes.append({
-    "type": "shadowsocks",
-    "address": ip,
-    "port": ss_port,
-    "method": "chacha20-ietf-poly1305",
-    "password": ss_password
-})
-if any(x["tag"] == "in-vless-ws-tls" for x in inbounds):
-    nodes.append({
-        "type": "vless-ws-tls",
-        "address": domain,
-        "port": tls_port,
-        "uuid": uuid,
-        "path": "/xws",
-        "sni": domain
-    })
-with open(base + "/data/nodes.json", "w") as f:
-    json.dump(nodes, f, indent=2)
-os.chmod(base + "/data/nodes.json", 0o600)
-PY
-    echo "$reality_port" > "$DATA/reality.port"
-    echo "$ss_port" > "$DATA/shadowsocks.port"
-    [[ -n "$tls_port" ]] && echo "$tls_port" > "$DATA/tls.port" || true
-}
-generate_subscription() {
-    [[ -f "$SUBJSON" ]] || {
-        warn "没有节点清单；请先执行安装。"
-        return 1
-    }
-    # 订阅刷新时以本次保存的 CF Tunnel 设置为准，防止 nodes.json 中残留旧域名/路径。
-    if [[ -f "$CF_SETTINGS" ]]; then
-        # shellcheck disable=SC1090
-        source "$CF_SETTINGS"
-        if [[ "${CF_MODE:-}" == "1" ]] &&
-           [[ -n "${CF_DOMAIN:-}" && "${CF_PORT:-}" =~ ^[0-9]+$ && -n "${CF_UUID:-}" && "${CF_PATH:-}" == /* ]]; then
-            export CF_MODE CF_DOMAIN CF_PORT CF_UUID CF_PATH
-            python3 - <<'PYCFSYNC'
-import json, os
-path = "/opt/xiazheteng-node/data/nodes.json"
-with open(path, encoding="utf-8") as f:
-    nodes = json.load(f)
-if not isinstance(nodes, list):
-    raise SystemExit("nodes.json 格式错误：预期为 JSON 数组")
-mode = os.environ["CF_MODE"]
-node_type = "vless-ws-cf-tunnel-temp"
-cf_types = {"vless-ws-cf-tunnel", "vless-ws-cf-tunnel-temp"}
-nodes = [n for n in nodes if not (isinstance(n, dict) and n.get("type") in cf_types)]
-nodes.append({
-    "type": node_type,
-    "address": os.environ["CF_DOMAIN"],
-    "port": 443,
-    "uuid": os.environ["CF_UUID"],
-    "path": os.environ["CF_PATH"],
-    "sni": os.environ["CF_DOMAIN"]
-})
-tmp = path + ".tmp"
-with open(tmp, "w", encoding="utf-8") as f:
-    json.dump(nodes, f, ensure_ascii=False, indent=2)
-os.chmod(tmp, 0o600)
-os.replace(tmp, path)
-print("已按 CF Tunnel 保存设置同步节点：域名=" + os.environ["CF_DOMAIN"] + "，路径=" + os.environ["CF_PATH"])
-PYCFSYNC
-        fi
-    fi
-    "$BIN" run -test -config "$CONF" >/dev/null 2>&1 || {
-        warn "主 Xray 配置验证失败，不生成订阅。"
-        return 1
-    }
-    if [[ -f "$CF_CONF" ]]; then
-        "$BIN" run -test -config "$CF_CONF" >/dev/null 2>&1 || {
-            warn "CF Tunnel 专用 Xray 配置验证失败，不生成订阅。"
-            return 1
-        }
-    fi
-    python3 - <<'PY'
-import base64, json, os, urllib.parse
-base = "/opt/xiazheteng-node"
-with open(base + "/data/nodes.json") as f:
-    nodes = json.load(f)
-links = []
-for n in nodes:
-    t = n["type"]
-    name = urllib.parse.quote("xiazheteng-" + t, safe="")
-    host = n["address"]
-    port = n["port"]
-    if t == "vless-reality":
-        if not n.get("public_key") or not n.get("uuid"):
-            continue
-        q = urllib.parse.urlencode({
-            "encryption": "none",
-            "security": "reality",
-            "sni": n["sni"],
-            "fp": "chrome",
-            "pbk": n["public_key"],
-            "sid": n["short_id"],
-            "type": "raw",
-            "flow": n["flow"]
-        })
-        links.append(f"vless://{n['uuid']}@{host}:{port}?{q}#{name}")
-    elif t == "shadowsocks":
-        raw = n["method"] + ":" + n["password"]
-        userinfo = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
-        links.append(f"ss://{userinfo}@{host}:{port}#{name}")
-    elif t == "vless-ws-tls":
-        q = urllib.parse.urlencode({
-            "encryption": "none",
-            "security": "tls",
-            "sni": n["sni"],
-            "type": "ws",
-            "path": n["path"],
-            "host": n["sni"]
-        })
-        links.append(f"vless://{n['uuid']}@{host}:{port}?{q}#{name}")
-    elif t in ("vless-ws-cf-tunnel", "vless-ws-cf-tunnel-temp"):
-        q = urllib.parse.urlencode({
-            "encryption": "none",
-            "security": "tls",
-            "sni": n["sni"],
-            "type": "ws",
-            "path": n["path"],
-            "host": n["sni"]
-        })
-        links.append(f"vless://{n['uuid']}@{host}:{port}?{q}#{name}")
-with open(base + "/data/subscription.txt", "w") as f:
-    f.write("\n".join(links) + ("\n" if links else ""))
-encoded = base64.b64encode("\n".join(links).encode()).decode()
-with open(base + "/data/subscription.b64", "w") as f:
-    f.write(encoded + "\n")
-os.chmod(base + "/data/subscription.txt", 0o600)
-os.chmod(base + "/data/subscription.b64", 0o600)
-print("订阅节点数量：", len(links))
-if not links:
-    raise SystemExit("错误：订阅中没有任何节点")
-PY
-    local node_count reality_count ss_count tls_count
-    node_count="$(jq 'length' "$SUBJSON")"
-    reality_count="$(jq '[.[] | select(.type == "vless-reality")] | length' "$SUBJSON")"
-    ss_count="$(jq '[.[] | select(.type == "shadowsocks")] | length' "$SUBJSON")"
-    tls_count="$(jq '[.[] | select(.type == "vless-ws-tls")] | length' "$SUBJSON")"
-    cf_count="$(jq '[.[] | select(.type == "vless-ws-cf-tunnel" or .type == "vless-ws-cf-tunnel-temp")] | length' "$SUBJSON")"
-    info "节点清单统计：总计=$node_count，REALITY=$reality_count，SS=$ss_count，TLS=$tls_count，CF Tunnel=$cf_count"
-    if [[ "$reality_count" -eq 0 ]]; then
-        warn "未生成 VLESS REALITY。请检查前面的 x25519 密钥生成/解析日志。"
-    fi
-    if [[ "${DOMAIN_OK:-0}" == 1 && "${TLS_OK:-0}" != 1 ]]; then
-        warn "域名检查通过，但 TLS 节点未生成；请查看证书申请、80 端口及证书安装日志。"
-    fi
-}
-install_subscription_server() {
-    if [[ -f "$SUB_PORT_FILE" ]]; then
-        source "$SUB_PORT_FILE"
-    fi
-    [[ "${SUB_PORT:-}" =~ ^[0-9]+$ ]] &&
-        (( SUB_PORT >= 1 && SUB_PORT <= 65535 )) ||
-        die "订阅端口未配置或无效，请先执行一键安装 / 自动修复。"
-    [[ -f "$SUB_TOKEN_FILE" ]] ||
-        openssl rand -hex 32 > "$SUB_TOKEN_FILE"
-    chmod 600 "$SUB_TOKEN_FILE"
-    local token
-    token="$(tr -d '\r\n' < "$SUB_TOKEN_FILE")"
-    [[ "$token" =~ ^[a-fA-F0-9]{64}$ ]] ||
-        die "订阅 token 格式异常。"
-    local tls_enabled=0
-    if [[ "${TLS_OK:-0}" == 1 ]] &&
-       [[ -s "$BASE/certs/fullchain.pem" ]] &&
-       [[ -s "$BASE/certs/key.pem" ]]; then
-        tls_enabled=1
-    fi
-    cat > "$SUB_SERVER" <<'PY'
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if command -v systemd-inhibit >/dev/null; then
+  systemd-inhibit --what=idle:sleep --who=xiazt --why='节点部署进行中' --mode=block sleep infinity >/dev/null 2>&1 &
+  awake_pid=$!
+fi
+setterm --blank 0 --powersave off </dev/tty 2>/dev/null || true
+if ! command -v python3 >/dev/null; then
+  apt-get update
+  apt-get install -y python3 ca-certificates
+fi
+cat >"$workdir/manager.py" <<'XIAZT_PYTHON_EOF_938715'
 #!/usr/bin/env python3
-import hmac
+"""瞎折腾：专用 3x-ui/Xray 实例，独立管理、可审计。"""
+import base64
+import concurrent.futures
+import contextlib
+import getpass
+import hashlib
+import http.cookiejar
+import ipaddress
+import json
 import os
-import ssl
+from pathlib import Path
+import re
+import secrets
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import unicodedata
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
-BASE = "/opt/xiazheteng-node"
-DATA = BASE + "/data"
-PORT = int(os.environ["SUB_PORT"])
-TOKEN_FILE = DATA + "/subscription.token"
-SUB_FILE = DATA + "/subscription.b64"
-TLS_ENABLED = os.environ.get("SUB_TLS", "0") == "1"
-CERT = BASE + "/certs/fullchain.pem"
-KEY = BASE + "/certs/key.pem"
-def read_token():
-    with open(TOKEN_FILE, "r") as f:
-        return f.read().strip()
-class Handler(BaseHTTPRequestHandler):
-    server_version = "SubscriptionService"
-    sys_version = ""
-    def log_message(self, fmt, *args):
-        print("%s - %s" % (self.client_address[0], fmt.split("%")[0]))
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path != "/sub":
-            self.send_error(404)
-            return
-        supplied = parse_qs(parsed.query).get("token", [""])[0]
-        expected = read_token()
-        if not hmac.compare_digest(supplied, expected):
-            self.send_error(403, "Invalid subscription token")
-            return
+
+ROOT = Path('/opt/xiazt')
+STATE = ROOT / 'state.json'
+NAMES = ['xiazt-panel', 'xiazt-edge', 'xiazt-cf']
+SCHEMES = ('vless://', 'vmess://', 'trojan://', 'ss://', 'ssr://',
+           'hysteria2://', 'hy2://', 'tuic://', 'hysteria://', 'wireguard://')
+MAX_BODY = 4 * 1024 * 1024
+DEFAULT_SUB_NAME = '我的订阅'
+
+
+def run(*args, capture=False, check=True):
+    p = subprocess.run(args, text=True, stdout=subprocess.PIPE if capture else None,
+                       stderr=subprocess.PIPE if capture else None)
+    if check and p.returncode:
+        # Do not print argv: CLI arguments may contain passwords/tokens.
+        raise RuntimeError(f'{args[0]} 执行失败（退出码 {p.returncode}），请检查服务日志')
+    return p.stdout.strip() if capture else p.returncode
+
+
+def write(path, data, mode=0o600):
+    path = Path(path)
+    tmp = path.with_name(path.name + '.' + secrets.token_hex(6) + '.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def save(c):
+    write(STATE, json.dumps(c, ensure_ascii=False, indent=2))
+
+
+def load():
+    return json.loads(STATE.read_text(encoding='utf-8'))
+
+
+def request(url, data=None, headers=None, method=None, opener=None):
+    body = json.dumps(data).encode() if data is not None else None
+    h = {'User-Agent': 'xiazt/1.0', **(headers or {})}
+    if body is not None:
+        h['Content-Type'] = 'application/json'
+    req = urllib.request.Request(url, body, h, method=method)
+    with (opener or urllib.request.build_opener()).open(req, timeout=25) as r:
+        raw = r.read(MAX_BODY + 1)
+        if len(raw) > MAX_BODY:
+            raise ValueError('响应超过 4 MiB')
+        return json.loads(raw)
+
+
+def ask(prompt, default=''):
+    return input(prompt).strip() or default
+
+
+def domain(value):
+    value = value.lower().rstrip('.')
+    if len(value) > 253 or not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}', value):
+        raise ValueError('请输入纯域名，不带 https://、端口或路径；中文域名请用 punycode')
+    return value
+
+
+def public_ip(value):
+    ip = ipaddress.ip_address(value)
+    if not ip.is_global:
+        raise ValueError('需要公网 IPv4/IPv6 地址')
+    return str(ip)
+
+
+def port_free(port):
+    for family, address in [(socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')]:
+        with socket.socket(family) as s:
+            try:
+                # Reinstallation must tolerate recently closed TCP connections.
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6:
+                    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                s.bind((address, port))
+            except OSError as e:
+                if e.errno not in (97, 99):
+                    return False
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         try:
-            with open(SUB_FILE, "rb") as f:
-                body = f.read().strip() + b"\n"
+            s.bind(('0.0.0.0', port))
         except OSError:
-            self.send_error(503, "Subscription not ready")
+            return False
+    return True
+
+
+def choose_port(preferred):
+    for p in [preferred] + [secrets.randbelow(30000) + 20000 for _ in range(100)]:
+        if port_free(p):
+            return p
+    raise RuntimeError('找不到空闲 TCP 端口')
+
+
+def image(ref):
+    run('docker', 'pull', '--quiet', ref)
+    digests = json.loads(run('docker', 'image', 'inspect', ref,
+                             '--format', '{{json .RepoDigests}}', capture=True))
+    if not digests:
+        raise RuntimeError('镜像缺少摘要，拒绝启动未锁定镜像')
+    return digests[0]
+
+
+def container(name, img, *args, entrypoint=None, volumes=(), env=()):
+    cmd = ['docker', 'run', '-d', '--name', name, '--network', 'host',
+           '--restart', 'unless-stopped', '--label', 'io.xiazt.owner=1',
+           '--log-opt', 'max-size=10m', '--log-opt', 'max-file=2']
+    for host, guest in volumes:
+        cmd += ['-v', f'{host}:{guest}']
+    for v in env:
+        cmd += ['-e', v]
+    if entrypoint:
+        cmd += ['--entrypoint', entrypoint]
+    run(*cmd, img, *args, capture=True)
+
+
+def owned(name):
+    return run('docker', 'inspect', '--format',
+               '{{index .Config.Labels "io.xiazt.owner"}}', name,
+               capture=True, check=False) == '1'
+
+
+def panel_cli(c, *args):
+    return run('docker', 'run', '--rm', '--network', 'none',
+               '-v', f'{ROOT}/db:/etc/x-ui', '--entrypoint', '/app/x-ui',
+               c['panel_image'], 'setting', *args, capture=True)
+
+
+class Panel:
+    def __init__(self, c):
+        self.c = c
+        self.base = f"http://127.0.0.1:{c['panel_port']}{c['panel_path']}"
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.csrf = ''
+
+    def call(self, path, data=None):
+        headers = {'X-CSRF-Token': self.csrf} if self.csrf else {}
+        obj = request(self.base + path, data, headers=headers, opener=self.opener)
+        if not obj.get('success'):
+            raise RuntimeError('3x-ui API 拒绝请求：' + str(obj.get('msg', '未知错误')))
+        return obj.get('obj')
+
+    def login(self):
+        self.csrf = self.call('csrf-token')
+        self.call('login', {'username': self.c['username'], 'password': self.c['password']})
+        self.csrf = self.call('csrf-token')
+
+    def wait(self):
+        for _ in range(60):
+            try:
+                self.login()
+                return
+            except (OSError, ValueError, RuntimeError):
+                time.sleep(1)
+        raise RuntimeError('3x-ui 登录失败；状态已保留，运行 x 查看日志/继续配置')
+
+
+def cf(c, path, data=None, method=None):
+    obj = request('https://api.cloudflare.com/client/v4' + path, data,
+                  {'Authorization': 'Bearer ' + c['cf_api_token']}, method)
+    if not obj.get('success'):
+        raise RuntimeError('Cloudflare API 失败：' + str(obj.get('errors', [])))
+    return obj.get('result')
+
+
+def setup_cf(c):
+    host = c['cf_hostname']
+    parts = host.split('.')
+    zone = None
+    for i in range(len(parts) - 1):
+        zones = cf(c, '/zones?name=' + '.'.join(parts[i:]))
+        if zones:
+            zone = zones[0]['id']
+            break
+    if not zone:
+        raise RuntimeError('找不到该域名的 Cloudflare Zone，检查 API Token 的 Zone Read 权限')
+    c['cf_zone'] = zone
+    existing = cf(c, f'/zones/{zone}/dns_records?name={host}')
+    if existing and not (c.get('cf_dns_id') and existing[0]['id'] == c['cf_dns_id']):
+        raise RuntimeError('固定隧道域名已有 DNS 记录；请换一个空闲子域名，脚本不会覆盖现有记录')
+    account = c['cf_account']
+    if not c.get('cf_tunnel_id'):
+        tunnel = cf(c, f'/accounts/{account}/cfd_tunnel',
+                    {'name': 'xiazt-' + secrets.token_hex(5), 'config_src': 'cloudflare'})
+        c['cf_tunnel_id'] = tunnel['id']
+        save(c)  # record ownership before the next external mutation
+    tid = c['cf_tunnel_id']
+    cf(c, f'/accounts/{account}/cfd_tunnel/{tid}/configurations', {'config': {'ingress': [
+        {'hostname': host, 'service': f"http://127.0.0.1:{c['edge_port']}"},
+        {'service': 'http_status:404'}]}}, 'PUT')
+    if not c.get('cf_dns_id'):
+        record = cf(c, f'/zones/{zone}/dns_records', {'type': 'CNAME', 'name': host,
+                    'content': tid + '.cfargotunnel.com', 'proxied': True, 'ttl': 1})
+        c['cf_dns_id'] = record['id']
+        save(c)
+    token = cf(c, f'/accounts/{account}/cfd_tunnel/{tid}/token')
+    # The image runs as non-root; host parent directory remains root-only (0700).
+    write(ROOT / 'cf-token', token, 0o644)
+
+
+def setup_nodes(c):
+    api = Panel(c)
+    api.wait()
+    existing = {i['remark'] for i in api.call('panel/api/inbounds/list')}
+    def add(name, port, protocol, settings, stream, listen='127.0.0.1'):
+        if name in existing:
             return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(body)
-    def do_HEAD(self):
-        self.send_error(405)
-class Server(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-server = Server(("0.0.0.0", PORT), Handler)
-if TLS_ENABLED:
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(CERT, KEY)
-    server.socket = ctx.wrap_socket(server.socket, server_side=True)
-server.serve_forever()
-PY
-    chmod 700 "$SUB_SERVER"
-    cat > "$SUB_UNIT" <<EOF
-[Unit]
-Description=Xia Zhe Teng Online Subscription Service
-After=network-online.target
+        api.call('panel/api/inbounds/add', {'remark': name, 'enable': True,
+                 'listen': listen, 'port': port, 'protocol': protocol,
+                 'settings': json.dumps(settings), 'streamSettings': json.dumps(stream),
+                 'sniffing': json.dumps({'enabled': True, 'destOverride': ['http', 'tls']}),
+                 'allocate': json.dumps({'strategy': 'always', 'refresh': 5, 'concurrency': 3})})
+    for proto in ('vless', 'vmess', 'trojan'):
+        client = {'id': c['uuid'], 'email': 'xiazt-' + proto, 'enable': True,
+                  'subId': c['sub_token'], 'totalGB': 0, 'expiryTime': 0,
+                  'limitIp': 0, 'reset': 0}
+        if proto == 'trojan':
+            client['password'] = c['node_password']
+        if proto == 'vmess':
+            client['alterId'] = 0
+        settings = {'clients': [client]}
+        if proto == 'vless':
+            settings['decryption'] = 'none'
+        add('xiazt-' + proto + '-ws', c[proto + '_port'], proto, settings,
+            {'network': 'ws', 'security': 'none',
+             'wsSettings': {'path': c['ws_prefix'] + '/' + proto, 'headers': {}}})
+    add('xiazt-reality', c['reality_port'], 'vless',
+        {'clients': [{'id': c['uuid'], 'email': 'xiazt-reality', 'enable': True,
+                      'flow': 'xtls-rprx-vision', 'subId': c['sub_token']}], 'decryption': 'none'},
+        {'network': 'tcp', 'security': 'reality', 'realitySettings': {
+            'show': False, 'target': c['sni'] + ':443', 'dest': c['sni'] + ':443',
+            'xver': 0, 'serverNames': [c['sni']], 'privateKey': c['private_key'],
+            'shortIds': [c['short_id']], 'settings': {'publicKey': c['public_key'],
+            'fingerprint': 'chrome', 'serverName': c['sni'], 'spiderX': '/'}}}, listen='::' if ':' in c['ip'] else '0.0.0.0')
+    add('xiazt-shadowsocks', c['ss_port'], 'shadowsocks',
+        {'method': 'chacha20-ietf-poly1305', 'password': c['node_password'],
+         'network': 'tcp,udp'}, {'network': 'tcp', 'security': 'none'}, listen='::' if ':' in c['ip'] else '0.0.0.0')
+    run('docker', 'restart', 'xiazt-panel', capture=True)
+    api.wait()
+    # API acceptance alone is insufficient: check actual listeners after core restart.
+    for p in [c[k + '_port'] for k in ('vless', 'vmess', 'trojan', 'reality', 'ss')]:
+        for _ in range(30):
+            try:
+                with socket.create_connection(('127.0.0.1', p), timeout=1):
+                    break
+            except OSError:
+                time.sleep(1)
+        else:
+            raise RuntimeError(f'Xray 未监听 {p}；不能报告部署成功。运行 x 查看日志')
+
+
+def b64(s):
+    return base64.b64encode(s.encode()).decode()
+
+
+def subscription_name(value):
+    if not isinstance(value, str) or any(unicodedata.category(ch).startswith('C') for ch in value):
+        raise ValueError('订阅名称不能包含控制字符')
+    value = value.strip()
+    if not value or len(value) > 48:
+        raise ValueError('订阅名称需为 1–48 个字符')
+    return value
+
+
+def link(scheme, user, host, port, query, name):
+    host = '[' + host + ']' if ':' in host else host
+    return f'{scheme}://{urllib.parse.quote(user, safe="")}@{host}:{port}?' + urllib.parse.urlencode(query) + '#' + urllib.parse.quote(name)
+
+
+def quick_host():
+    # cloudflared logs to stderr; gather both streams without leaking them.
+    started = run('docker', 'inspect', '--format', '{{.State.StartedAt}}', 'xiazt-cf', capture=True, check=False)
+    if not started:
+        return ''
+    p = subprocess.run(['docker', 'logs', '--since', started, '--tail', '200', 'xiazt-cf'], capture_output=True, text=True)
+    matches = re.findall(r'https://([a-z0-9-]+\.trycloudflare\.com)', p.stdout + p.stderr)
+    return matches[-1] if matches else ''
+
+
+def endpoints(c):
+    result = []
+    if c['domain']:
+        result.append(c['domain'])
+    if c['tunnel'] == 'fixed':
+        result.append(c['cf_hostname'])
+    elif c['tunnel'] == 'quick':
+        host = quick_host()
+        if host:
+            result.append(host)
+    return list(dict.fromkeys(result))
+
+
+def node_links(c, name=None):
+    name = subscription_name(c.get('subscription_name', DEFAULT_SUB_NAME) if name is None else name)
+    links = [link('vless', c['uuid'], c['ip'], c['reality_port'],
+                  {'encryption': 'none', 'security': 'reality', 'sni': c['sni'],
+                   'fp': 'chrome', 'pbk': c['public_key'], 'sid': c['short_id'],
+                   'type': 'tcp', 'flow': 'xtls-rprx-vision'}, name + '-REALITY')]
+    host = '[' + c['ip'] + ']' if ':' in c['ip'] else c['ip']
+    links.append('ss://' + b64('chacha20-ietf-poly1305:' + c['node_password']) +
+                 f"@{host}:{c['ss_port']}#" + urllib.parse.quote(name + '-SS'))
+    for host in endpoints(c):
+        for proto in ('vless', 'trojan'):
+            q = {'security': 'tls', 'sni': host, 'type': 'ws', 'host': host,
+                 'path': c['ws_prefix'] + '/' + proto}
+            if proto == 'vless':
+                q['encryption'] = 'none'
+            links.append(link(proto, c['uuid'] if proto == 'vless' else c['node_password'],
+                              host, 443, q, name + '-' + proto + '-' + host))
+        links.append('vmess://' + b64(json.dumps({'v': '2', 'ps': name + '-vmess-' + host,
+            'add': host, 'port': '443', 'id': c['uuid'], 'aid': '0', 'scy': 'auto',
+            'net': 'ws', 'type': 'none', 'host': host, 'path': c['ws_prefix'] + '/vmess',
+            'tls': 'tls', 'sni': host}, ensure_ascii=False)))
+    return links
+
+
+def subscription_response(c, query, merged):
+    names = query.get('name', [c.get('subscription_name', DEFAULT_SUB_NAME)])
+    if len(names) != 1:
+        raise ValueError('订阅名称只能指定一次')
+    name = subscription_name(names[0])
+    lines = list(dict.fromkeys(node_links(c, name) + merged))
+    raw = '\n'.join(lines)
+    body = (raw if query.get('format') == ['raw'] else b64(raw)).encode()
+    headers = {'Profile-Title': 'base64:' + b64(name),
+               'Content-Disposition': "inline; filename*=UTF-8''" + urllib.parse.quote(name + '.txt', safe='')}
+    return body, headers
+
+
+def parse_subscription(raw):
+    text = raw.decode('utf-8-sig').strip()
+    if not text:
+        raise ValueError('空订阅')
+    if not text.startswith(SCHEMES):
+        try:
+            text = base64.b64decode(re.sub(r'\s', '', text) + '===', altchars=b'-_', validate=False).decode().strip()
+        except (ValueError, UnicodeError):
+            raise ValueError('仅支持 URI 列表/Base64 订阅，不支持 Clash YAML 或 JSON')
+    lines = [s.strip() for s in text.splitlines() if s.strip()]
+    if not lines or any(not s.startswith(SCHEMES) for s in lines):
+        raise ValueError('订阅含不支持的格式')
+    return list(dict.fromkeys(lines))
+
+
+class PublicHTTPS(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_source(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def validate_source(url):
+    u = urllib.parse.urlsplit(url)
+    if u.scheme != 'https' or not u.hostname or u.username or u.password or u.port not in (None, 443):
+        raise ValueError('外部订阅必须是公网 HTTPS URL（443）')
+    addresses = socket.getaddrinfo(u.hostname, 443, type=socket.SOCK_STREAM)
+    if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
+        raise ValueError('不接受内网/本机订阅地址')
+
+
+def fetch_source(url):
+    validate_source(url)
+    opener = urllib.request.build_opener(PublicHTTPS())
+    with opener.open(urllib.request.Request(url, headers={'User-Agent': 'v2rayN/xiazt'}), timeout=15) as r:
+        raw = r.read(MAX_BODY + 1)
+    if len(raw) > MAX_BODY:
+        raise ValueError('外部订阅超过 4 MiB')
+    return parse_subscription(raw)
+
+
+def refresh_sources(c):
+    cache = {}
+    path = ROOT / 'cache.json'
+    if path.exists():
+        cache = json.loads(path.read_text())
+    def fetch(url):
+        try:
+            return url, fetch_source(url), True
+        except Exception:
+            # Never log subscription URLs: query strings are credentials.
+            print('某个外部订阅刷新失败，沿用上次成功缓存', flush=True)
+            return url, cache.get(url, {}).get('links', []), False
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        for url, links, ok in pool.map(fetch, c.get('sources', [])):
+            old = cache.get(url, {})
+            cache[url] = {'links': links, 'updated': int(time.time()) if ok else old.get('updated', 0)}
+    cache = {u: cache[u] for u in c.get('sources', []) if u in cache}
+    write(path, json.dumps(cache))
+    return [v for obj in cache.values() for v in obj['links']]
+
+
+def serve():
+    merged = []
+    lock = threading.Lock()
+    def worker():
+        nonlocal merged
+        while True:
+            try:
+                result = refresh_sources(load())
+                with lock:
+                    merged = result
+            except Exception:
+                print('订阅缓存刷新失败', flush=True)
+            time.sleep(300)
+    threading.Thread(target=worker, daemon=True).start()
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass  # prevent secret-bearing URLs appearing in logs
+        def do_GET(self):
+            c = load()
+            path = urllib.parse.urlsplit(self.path).path
+            extra_headers = {}
+            if path == '/health':
+                body = b'ok'
+            elif secrets.compare_digest(path, '/sub/' + c['sub_token']):
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
+                try:
+                    with lock:
+                        body, extra_headers = subscription_response(c, query, merged)
+                except ValueError:
+                    self.send_error(400, 'Invalid subscription name')
+                    return
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            for key, value in extra_headers.items():
+                self.send_header(key, value)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    server = ThreadingHTTPServer(('127.0.0.1', load()['sub_port']), Handler)
+    server.daemon_threads = True
+    server.serve_forever()
+
+
+def caddy_config(c):
+    routes = ''
+    for proto in ('vless', 'vmess', 'trojan'):
+        routes += f"    handle {c['ws_prefix']}/{proto} {{\n        reverse_proxy 127.0.0.1:{c[proto + '_port']}\n    }}\n"
+    routes += f"    handle /sub/* {{\n        reverse_proxy 127.0.0.1:{c['sub_port']}\n    }}\n    handle /health {{\n        respond ok\n    }}\n    handle {{\n        respond 404\n    }}\n"
+    config = '{\n    admin off\n'
+    if not c.get('http_challenge', True):
+        config += '    auto_https disable_redirects\n'
+    config += '}\n'
+    # A site hostname matches the HTTP Host; it does not restrict the bind address.
+    # CF forwards the public hostname, so accept any Host but bind loopback only.
+    config += f"http://:{c['edge_port']} {{\n    bind 127.0.0.1\n" + routes + '}\n'
+    if c['domain']:
+        tls = '' if c.get('http_challenge', True) else '    tls {\n        issuer acme {\n            disable_http_challenge\n        }\n    }\n'
+        config += c['domain'] + ' {\n' + tls + routes + '}\n'
+    return config
+
+
+def install_services(c):
+    write(ROOT / 'Caddyfile', caddy_config(c), 0o644)
+    if not owned('xiazt-edge'):
+        container('xiazt-edge', c['edge_image'], 'caddy', 'run', '--config', '/etc/caddy/Caddyfile',
+                  volumes=[(ROOT / 'Caddyfile', '/etc/caddy/Caddyfile:ro'),
+                           (ROOT / 'caddy-data', '/data'), (ROOT / 'caddy-config', '/config')])
+    else:
+        run('docker', 'restart', 'xiazt-edge', capture=True)
+    write('/etc/systemd/system/xiazt-sub.service', '''[Unit]
+Description=Xiazt subscription service
+After=network-online.target docker.service
 Wants=network-online.target
 [Service]
-Type=simple
-Environment=SUB_PORT=$SUB_PORT
-Environment=SUB_TLS=$tls_enabled
-ExecStart=/usr/bin/python3 $SUB_SERVER
-WorkingDirectory=$BASE
+ExecStart=/usr/bin/python3 /opt/xiazt/manager.py serve
 Restart=on-failure
-RestartSec=3
+RestartSec=5
 UMask=0077
 NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/xiazt
+ProtectHome=true
 PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
-EOF
-    chmod 644 "$SUB_UNIT"
-    systemctl daemon-reload
-    systemctl enable "$SUB_SERVICE"
-    systemctl restart "$SUB_SERVICE"
-    sleep 1
-    systemctl is-active --quiet "$SUB_SERVICE" ||
-        die "在线订阅服务未能启动，请检查 journalctl -u $SUB_SERVICE。"
-    SUB_SCHEME="http"
-    if [[ "$tls_enabled" == 1 ]]; then
-        SUB_SCHEME="https"
-    fi
-    if [[ "$SUB_SCHEME" == "https" && -n "${DOMAIN:-}" ]]; then
-        SUB_HOST="$DOMAIN"
-    else
-        PUBLIC_IP="${PUBLIC_IP:-}"
-        if [[ -z "$PUBLIC_IP" ]]; then
-            PUBLIC_IP="$(curl -4fsS \
-                --connect-timeout 3 \
-                --max-time 8 \
-                https://api.ipify.org 2>/dev/null || true)"
-        fi
-        if [[ -z "$PUBLIC_IP" ]]; then
-            die "无法获取公网 IPv4，订阅链接生成失败。请检查网络或手动配置 PUBLIC_IP。"
-        fi
-        SUB_HOST="$PUBLIC_IP"
-    fi
-    if { [[ "$SUB_SCHEME" == "https" && "$SUB_PORT" == 443 ]] ||
-         [[ "$SUB_SCHEME" == "http" && "$SUB_PORT" == 80 ]]; }; then
-        SUB_URL="$SUB_SCHEME://$SUB_HOST/sub?token=$token"
-    else
-        SUB_URL="$SUB_SCHEME://$SUB_HOST:$SUB_PORT/sub?token=$token"
-    fi
-    printf '%s\n' "$SUB_URL" > "$SUB_URL_FILE"
-    chmod 600 "$SUB_URL_FILE"
-    local local_url
-    local_url="$SUB_SCHEME://127.0.0.1:$SUB_PORT/sub?token=$token"
-    if [[ "$SUB_SCHEME" == "https" ]]; then
-        curl -kfsS --connect-timeout 3 --max-time 8 \
-            "$local_url" -o "$DATA/subscription-check.tmp" ||
-            die "在线 HTTPS 订阅接口本机验证失败。"
-    else
-        curl -fsS --connect-timeout 3 --max-time 8 \
-            "$local_url" -o "$DATA/subscription-check.tmp" ||
-            die "在线 HTTP 订阅接口本机验证失败。"
-    fi
-    [[ -s "$DATA/subscription-check.tmp" ]] ||
-        die "订阅接口返回内容为空。"
-    rm -f "$DATA/subscription-check.tmp"
-    info "在线订阅服务启动并通过本机 HTTP 检查。"
-}
-show_subscription_url() {
-    if [[ -s "$SUB_URL_FILE" ]]; then
-        echo
-        echo "============== 在线订阅链接 =============="
-        cat "$SUB_URL_FILE"
-        echo
-        echo "订阅服务：$(systemctl is-active "$SUB_SERVICE" 2>/dev/null || true)"
-        echo "订阅端口：${SUB_PORT:-未知}"
-        echo "本机接口检查：通过"
-        echo "=========================================="
-        echo "注意：本机检查不等于外网可达性检查。"
-        echo "请确认 VPS 安全组及防火墙已放行订阅端口。"
-        echo
-    fi
-}
-install_service() {
-    if [[ -e "$UNIT" ]]; then
-        local backup answer managed=0 unit_text=""
-        backup="${UNIT}.backup.$(date +%Y%m%d-%H%M%S)"
-        unit_text="$(cat "$UNIT" 2>/dev/null || true)"
-        # Recognize this manager's prior unit even if an older version omitted its marker.
-        if grep -Fq "Managed by xiazheteng-node-manager" <<< "$unit_text" ||
-           grep -Fq "ExecStart=$BIN run -config $CONF" <<< "$unit_text" ||
-           grep -Fq "Description=Xia Zhe Teng Independent Xray Service" <<< "$unit_text"; then
-            managed=1
-        fi
-        if [[ "$managed" == 1 ]]; then
-            cp -a "$UNIT" "$backup"
-            info "识别到本脚本此前创建的 Xray 服务，已备份旧配置：$backup；继续更新。"
-        else
-            echo "发现同名 systemd 服务文件，无法确认是否由本脚本创建：$UNIT"
-            echo "为避免覆盖其他程序，必须明确确认；原文件会先备份。"
-            read -r -p "确认备份并覆盖该服务文件？[y/N]：" answer || answer=""
-            case "${answer,,}" in
-                y|yes)
-                    cp -a "$UNIT" "$backup"
-                    warn "原服务文件已备份至：$backup"
-                    ;;
-                *) die "用户取消覆盖。原服务文件未修改；请确认归属后重新部署。" ;;
-            esac
-        fi
-    fi
-    cat > "$UNIT" <<EOF
-[Unit]
-Description=Xia Zhe Teng Independent Xray Service
-# Managed by xiazheteng-node-manager
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=simple
-User=root
-ExecStart=$BIN run -config $CONF
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=1048576
-NoNewPrivileges=true
-PrivateTmp=true
-[Install]
-WantedBy=multi-user.target
-EOF
-    chmod 644 "$UNIT"
-    systemctl daemon-reload
-    "$BIN" run -test -config "$CONF" ||
-        die "Xray 配置校验失败，拒绝启动。"
-    systemctl enable "$SERVICE"
-    systemctl restart "$SERVICE"
-    sleep 2
-    systemctl is-active --quiet "$SERVICE" ||
-        die "Xray 服务未能启动，请检查 journalctl -u $SERVICE。"
-    info "独立 Xray 服务启动成功。"
-}
-report_firewall() {
-    local p
-    for p in "$@"; do
-        if command -v ufw >/dev/null 2>&1 &&
-           ufw status 2>/dev/null | grep -qi active; then
-            warn "检测到 UFW 已启用。请确认 TCP/UDP $p 已放行；脚本不会重置防火墙。"
-        fi
-    done
-    if command -v firewall-cmd >/dev/null 2>&1 &&
-       firewall-cmd --state >/dev/null 2>&1; then
-        warn "检测到 firewalld。请确认相应端口已放行；脚本不会重置防火墙。"
-    fi
-    warn "VPS 服务商安全组不一定可自动检测，请确认公网端口已放行。"
-}
-modify_domain_and_redeploy() {
-    need_root
-    local current_domain new_domain answer
-    current_domain="${DOMAIN:-}"
-    if [[ -f "$ENVFILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$ENVFILE"
-        current_domain="${DOMAIN:-$current_domain}"
-    fi
-    echo "当前保存的域名：${current_domain:-（无）}"
-    read -r -p "请输入新的域名（留空表示无域名模式）：" new_domain
-    new_domain="${new_domain,,}"
-    new_domain="${new_domain%.}"
-    read -r -p "保存新配置并重新部署？[y/N]：" answer
-    case "${answer,,}" in
-        y|yes)
-            mkdir -p "$BASE"
-            printf 'DOMAIN=%q\n' "$new_domain" > "$ENVFILE"
-            chmod 600 "$ENVFILE"
-            DOMAIN="$new_domain"
-            info "已更新域名配置，开始重新部署。"
-            do_install
-            ;;
-        *) echo "已取消，原配置保持不变。" ;;
-    esac
-}
+''', 0o644)
+    run('systemctl', 'daemon-reload')
+    run('systemctl', 'enable', '--now', 'xiazt-sub.service')
+    if owned('xiazt-cf'):
+        run('docker', 'restart', 'xiazt-cf', capture=True)
+    elif c['tunnel'] == 'fixed':
+        setup_cf(c)
+        container('xiazt-cf', c['cf_image'], 'tunnel', '--no-autoupdate', 'run',
+                  '--token-file', '/run/cf-token', volumes=[(ROOT / 'cf-token', '/run/cf-token:ro')])
+    elif c['tunnel'] == 'quick':
+        container('xiazt-cf', c['cf_image'], 'tunnel', '--no-autoupdate', '--url',
+                  f"http://127.0.0.1:{c['edge_port']}")
 
-do_install() {
-    detect_os
-    install_dependencies
-    detect_public_ipv4
-    inspect_existing_services
-    mkdir -p "$BASE" "$DATA" "$BASE/bin"
-    chmod 700 "$BASE" "$DATA"
-    if [[ -f "$ENVFILE" ]]; then
-        source "$ENVFILE"
-        info "读取已有安装配置。"
-    else
-        read -r -p "请输入已经解析到本 VPS 的域名（没有域名直接回车）：" DOMAIN
-        DOMAIN="${DOMAIN,,}"
-        DOMAIN="${DOMAIN%.}"
-        printf 'DOMAIN=%q\n' "$DOMAIN" > "$ENVFILE"
-        chmod 600 "$ENVFILE"
-    fi
-    DOMAIN="${DOMAIN:-}"
-    check_domain
-    install_xray
-    obtain_tls_certificate
-    setup_subscription_port
-    export BASE
-    rm -f "$DATA/tls.port" "$DATA/reality.port" "$DATA/shadowsocks.port"
-    generate_configuration
-    generate_subscription
-    install_service
-    install_subscription_server
-    "$BIN" run -test -config "$CONF" >/dev/null || die "安装后检查失败：Xray 配置验证未通过。"
-    systemctl is-active --quiet "$SERVICE" || die "安装后检查失败：Xray 服务未运行。"
-    [[ -s "$SUBFILE" ]] || die "安装后检查失败：订阅文件为空。"
-    info "安装后检查通过：Xray 配置有效、服务运行中、订阅文件非空。"
-    local ports=()
-    [[ -f "$DATA/reality.port" ]] && ports+=("$(cat "$DATA/reality.port")")
-    [[ -f "$DATA/shadowsocks.port" ]] && ports+=("$(cat "$DATA/shadowsocks.port")")
-    [[ -f "$DATA/tls.port" ]] && ports+=("$(cat "$DATA/tls.port")")
-    [[ -n "${SUB_PORT:-}" ]] && ports+=("$SUB_PORT")
-    report_firewall "${ports[@]}"
-    echo
-    echo "================ 安装结果 ================"
-    systemctl --no-pager --full status "$SERVICE" || true
-    echo
-    show_subscription_url
-    echo "节点文件：$SUBFILE"
-    echo "日志文件：$LOG"
-    echo "==========================================="
-}
-install_cloudflared() {
-    if [[ -x "$CLOUDFLARED_BIN" ]] && "$CLOUDFLARED_BIN" --version >/dev/null 2>&1; then
-        info "检测到 cloudflared：$($CLOUDFLARED_BIN --version 2>/dev/null | head -n 1)"
-        return 0
-    fi
-    local asset tmp
-    case "$(uname -m)" in
-        x86_64|amd64) asset="cloudflared-linux-amd64" ;;
-        aarch64|arm64) asset="cloudflared-linux-arm64" ;;
-        *) die "当前 CPU 架构不支持自动安装 cloudflared：$(uname -m)" ;;
-    esac
-    tmp="$(mktemp)"
-    info "正在下载 cloudflared。"
-    if ! curl -fL --retry 3 --connect-timeout 10 --max-time 180 \
-        "https://github.com/cloudflare/cloudflared/releases/latest/download/$asset" -o "$tmp"; then
-        rm -f "$tmp"
-        die "cloudflared 下载失败。"
-    fi
-    install -m 0755 "$tmp" "$CLOUDFLARED_BIN"
-    rm -f "$tmp"
-    "$CLOUDFLARED_BIN" --version >/dev/null 2>&1 || die "cloudflared 安装后无法执行。"
-    info "cloudflared 安装完成。"
-}
-cf_tunnel_status() {
-    echo
-    echo "============== Cloudflare 临时隧道状态 =============="
-    echo "CF Xray 服务：$(systemctl is-active "$CF_SERVICE" 2>/dev/null || true)"
-    echo "临时隧道服务：$(systemctl is-active "$CF_TEMP_SERVICE" 2>/dev/null || true)"
-    echo "固定隧道服务（已弃用，应该停止）：$(systemctl is-active "$CF_TUNNEL_SERVICE" 2>/dev/null || true)"
-    if [[ -f "$CF_SETTINGS" ]]; then
-        # shellcheck disable=SC1090
-        source "$CF_SETTINGS"
-        echo "保存的临时域名：${CF_DOMAIN:-未知}"
-        echo "本机 WebSocket 端口：${CF_PORT:-未知}"
-        echo "WebSocket 路径：${CF_PATH:-未知}"
-        echo "VLESS UUID：${CF_UUID:-未知}"
-    fi
-    if [[ -f "$CF_TEMP_LOG" ]]; then
-        local temp_domain
-        temp_domain="$(grep -Eo 'https://[[:alnum:]-]+\.trycloudflare\.com' "$CF_TEMP_LOG" 2>/dev/null | tail -n 1 | sed 's#^https://##' || true)"
-        echo "日志中的临时域名：${temp_domain:-尚未获取}"
-    fi
-    echo "订阅中的 CF 临时节点：$(jq '[.[] | select(.type == "vless-ws-cf-tunnel-temp")] | length' "$SUBJSON" 2>/dev/null || echo 0)"
-    echo "====================================================="
-}
 
-cf_tunnel_deploy() {
-    need_root
-    detect_os
-    install_dependencies
-    mkdir -p "$BASE" "$DATA" "$BASE/bin"
-    chmod 700 "$BASE" "$DATA" "$BASE/bin"
-    install_xray
-    install_cloudflared
+def verify_public(c):
+    hosts = []
+    for _ in range(90):
+        hosts = endpoints(c)
+        if hosts:
+            break
+        time.sleep(1)
+    results = {}
+    for host in hosts:
+        ok = False
+        for _ in range(30):
+            try:
+                # Verify TLS and actual subscription, not just a listening socket.
+                req = urllib.request.Request(f"https://{host}/sub/{c['sub_token']}",
+                                             headers={'User-Agent': 'v2rayN/xiazt'})
+                with urllib.request.urlopen(req, timeout=6) as r:
+                    parsed = parse_subscription(r.read(MAX_BODY))
+                    ok = len(parsed) >= 5
+                if ok:
+                    break
+            except Exception:
+                time.sleep(2)
+        results[host] = ok
+    c['public_checks'] = results
+    save(c)
+    if not hosts or not all(results.values()):
+        print('公网订阅未验证通过：检查 DNS、80/443、安全组及 CF 日志。未标记部署成功。')
+        return False
+    return True
 
-    local cf_domain="" cf_path="/cfws" cf_port="" cf_uuid="" input_path="" temp_domain=""
-    local settings_tmp node_type
 
-    echo
-    echo "Cloudflare Tunnel：仅使用临时隧道（Quick Tunnel）"
-    echo "Cloudflare 会自动分配 trycloudflare.com 域名；重新创建隧道时域名可能变化。"
+def show(c):
+    print('订阅名称：' + c.get('subscription_name', DEFAULT_SUB_NAME))
+    print('\n后台通过 SSH 转发访问：')
+    sshhost = '[' + c['ip'] + ']' if ':' in c['ip'] else c['ip']
+    print(f"ssh -N -L {c['panel_port']}:127.0.0.1:{c['panel_port']} root@{sshhost}")
+    print(f"后台：http://127.0.0.1:{c['panel_port']}{c['panel_path']}")
+    print('账号：' + c['username'] + '\n密码：' + c['password'])
+    for host in endpoints(c):
+        print(f"订阅：https://{host}/sub/{c['sub_token']}")
+    print(f"需放行：TCP {c['reality_port']}；TCP/UDP {c['ss_port']}" +
+          (('；TCP 80/443' if c.get('http_challenge', True) else '；TCP 443') + '（域名直连）' if c['domain'] else ''))
+    print('WS 端口、后台、订阅源站只监听本机；不自动改动你的防火墙或云安全组。')
+    if c['tunnel'] == 'quick':
+        print('临时隧道重启会换域名：运行 x 查看新订阅。节点订阅内容会自动使用当前域名。')
+    print('快捷管理：x；凭据保存：/opt/xiazt/state.json（root 专用）')
 
-    if [[ -f "$CF_SETTINGS" ]]; then
-        # shellcheck disable=SC1090
-        source "$CF_SETTINGS"
-        cf_port="${CF_PORT:-}"
-        cf_uuid="${CF_UUID:-}"
-        cf_path="${CF_PATH:-/cfws}"
-    fi
 
-    read -r -p "WebSocket 路径 [$cf_path]：" input_path
-    cf_path="${input_path:-$cf_path}"
-    [[ "$cf_path" == /* && "$cf_path" != *' '* && "$cf_path" != *'?'* && "$cf_path" != *'#'* ]] || die "WebSocket 路径必须以 / 开头，且不能包含空格、? 或 #。"
+def install():
+    # First installation prompt, as requested.
+    host = ask('输入已解析的域名（没有就回车跳过）：')
+    if host:
+        host = domain(host)
+    if STATE.exists():
+        raise RuntimeError('已有专用实例，请使用 x 管理或先卸载；拒绝覆盖现有凭据')
+    if ROOT.exists() and any(ROOT.iterdir()):
+        raise RuntimeError('/opt/xiazt 已存在且非空，拒绝覆盖')
+    if Path('/usr/local/bin/x').exists():
+        raise RuntimeError('/usr/local/bin/x 已存在，拒绝覆盖已有快捷命令')
+    for n in NAMES:
+        if shutil.which('docker') and run('docker', 'inspect', '--format', '{{.Id}}', n, capture=True, check=False):
+            raise RuntimeError(f'容器名 {n} 已存在，拒绝覆盖')
+    tunnel = ask('CF 隧道：0 不使用 / 1 临时 / 2 固定 [' + ('0' if host else '1') + ']：', '0' if host else '1')
+    if tunnel not in ('0', '1', '2'):
+        raise ValueError('隧道选项必须是 0/1/2')
+    if not host and tunnel == '0':
+        raise ValueError('无域名时请选择临时或固定隧道，以提供 HTTPS 订阅')
+    ip = ''
+    for url in ('https://api.ipify.org', 'https://api6.ipify.org'):
+        try:
+            with urllib.request.urlopen(url, timeout=8) as r:
+                ip = public_ip(r.read(100).decode().strip())
+            break
+        except Exception:
+            pass
+    ip = public_ip(ask('VPS 公网 IP' + (f' [{ip}]' if ip else '') + '：', ip))
+    username = ask('后台账号 [随机生成]：', 'xzt_' + secrets.token_hex(4))
+    password = getpass.getpass('后台密码 [回车随机生成]：') or secrets.token_urlsafe(24)
+    if len(password) < 12:
+        raise ValueError('后台密码至少 12 位')
+    sni = domain(ask('REALITY 目标域名 [www.microsoft.com]：', 'www.microsoft.com'))
+    custom_name = subscription_name(ask('自定义订阅名称 [我的订阅]：', DEFAULT_SUB_NAME))
+    c = {'domain': host, 'ip': ip, 'tunnel': {'0': 'none', '1': 'quick', '2': 'fixed'}[tunnel],
+         'username': username, 'password': password, 'panel_path': '/' + secrets.token_hex(12) + '/',
+         'uuid': str(uuid.uuid4()), 'node_password': secrets.token_urlsafe(24),
+         'sub_token': secrets.token_urlsafe(32), 'short_id': secrets.token_hex(8),
+         'sni': sni, 'ws_prefix': '/' + secrets.token_hex(12), 'sources': [], 'complete': False,
+         'subscription_name': custom_name}
+    if tunnel == '2':
+        c['cf_hostname'] = domain(ask('固定隧道域名（CF 托管的空闲子域名）：'))
+        c['cf_account'] = ask('Cloudflare Account ID：')
+        if not re.fullmatch('[a-fA-F0-9]{32}', c['cf_account']):
+            raise ValueError('Account ID 应为 32 位十六进制')
+        c['cf_api_token'] = getpass.getpass('Cloudflare API Token（Tunnel Edit / DNS Edit / Zone Read）：').strip()
+        if not c['cf_api_token']:
+            raise ValueError('API Token 不能为空')
+    if host:
+        try:
+            resolved = {a[4][0] for a in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
+        except socket.gaierror:
+            resolved = set()
+        # A VPS hostname is commonly mapped to loopback in /etc/hosts.
+        # Verify against public DNS before rejecting an otherwise valid domain.
+        if ip not in resolved:
+            for kind in ('A', 'AAAA'):
+                answer = request('https://dns.google/resolve?' + urllib.parse.urlencode({'name': host, 'type': kind}))
+                resolved.update(a['data'] for a in answer.get('Answer', []) if a['type'] in (1, 28))
+        if ip not in resolved:
+            raise ValueError('域名未解析到所选公网 IP。直连模式请关闭 CF 橙云，或改用固定隧道')
+        if not port_free(443):
+            raise RuntimeError('443 端口已占用；请使用隧道模式，脚本不会抢占服务')
+        c['http_challenge'] = port_free(80)
+        if not c['http_challenge']:
+            print('80 端口已有服务，保留原服务；HTTPS 证书改用 443 TLS-ALPN 验证。')
+    reserved = set()
+    for name, preferred in [('panel', 20530), ('sub', 20531), ('edge', 20532),
+                            ('vless', 20533), ('vmess', 20534), ('trojan', 20535),
+                            ('reality', 8443), ('ss', 18443)]:
+        p = choose_port(preferred)
+        while p in reserved:
+            p = choose_port(secrets.randbelow(30000) + 20000)
+        c[name + '_port'] = p
+        reserved.add(p)
+    print('安装系统依赖；不会卸载或接管已有 3x-ui。')
+    run('apt-get', 'update')
+    run('apt-get', 'install', '-y', 'ca-certificates', 'curl', 'docker.io', 'openssl')
+    run('systemctl', 'enable', '--now', 'docker')
+    # Pull mutable upstream tags once, then record immutable repository digests.
+    release = request('https://api.github.com/repos/MHSanaei/3x-ui/releases/latest')['tag_name']
+    c['panel_version'] = release
+    c['panel_image'] = image('ghcr.io/mhsanaei/3x-ui:' + release)
+    c['edge_image'] = image('caddy:2')
+    if tunnel != '0':
+        c['cf_image'] = image('cloudflare/cloudflared:latest')
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (ROOT / 'db').mkdir(mode=0o700)
+    save(c)
+    shutil.copyfile(Path(__file__), ROOT / 'manager.py')
+    os.chmod(ROOT / 'manager.py', 0o700)
+    write('/usr/local/bin/x', '#!/bin/sh\nexec /usr/bin/python3 /opt/xiazt/manager.py "$@"\n', 0o755)
+    resume(c)
 
-    if [[ ! "$cf_port" =~ ^[0-9]+$ ]] || (( cf_port < 1 || cf_port > 65535 )); then
-        cf_port="$(choose_random_port)" || die "无法为 CF Xray 选择本机端口。"
-    fi
-    [[ -n "$cf_uuid" ]] || cf_uuid="$(cat /proc/sys/kernel/random/uuid)"
 
-    export CF_DOMAIN="pending.trycloudflare.com" CF_PORT="$cf_port" CF_UUID="$cf_uuid" CF_PATH="$cf_path"
-    python3 - <<'PYCF'
-import json, os
-base = "/opt/xiazheteng-node"
-config = {
-    "log": {"loglevel": "warning"},
-    "inbounds": [{
-        "tag": "in-cf-tunnel-ws",
-        "listen": "127.0.0.1",
-        "port": int(os.environ["CF_PORT"]),
-        "protocol": "vless",
-        "settings": {"clients": [{"id": os.environ["CF_UUID"]}], "decryption": "none"},
-        "streamSettings": {
-            "network": "ws", "security": "none",
-            "wsSettings": {"path": os.environ["CF_PATH"]}
-        }
-    }],
-    "outbounds": [{"protocol": "freedom", "tag": "direct"}]
-}
-path = base + "/cf-tunnel-xray.json"
-tmp = path + ".tmp"
-with open(tmp, "w", encoding="utf-8") as f:
-    json.dump(config, f, ensure_ascii=False, indent=2)
-os.chmod(tmp, 0o600)
-os.replace(tmp, path)
-PYCF
+def resume(c):
+    # Configure an offline DB before starting the panel: no exposed default login.
+    if not owned('xiazt-panel'):
+        panel_cli(c, '-username', c['username'], '-password', c['password'],
+              '-port', str(c['panel_port']), '-listenIP', '127.0.0.1', '-webBasePath', c['panel_path'])
+        # Disable the upstream default public subscription listener before first boot.
+        with sqlite3.connect(ROOT / 'db/x-ui.db') as db:
+            for key, value in [('subEnable', 'false'), ('subListen', '127.0.0.1')]:
+                db.execute('DELETE FROM settings WHERE key = ?', (key,))
+                db.execute('INSERT INTO settings (key, value) VALUES (?, ?)', (key, value))
+        container('xiazt-panel', c['panel_image'], volumes=[(ROOT / 'db', '/etc/x-ui')],
+              env=['XUI_ENABLE_FAIL2BAN=false', 'TZ=Asia/Shanghai'])
+    else:
+        run('docker', 'start', 'xiazt-panel', capture=True)
+    Panel(c).wait()
+    # Derive X25519 keypair using host OpenSSL; independent of xray CLI output versions.
+    if not c.get('private_key'):
+        key = subprocess.check_output(['openssl', 'genpkey', '-algorithm', 'X25519'])
+        private = subprocess.check_output(['openssl', 'pkey', '-outform', 'DER'], input=key)[-32:]
+        public = subprocess.check_output(['openssl', 'pkey', '-pubout', '-outform', 'DER'], input=key)[-32:]
+        c['private_key'] = base64.urlsafe_b64encode(private).decode().rstrip('=')
+        c['public_key'] = base64.urlsafe_b64encode(public).decode().rstrip('=')
+        save(c)
+    setup_nodes(c)
+    install_services(c)
+    c['complete'] = verify_public(c)
+    save(c)
+    show(c)
+    if not c['complete']:
+        raise RuntimeError('部署未通过公网订阅检查，运行 x → 检查/恢复')
+    print('服务与 HTTPS 订阅检查通过。真实代理通断仍需从客户端测试。')
 
-    # 清理旧固定隧道，脚本今后不再部署或启动固定隧道。
-    systemctl disable --now "$CF_TUNNEL_SERVICE" 2>/dev/null || true
-    if [[ -f "$CF_TUNNEL_UNIT" ]] && grep -q 'Xia Zhe Teng Cloudflare Fixed Tunnel' "$CF_TUNNEL_UNIT"; then
-        rm -f "$CF_TUNNEL_UNIT"
-    fi
-    rm -f "$CF_TOKEN_FILE"
 
-    cat > "$CF_UNIT" <<EOF
-[Unit]
-Description=Xia Zhe Teng Cloudflare Tunnel VLESS WebSocket Inbound
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=simple
-User=root
-ExecStart=$BIN run -config $CF_CONF
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=1048576
-NoNewPrivileges=true
-PrivateTmp=true
-[Install]
-WantedBy=multi-user.target
-EOF
-    chmod 644 "$CF_UNIT"
-    "$BIN" run -test -config "$CF_CONF" || die "CF Tunnel 专用 Xray 配置校验失败。"
-    systemctl daemon-reload
-    systemctl enable "$CF_SERVICE"
-    systemctl restart "$CF_SERVICE"
-    sleep 1
-    systemctl is-active --quiet "$CF_SERVICE" || die "CF 专用 Xray 服务启动失败，请查看 journalctl -u $CF_SERVICE。"
+def remove():
+    c = load()
+    if ask('删除本脚本全部节点、后台、凭据和订阅；输入 DELETE 确认：') != 'DELETE':
+        return
+    # Do not silently leave externally-created resources behind.
+    if c.get('cf_tunnel_id'):
+        if c.get('cf_dns_id'):
+            cf(c, f"/zones/{c['cf_zone']}/dns_records/{c['cf_dns_id']}", method='DELETE')
+            c.pop('cf_dns_id')
+            save(c)
+        if owned('xiazt-cf'):
+            run('docker', 'rm', '-f', 'xiazt-cf', capture=True)
+        cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel/{c['cf_tunnel_id']}/connections", method='DELETE')
+        cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel/{c['cf_tunnel_id']}", method='DELETE')
+        c.pop('cf_tunnel_id')
+        save(c)
+    run('systemctl', 'disable', '--now', 'xiazt-sub.service', check=False)
+    for name in NAMES:
+        if owned(name):
+            run('docker', 'rm', '-f', name, capture=True)
+    unit = Path('/etc/systemd/system/xiazt-sub.service')
+    unit.unlink(missing_ok=True)
+    shortcut = Path('/usr/local/bin/x')
+    if shortcut.exists() and '/opt/xiazt/manager.py' in shortcut.read_text():
+        shortcut.unlink()
+    if ROOT.is_symlink() or ROOT.resolve() != Path('/opt/xiazt'):
+        raise RuntimeError('目录校验失败，拒绝删除')
+    shutil.rmtree(ROOT)
+    run('systemctl', 'daemon-reload')
+    print('本脚本创建的节点与 CF 资源已删除。Docker 和其他应用保留。')
 
-    cat > "$CF_TEMP_UNIT" <<EOF
-[Unit]
-Description=Xia Zhe Teng Cloudflare Temporary Tunnel
-After=network-online.target $CF_SERVICE.service
-Wants=network-online.target
-[Service]
-Type=simple
-ExecStart=/bin/bash -lc 'exec $CLOUDFLARED_BIN tunnel --url http://127.0.0.1:$cf_port --edge-ip-version auto --no-autoupdate --protocol http2 >> $CF_TEMP_LOG 2>&1'
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=true
-PrivateTmp=true
-[Install]
-WantedBy=multi-user.target
-EOF
-    chmod 644 "$CF_TEMP_UNIT"
-    : > "$CF_TEMP_LOG"
-    chmod 600 "$CF_TEMP_LOG"
-    systemctl daemon-reload
-    systemctl enable "$CF_TEMP_SERVICE"
-    systemctl restart "$CF_TEMP_SERVICE"
 
-    temp_domain=""
-    for _ in $(seq 1 45); do
-        sleep 1
-        temp_domain="$(grep -Eo 'https://[[:alnum:]-]+\.trycloudflare\.com' "$CF_TEMP_LOG" 2>/dev/null | tail -n 1 | sed 's#^https://##' || true)"
-        [[ -n "$temp_domain" ]] && break
-        systemctl is-active --quiet "$CF_TEMP_SERVICE" || break
-    done
-    [[ -n "$temp_domain" ]] || die "临时隧道未能取得 trycloudflare.com 域名。请检查：journalctl -u $CF_TEMP_SERVICE -n 100。"
-    cf_domain="$temp_domain"
-    node_type="vless-ws-cf-tunnel-temp"
+def menu():
+    while True:
+        print('\n瞎折腾一键脚本\n1 查看账号/订阅\n2 添加外部订阅\n3 清空外部订阅\n4 状态与日志\n5 检查/恢复节点\n6 重启服务\n7 自定义订阅名称\n9 一键卸载全部节点\n0 退出')
+        choice = ask('选择：', '0')
+        c = load()
+        if choice == '0':
+            return
+        if choice == '1':
+            show(c)
+        elif choice == '2':
+            if len(c['sources']) >= 20:
+                print('最多整合 20 个外部订阅')
+                continue
+            url = ask('输入 HTTPS 订阅地址（输入不写入日志）：')
+            nodes = fetch_source(url)
+            if url not in c['sources']:
+                c['sources'].append(url)
+            save(c)
+            refresh_sources(c)
+            run('systemctl', 'restart', 'xiazt-sub')
+            print(f'已添加并验证 {len(nodes)} 条链接，后台每 5 分钟刷新')
+        elif choice == '3':
+            c['sources'] = []
+            save(c)
+            write(ROOT / 'cache.json', '{}')
+            run('systemctl', 'restart', 'xiazt-sub')
+        elif choice == '4':
+            for n in NAMES:
+                if owned(n):
+                    print(n, run('docker', 'inspect', '--format', '{{.State.Status}}', n, capture=True))
+            run('systemctl', 'status', '--no-pager', 'xiazt-sub', check=False)
+            print('详细日志：docker logs xiazt-panel / docker logs xiazt-edge / docker logs xiazt-cf')
+        elif choice == '5':
+            resume(c)
+        elif choice == '6':
+            for n in NAMES:
+                if owned(n):
+                    run('docker', 'restart', n, capture=True)
+            run('systemctl', 'restart', 'xiazt-sub')
+            c['complete'] = verify_public(c)
+            save(c)
+        elif choice == '7':
+            current = c.get('subscription_name', DEFAULT_SUB_NAME)
+            value = ask(f'自定义订阅名称 [{current}]：', current)
+            try:
+                c['subscription_name'] = subscription_name(value)
+            except ValueError as exc:
+                print(str(exc))
+                continue
+            save(c)
+            print('已更新订阅名称：' + c['subscription_name'] + '。在客户端更新订阅即可生效。')
+        elif choice == '9':
+            remove()
+            if not STATE.exists():
+                return
 
-    settings_tmp="${CF_SETTINGS}.tmp"
-    printf 'CF_DOMAIN=%q\nCF_PORT=%q\nCF_UUID=%q\nCF_PATH=%q\nCF_MODE=1\nCF_NODE_TYPE=%q\n' \
-        "$cf_domain" "$cf_port" "$cf_uuid" "$cf_path" "$node_type" > "$settings_tmp"
-    chmod 600 "$settings_tmp"
-    mv -f "$settings_tmp" "$CF_SETTINGS"
 
-    python3 - "$CF_CONF" "$cf_port" "$cf_uuid" "$cf_path" <<'PYCFVERIFY'
-import json, sys
-cfg_path, expected_port, expected_uuid, expected_path = sys.argv[1:]
-with open(cfg_path, encoding="utf-8") as f:
-    cfg = json.load(f)
-found = [x for x in cfg.get("inbounds", []) if x.get("tag") == "in-cf-tunnel-ws"]
-if len(found) != 1:
-    raise SystemExit("校验失败：CF Xray 配置中没有唯一的 in-cf-tunnel-ws 入站")
-x = found[0]
-actual_path = x.get("streamSettings", {}).get("wsSettings", {}).get("path")
-actual_port = str(x.get("port", ""))
-actual_uuid = x.get("settings", {}).get("clients", [{}])[0].get("id", "")
-if actual_port != expected_port or actual_uuid != expected_uuid or actual_path != expected_path:
-    raise SystemExit(f"校验失败：CF Xray 配置不一致。实际端口={actual_port}，路径={actual_path}")
-print(f"Xray 配置一致性校验通过：端口={actual_port}，路径={actual_path}")
-PYCFVERIFY
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'serve':
+        serve()
+        return
+    if os.geteuid() != 0:
+        raise RuntimeError('请用 root 或 sudo 运行')
+    import fcntl
+    lock_fd = os.open('/run/lock/xiazt.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise RuntimeError('另一个瞎折腾管理任务正在运行，请先退出它')
+    os.umask(0o077)
+    print(r'''
+ __  __ ___    _    ___ _____
+ \ \/ /|_ _|  / \  |__ /_   _|
+  >  <  | |  / _ \  |_ \ | |
+ /_/\_\|___|/_/ \_\|___/ |_|
+       瞎折腾一键脚本
+''')
+    print('GitHub   https://github.com/xiazheteng8\n'
+          'TG       https://t.me/xiazheteng8\n'
+          'YouTube  https://www.youtube.com/@xiazheteng8\n')
+    if len(sys.argv) > 1 and sys.argv[1] == 'install':
+        install()
+    elif STATE.exists():
+        menu()
+    else:
+        install()
+    os.close(lock_fd)
 
-    export CF_DOMAIN="$cf_domain" CF_PORT="$cf_port" CF_UUID="$cf_uuid" CF_PATH="$cf_path" CF_NODE_TYPE="$node_type"
-    python3 - <<'PYCFNODE'
-import json, os
-path = "/opt/xiazheteng-node/data/nodes.json"
-try:
-    with open(path, encoding="utf-8") as f:
-        nodes = json.load(f)
-    if not isinstance(nodes, list):
-        raise SystemExit("nodes.json 格式错误：预期 JSON 数组")
-except FileNotFoundError:
-    nodes = []
-cf_types = {"vless-ws-cf-tunnel", "vless-ws-cf-tunnel-temp"}
-nodes = [n for n in nodes if not (isinstance(n, dict) and n.get("type") in cf_types)]
-nodes.append({
-    "type": "vless-ws-cf-tunnel-temp",
-    "address": os.environ["CF_DOMAIN"],
-    "port": 443,
-    "uuid": os.environ["CF_UUID"],
-    "path": os.environ["CF_PATH"],
-    "sni": os.environ["CF_DOMAIN"]
-})
-tmp = path + ".tmp"
-with open(tmp, "w", encoding="utf-8") as f:
-    json.dump(nodes, f, ensure_ascii=False, indent=2)
-os.chmod(tmp, 0o600)
-os.replace(tmp, path)
-PYCFNODE
 
-    info "Cloudflare 临时隧道节点已写入统一节点清单。"
-    echo
-    echo "============= Cloudflare 临时隧道配置结果 ============="
-    echo "模式：临时隧道（Quick Tunnel）"
-    echo "域名：$cf_domain"
-    echo "本机 WebSocket 源站：http://127.0.0.1:$cf_port$cf_path"
-    echo "WebSocket 路径：$cf_path"
-    echo "VLESS UUID：$cf_uuid"
-    echo "注意：临时域名可能在隧道重建后变化；重新部署会同步更新订阅节点。"
-    echo "========================================================"
-    echo "正在刷新订阅……"
-    generate_subscription
-}
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('\n已中断；已有状态保留，可运行 x 管理。')
+        sys.exit(130)
+    except Exception as exc:
+        # urllib exceptions can include credentials in URLs: report type only.
+        if isinstance(exc, (urllib.error.URLError, urllib.error.HTTPError)):
+            print('网络请求失败：' + type(exc).__name__ + '；请检查网络和 API 权限', file=sys.stderr)
+        else:
+            print('失败：' + str(exc), file=sys.stderr)
+        sys.exit(1)
 
-cf_tunnel_menu() {
-    while true; do
-        echo
-        echo "========== Cloudflare 临时隧道管理 =========="
-        echo "[1] 部署 / 更新临时隧道节点"
-        echo "[2] 查看临时隧道服务状态"
-        echo "[3] 重启临时隧道并刷新订阅"
-        echo "[0] 返回主菜单"
-        read -r -p "请选择：" cf_choice
-        case "$cf_choice" in
-            1) cf_tunnel_deploy ;;
-            2) cf_tunnel_status ;;
-            3)
-                # 清空旧日志，避免把上一次 Quick Tunnel 的域名误认为本次域名。
-                : > "$CF_TEMP_LOG"
-                chmod 600 "$CF_TEMP_LOG"
-                systemctl restart "$CF_SERVICE" 2>/dev/null || true
-                systemctl restart "$CF_TEMP_SERVICE" 2>/dev/null || true
-                # 重启后的 Quick Tunnel 域名可能变化，最多等待 30 秒提取新域名。
-                local refreshed_domain=""
-                for _ in $(seq 1 30); do
-                    sleep 1
-                    refreshed_domain="$(grep -Eo 'https://[[:alnum:]-]+\.trycloudflare\.com' "$CF_TEMP_LOG" 2>/dev/null | tail -n 1 | sed 's#^https://##' || true)"
-                    [[ -n "$refreshed_domain" ]] && break
-                    systemctl is-active --quiet "$CF_TEMP_SERVICE" || break
-                done
-                if [[ -f "$CF_TEMP_LOG" ]]; then
-                    if [[ -n "$refreshed_domain" && -f "$CF_SETTINGS" ]]; then
-                        # shellcheck disable=SC1090
-                        source "$CF_SETTINGS"
-                        printf 'CF_DOMAIN=%q\nCF_PORT=%q\nCF_UUID=%q\nCF_PATH=%q\nCF_MODE=1\nCF_NODE_TYPE=vless-ws-cf-tunnel-temp\n' \
-                            "$refreshed_domain" "$CF_PORT" "$CF_UUID" "$CF_PATH" > "${CF_SETTINGS}.tmp"
-                        chmod 600 "${CF_SETTINGS}.tmp"
-                        mv -f "${CF_SETTINGS}.tmp" "$CF_SETTINGS"
-                        export CF_DOMAIN="$refreshed_domain" CF_PORT CF_UUID CF_PATH
-                        python3 - <<'PYCFREFRESH'
-import json, os
-p="/opt/xiazheteng-node/data/nodes.json"
-with open(p, encoding="utf-8") as f: nodes=json.load(f)
-if not isinstance(nodes,list): raise SystemExit("nodes.json 格式错误")
-old={"vless-ws-cf-tunnel","vless-ws-cf-tunnel-temp"}
-nodes=[n for n in nodes if not (isinstance(n,dict) and n.get("type") in old)]
-nodes.append({"type":"vless-ws-cf-tunnel-temp","address":os.environ["CF_DOMAIN"],"port":443,"uuid":os.environ["CF_UUID"],"path":os.environ["CF_PATH"],"sni":os.environ["CF_DOMAIN"]})
-tmp=p+".tmp"
-with open(tmp,"w",encoding="utf-8") as f: json.dump(nodes,f,ensure_ascii=False,indent=2)
-os.chmod(tmp,0o600); os.replace(tmp,p)
-PYCFREFRESH
-                        generate_subscription
-                    else
-                        warn "未能从隧道日志取得新域名；请使用 [1] 重新部署以更新订阅。"
-                    fi
-                fi
-                cf_tunnel_status
-                ;;
-            0) return 0 ;;
-            *) echo "无效选项。" ;;
-        esac
-    done
-}
-
-do_uninstall() {
-    echo "开始移除本脚本创建的独立服务和文件。"
-    if [[ -f "$CF_TUNNEL_UNIT" ]] && grep -q "xiazheteng-node-manager" "$CF_TUNNEL_UNIT"; then
-        systemctl disable --now "$CF_TUNNEL_SERVICE" 2>/dev/null || true
-        rm -f "$CF_TUNNEL_UNIT"
-        systemctl daemon-reload
-    fi
-    if [[ -f "$CF_TEMP_UNIT" ]] && grep -q "xiazheteng-node-manager" "$CF_TEMP_UNIT"; then
-        systemctl disable --now "$CF_TEMP_SERVICE" 2>/dev/null || true
-        rm -f "$CF_TEMP_UNIT"
-        systemctl daemon-reload
-    fi
-    if [[ -f "$CF_UNIT" ]] && grep -q "xiazheteng-node-manager" "$CF_UNIT"; then
-        systemctl disable --now "$CF_SERVICE" 2>/dev/null || true
-        rm -f "$CF_UNIT"
-        systemctl daemon-reload
-    fi
-    if [[ -f "$SUB_UNIT" ]] &&
-       grep -q "xiazheteng-node-manager" "$SUB_UNIT"; then
-        systemctl disable --now "$SUB_SERVICE" 2>/dev/null || true
-        rm -f "$SUB_UNIT"
-        systemctl daemon-reload
-    else
-        warn "在线订阅服务文件不存在或不属于本脚本，不做处理。"
-    fi
-    if [[ -f "$UNIT" ]] &&
-       grep -q "xiazheteng-node-manager" "$UNIT"; then
-        systemctl disable --now "$SERVICE" 2>/dev/null || true
-        rm -f "$UNIT"
-        systemctl daemon-reload
-    else
-        warn "Xray 服务文件不存在或不属于本脚本，不做处理。"
-    fi
-    if [[ -L "$SHORTCUT" ]] ||
-       { [[ -f "$SHORTCUT" ]] &&
-         grep -q "xiazheteng-node-manager" "$SHORTCUT" 2>/dev/null; }; then
-        rm -f "$SHORTCUT"
-    fi
-    if [[ "$BASE" == "/opt/xiazheteng-node" &&
-          -d "$BASE" &&
-          -f "$ENVFILE" ]]; then
-        rm -rf -- "$BASE"
-    fi
-    warn "系统依赖、acme.sh、已有服务和防火墙规则不会自动删除。"
-    info "卸载操作完成。"
-}
-create_shortcut() {
-    local self
-    self="$(readlink -f "$0")"
-    [[ -f "$self" ]] || die "无法定位当前脚本文件。"
-    install -m 0755 "$self" "$BASE/manager.sh"
-    cat > "$SHORTCUT" <<'EOF'
-#!/usr/bin/env bash
-exec bash /opt/xiazheteng-node/manager.sh "$@"
-EOF
-    chmod 755 "$SHORTCUT"
-    info "快捷命令创建完成。输入 x 即可启动管理菜单。"
-}
-menu() {
-    while true; do
-        echo
-        echo "=========================================="
-        echo "       VPS 节点一键部署管理系统"
-        echo "=========================================="
-        echo "[1] 一键安装 / 自动修复"
-        echo "[2] 卸载脚本管理的组件"
-        echo "[3] 整合订阅 / 刷新订阅"
-        echo "[4] 创建快捷命令 x"
-        echo "[5] 显示在线订阅链接"
-        echo "[6] 独立部署 / 管理 Cloudflare 临时隧道节点"
-        echo "[7] 修改域名 / 重新部署节点配置"
-        echo "[0] 退出"
-        echo "=========================================="
-        read -r -p "请选择：" choice
-        case "$choice" in
-            1) do_install ;;
-            2) do_uninstall ;;
-            3)
-                if [[ -x "$BIN" && -f "$CONF" ]]; then
-                    generate_subscription
-                    if systemctl is-active --quiet "$SERVICE"; then
-                        install_subscription_server
-                        show_subscription_url
-                    else
-                        warn "Xray 服务未运行，请先选择安装 / 修复。"
-                    fi
-                else
-                    warn "尚未安装本脚本的节点。"
-                fi
-                ;;
-            4) create_shortcut ;;
-            5) show_subscription_url ;;
-            6) cf_tunnel_menu ;;
-            7) modify_domain_and_redeploy ;;
-            0) echo "已退出。"; exit 0 ;;
-            *) echo "无效选项。" ;;
-        esac
-    done
-}
-main() {
-    need_root
-    detect_os
-    if [[ ! -f "$ENVFILE" ]]; then
-        mkdir -p "$BASE"
-        echo "首次初始化："
-        read -r -p "请输入已解析到本 VPS 的域名（无域名直接回车）：" DOMAIN
-        DOMAIN="${DOMAIN,,}"
-        DOMAIN="${DOMAIN%.}"
-        printf 'DOMAIN=%q\n' "$DOMAIN" > "$ENVFILE"
-        chmod 600 "$ENVFILE"
-    fi
-    source "$ENVFILE"
-    menu
-}
-main "$@"
+XIAZT_PYTHON_EOF_938715
+python3 "$workdir/manager.py" "$@"
