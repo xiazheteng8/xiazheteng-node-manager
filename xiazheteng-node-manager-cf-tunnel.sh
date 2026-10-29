@@ -68,6 +68,17 @@ SCHEMES = ('vless://', 'vmess://', 'trojan://', 'ss://', 'ssr://',
            'hysteria2://', 'hy2://', 'tuic://', 'hysteria://', 'wireguard://')
 MAX_BODY = 4 * 1024 * 1024
 DEFAULT_SUB_NAME = '我的订阅'
+DEFAULT_REALITY_TARGET = 'www.microsoft.com'
+# 中文字符点阵：瞎折腾脚本；78 列，无需服务器安装字体库。
+BANNER = """
+⢠⣶⣶⣶⡆⣤⣤⣤⣿⣿⣤⣤⣤⠀  ⠀⢸⣿⡇⠀⢰⣶⣶⣶⣶⣶⣿⣷⠀  ⠀⣶⣶⣶⣶⢰⣿⣆⣿⣟⣰⣿⡆⠀  ⠀⣶⣶⣶⡆⠀⣿⡇⠀⣶⣶⣶⣦⠀  ⠀⠀⠀⠀⠀⠀⣿⡇⠀⠀⠀⠀⠀⠀
+⢸⣿⠁⣿⡇⢿⣋⣉⣭⣭⣉⣙⡿⠀  ⠸⢿⣿⡿⠿⢸⣿⠉⠉⠀⠀⠀⠀⠀  ⠀⣿⡇⣸⣿⠘⠛⢻⣿⡟⠛⠛⠛⠀  ⠀⣿⡇⣿⡇⠿⣿⣿⠇⣿⡏⢹⣿⠀  ⠰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡷⠀
+⢸⣿⠿⣿⡇⢘⣛⣛⣿⣿⣛⣛⡃⠀  ⠀⢸⣿⡇⠀⢸⣿⣷⣶⣶⣶⣶⣶⡆  ⠀⣿⡿⢿⣿⠛⣻⣿⡟⠻⣿⣟⠛⠀  ⠀⣿⡿⣿⣇⣀⣿⣧⣀⣿⡇⢸⣿⠀  ⠀⠀⠀⠀⣰⣿⣿⣿⣷⡀⠀⠀⠀⠀
+⢸⣿⣤⣿⡇⣬⣭⣭⣿⣿⣭⣭⣥⠀  ⣤⣾⣿⣿⠿⢸⣿⠁⠀⢸⣿⡇⠀⠀  ⠀⣿⣧⣼⣿⢾⣿⡿⠿⢿⣿⠿⡷⠂  ⠀⣿⣇⣿⡟⢻⣿⣟⠛⣿⡇⢸⣿⠀  ⠀⠀⣠⣾⡿⠉⣿⡏⠹⣿⣦⡀⠀⠀
+⢸⣿⠋⣿⡇⢩⣭⣭⣿⣿⣭⣭⡍⠀  ⠈⢸⣿⡇⠀⣿⣿⠀⠀⢸⣿⡇⠀⠀  ⢀⣿⡟⢻⣿⠀⠿⠿⠶⠾⠿⣷⡖⠀  ⢀⣿⠟⣿⣇⣾⡟⢿⣆⣿⡇⣸⣿⠀  ⢠⣾⡿⣯⣤⣬⣿⣧⣤⣬⡿⣿⡷⠀
+⢸⣿⣶⣿⡇⢸⣿⣉⣉⣉⣉⣿⡇⠀  ⢀⣸⣿⡇⢼⣿⠇⠀⠀⢸⣿⡇⠀⠀  ⣸⣿⣇⣼⣿⠻⠿⠿⠟⠛⢃⣿⡇⠀  ⢸⣿⣀⣿⡿⣿⡷⠿⣿⣿⡿⠿⠏⠀  ⠀⠙⠁⠛⠛⠻⣿⡟⠛⠛⠃⠈⠁⠀
+⠘⠛⠉⠛⠃⠸⠿⠛⠛⠛⠛⠿⠇⠀  ⠘⠛⠛⠁⠀⠉⠀⠀⠀⠘⠛⠃⠀⠀  ⠈⠏⠘⠛⠋⠀⠀⠀⠈⠛⠛⠛⠁⠀  ⠘⠏⠛⠛⠁⠀⠀⠀⠀⠿⠇⠀⠀⠀  ⠀⠀⠀⠀⠀⠀⠿⠇⠀⠀⠀⠀⠀⠀
+"""
 
 
 def run(*args, capture=False, check=True):
@@ -126,6 +137,38 @@ def public_ip(value):
     if not ip.is_global:
         raise ValueError('需要公网 IPv4/IPv6 地址')
     return str(ip)
+
+
+def detect_public_ip():
+    for url in ('https://api.ipify.org', 'https://ipv4.icanhazip.com', 'https://api6.ipify.org'):
+        try:
+            with urllib.request.urlopen(url, timeout=8) as r:
+                return public_ip(r.read(100).decode().strip())
+        except (OSError, ValueError, UnicodeError):
+            pass
+    if shutil.which('ip'):
+        try:
+            interfaces = json.loads(run('ip', '-j', 'address', 'show', 'scope', 'global', capture=True))
+            addresses = [a['local'] for interface in interfaces for a in interface.get('addr_info', [])]
+            for address in sorted(addresses, key=lambda a: ':' in a):
+                try:
+                    return public_ip(address)
+                except ValueError:
+                    pass
+        except (OSError, ValueError, RuntimeError, KeyError):
+            pass
+    raise RuntimeError('无法自动识别 VPS 公网 IP，请检查网络后从安装菜单重试')
+
+
+def panel_credentials():
+    username = ask('3x-ui 后台账号 [回车随机生成]：', 'xzt_' + secrets.token_hex(4))
+    if any(unicodedata.category(ch).startswith('C') for ch in username):
+        raise ValueError('3x-ui 后台账号不能包含控制字符')
+    while True:
+        password = getpass.getpass('3x-ui 后台密码 [至少 12 个字符；回车随机生成]：') or secrets.token_urlsafe(24)
+        if len(password) >= 12:
+            return username, password
+        print('输入错误：3x-ui 后台密码不能少于 12 个字符，请重新输入。')
 
 
 def port_free(port):
@@ -226,18 +269,25 @@ def cf(c, path, data=None, method=None):
     return obj.get('result')
 
 
-def setup_cf(c):
+def resolve_cf_identity(c):
     host = c['cf_hostname']
     parts = host.split('.')
-    zone = None
     for i in range(len(parts) - 1):
         zones = cf(c, '/zones?name=' + '.'.join(parts[i:]))
         if zones:
-            zone = zones[0]['id']
-            break
-    if not zone:
-        raise RuntimeError('找不到该域名的 Cloudflare Zone，检查 API Token 的 Zone Read 权限')
-    c['cf_zone'] = zone
+            zone = zones[0]
+            account = zone.get('account', {}).get('id')
+            if not account:
+                raise RuntimeError('Cloudflare 未返回域名所属账户，请检查 API Token 的资源范围与 Zone Read 权限')
+            c['cf_zone'], c['cf_account'] = zone['id'], account
+            return
+    raise RuntimeError('找不到该域名的 Cloudflare Zone，检查 API Token 的 Zone Read 权限和域名范围')
+
+
+def setup_cf(c):
+    host = c['cf_hostname']
+    resolve_cf_identity(c)
+    zone = c['cf_zone']
     existing = cf(c, f'/zones/{zone}/dns_records?name={host}')
     if existing and not (c.get('cf_dns_id') and existing[0]['id'] == c['cf_dns_id']):
         raise RuntimeError('固定隧道域名已有 DNS 记录；请换一个空闲子域名，脚本不会覆盖现有记录')
@@ -587,11 +637,11 @@ def verify_public(c):
 
 def show(c):
     print('订阅名称：' + c.get('subscription_name', DEFAULT_SUB_NAME))
-    print('\n后台通过 SSH 转发访问：')
+    print('\n3x-ui 后台通过 SSH 转发访问：')
     sshhost = '[' + c['ip'] + ']' if ':' in c['ip'] else c['ip']
     print(f"ssh -N -L {c['panel_port']}:127.0.0.1:{c['panel_port']} root@{sshhost}")
-    print(f"后台：http://127.0.0.1:{c['panel_port']}{c['panel_path']}")
-    print('账号：' + c['username'] + '\n密码：' + c['password'])
+    print(f"3x-ui 后台：http://127.0.0.1:{c['panel_port']}{c['panel_path']}")
+    print('3x-ui 后台账号：' + c['username'] + '\n3x-ui 后台密码：' + c['password'])
     for host in endpoints(c):
         print(f"订阅：https://{host}/sub/{c['sub_token']}")
     print(f"需放行：TCP {c['reality_port']}；TCP/UDP {c['ss_port']}" +
@@ -621,20 +671,11 @@ def install():
         raise ValueError('隧道选项必须是 0/1/2')
     if not host and tunnel == '0':
         raise ValueError('无域名时请选择临时或固定隧道，以提供 HTTPS 订阅')
-    ip = ''
-    for url in ('https://api.ipify.org', 'https://api6.ipify.org'):
-        try:
-            with urllib.request.urlopen(url, timeout=8) as r:
-                ip = public_ip(r.read(100).decode().strip())
-            break
-        except Exception:
-            pass
-    ip = public_ip(ask('VPS 公网 IP' + (f' [{ip}]' if ip else '') + '：', ip))
-    username = ask('后台账号 [随机生成]：', 'xzt_' + secrets.token_hex(4))
-    password = getpass.getpass('后台密码 [回车随机生成]：') or secrets.token_urlsafe(24)
-    if len(password) < 12:
-        raise ValueError('后台密码至少 12 位')
-    sni = domain(ask('REALITY 目标域名 [www.microsoft.com]：', 'www.microsoft.com'))
+    ip = detect_public_ip()
+    sni = DEFAULT_REALITY_TARGET
+    print('自动识别 VPS 公网 IP：' + ip)
+    print('REALITY 目标域名自动设置为：' + sni)
+    username, password = panel_credentials()
     custom_name = subscription_name(ask('自定义订阅名称 [我的订阅]：', DEFAULT_SUB_NAME))
     c = {'domain': host, 'ip': ip, 'tunnel': {'0': 'none', '1': 'quick', '2': 'fixed'}[tunnel],
          'username': username, 'password': password, 'panel_path': '/' + secrets.token_hex(12) + '/',
@@ -644,12 +685,11 @@ def install():
          'subscription_name': custom_name}
     if tunnel == '2':
         c['cf_hostname'] = domain(ask('固定隧道域名（CF 托管的空闲子域名）：'))
-        c['cf_account'] = ask('Cloudflare Account ID：')
-        if not re.fullmatch('[a-fA-F0-9]{32}', c['cf_account']):
-            raise ValueError('Account ID 应为 32 位十六进制')
         c['cf_api_token'] = getpass.getpass('Cloudflare API Token（Tunnel Edit / DNS Edit / Zone Read）：').strip()
         if not c['cf_api_token']:
             raise ValueError('API Token 不能为空')
+        resolve_cf_identity(c)
+        print('已自动识别 Cloudflare 域名区域及所属账户。')
     if host:
         try:
             resolved = {a[4][0] for a in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
@@ -762,13 +802,61 @@ def remove():
     print('本脚本创建的节点与 CF 资源已删除。Docker 和其他应用保留。')
 
 
+def interaction_error(exc):
+    if isinstance(exc, KeyboardInterrupt):
+        print('\n已取消当前操作，返回菜单。')
+    elif isinstance(exc, (urllib.error.URLError, urllib.error.HTTPError)):
+        print('网络请求失败：' + type(exc).__name__ + '；请检查网络或 API 权限，已返回菜单。')
+    else:
+        print('操作未完成：' + str(exc) + '；已返回菜单。')
+
+
 def menu():
+    while STATE.exists():
+        try:
+            _menu_loop()
+            return
+        except EOFError:
+            return
+        except (Exception, KeyboardInterrupt) as exc:
+            interaction_error(exc)
+
+
+def installation_menu():
+    # Keep the domain as the first configuration prompt on a new machine.
+    while True:
+        try:
+            install()
+            return
+        except EOFError:
+            return
+        except (Exception, KeyboardInterrupt) as exc:
+            interaction_error(exc)
+        if STATE.exists():
+            menu()
+            return
+        while True:
+            try:
+                print('\n安装菜单\n1 重新配置并安装\n0 退出')
+                choice = ask('选择：', '0')
+                if choice == '0':
+                    return
+                if choice == '1':
+                    break
+                print('输入错误：请选择 0 或 1。')
+            except EOFError:
+                return
+            except KeyboardInterrupt:
+                print('\n已取消输入；选择 0 可退出。')
+
+
+def _menu_loop():
     while True:
         print('\n瞎折腾一键脚本\n1 查看账号/订阅\n2 添加外部订阅\n3 清空外部订阅\n4 状态与日志\n5 检查/恢复节点\n6 重启服务\n7 自定义订阅名称\n9 一键卸载全部节点\n0 退出')
         choice = ask('选择：', '0')
-        c = load()
         if choice == '0':
             return
+        c = load()
         if choice == '1':
             show(c)
         elif choice == '2':
@@ -817,6 +905,8 @@ def menu():
             remove()
             if not STATE.exists():
                 return
+        else:
+            print('输入错误：请选择菜单中的编号。')
 
 
 def main():
@@ -832,22 +922,17 @@ def main():
     except BlockingIOError:
         raise RuntimeError('另一个瞎折腾管理任务正在运行，请先退出它')
     os.umask(0o077)
-    print(r'''
- __  __ ___    _    ___ _____
- \ \/ /|_ _|  / \  |__ /_   _|
-  >  <  | |  / _ \  |_ \ | |
- /_/\_\|___|/_/ \_\|___/ |_|
-       瞎折腾一键脚本
-''')
+    print(BANNER)
+
     print('GitHub   https://github.com/xiazheteng8\n'
           'TG       https://t.me/xiazheteng8\n'
           'YouTube  https://www.youtube.com/@xiazheteng8\n')
     if len(sys.argv) > 1 and sys.argv[1] == 'install':
-        install()
+        installation_menu()
     elif STATE.exists():
         menu()
     else:
-        install()
+        installation_menu()
     os.close(lock_fd)
 
 
