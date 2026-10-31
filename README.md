@@ -2,6 +2,12 @@
 
 **一键安装 · 无域名部署 · Cloudflare Tunnel · 在线订阅 · 可视化管理**
 
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=6Ot82D5Hn4Q">
+    📺 <strong>点击查看完整视频教程（YouTube）</strong>
+  </a>
+</p>
+
 一款专为 Debian / Ubuntu VPS 打造的自动化部署与管理脚本。通过交互式安装流程，自动完成环境检测、Docker 容器部署、Cloudflare Tunnel 配置、在线订阅生成及日常维护。
 
 无需手动编写复杂配置，**一条命令完成安装，输入 `x` 即可管理。**
