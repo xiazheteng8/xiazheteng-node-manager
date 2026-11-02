@@ -719,7 +719,13 @@ def install():
         reserved.add(p)
     print('安装系统依赖；不会卸载或接管已有 3x-ui。')
     run('apt-get', 'update')
-    run('apt-get', 'install', '-y', 'ca-certificates', 'curl', 'docker.io', 'openssl')
+    
+    # 动态组装依赖：若已存在 docker 命令，则不安装 docker.io（避免卸载用户的 docker-ce）
+    pkgs = ['ca-certificates', 'curl', 'openssl']
+    if not shutil.which('docker'):
+        pkgs.append('docker.io')
+        
+    run('apt-get', 'install', '-y', *pkgs)
     run('systemctl', 'enable', '--now', 'docker')
     # Pull mutable upstream tags once, then record immutable repository digests.
     release = request('https://api.github.com/repos/MHSanaei/3x-ui/releases/latest')['tag_name']
