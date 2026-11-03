@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 瞎折腾一键脚本（修复版） | Debian 12/13、Ubuntu 22.04/24.04 | amd64/arm64
+# 瞎折腾一键脚本（全功能整合版：3x-ui/Xray + Cloudflare Tunnel + Hysteria2）
+# 支持系统：Debian 12/13、Ubuntu 22.04/24.04 | 架构：amd64/arm64
 set -Eeuo pipefail
 [[ ${EUID} -eq 0 ]] || { echo '请使用 root 或 sudo bash x.sh'; exit 1; }
 [[ -r /etc/os-release ]] || { echo '无法识别系统'; exit 1; }
@@ -34,7 +35,7 @@ if ! command -v python3 >/dev/null; then
 fi
 cat >"$workdir/manager.py" <<'XIAZT_PYTHON_EOF_938715'
 #!/usr/bin/env python3
-"""瞎折腾：专用 3x-ui/Xray 实例，独立管理、可审计（修复版）。"""
+"""瞎折腾：专用 3x-ui/Xray 实例 + Cloudflare 隧道 + Hysteria2 独立管理。"""
 import base64
 import concurrent.futures
 import contextlib
@@ -68,8 +69,9 @@ SCHEMES = ('vless://', 'vmess://', 'trojan://', 'ss://', 'ssr://',
            'hysteria2://', 'hy2://', 'tuic://', 'hysteria://', 'wireguard://')
 MAX_BODY = 4 * 1024 * 1024
 DEFAULT_SUB_NAME = '我的订阅'
-# 修复：替换 microsoft.com 为 apple.com，防止 TLS 证书链过大导致 Xray 握手崩溃
 DEFAULT_REALITY_TARGET = 'www.apple.com'
+HY_CONFIG_DIR = Path('/etc/hysteria')
+HY_CONFIG_FILE = HY_CONFIG_DIR / 'config.yaml'
 BANNER = """
 ⢠⣶⣶⣶⡆⣤⣤⣤⣿⣿⣤⣤⣤⠀  ⠀⢸⣿⡇⠀⢰⣶⣶⣶⣶⣶⣿⣷⠀  ⠀⣶⣶⣶⣶⢰⣿⣆⣿⣟⣰⣿⡆⠀  ⠀⣶⣶⣶⡆⠀⣿⡇⠀⣶⣶⣶⣦⠀  ⠀⠀⠀⠀⠀⠀⣿⡇⠀⠀⠀⠀⠀⠀
 ⢸⣿⠁⣿⡇⢿⣋⣉⣭⣭⣉⣙⡿⠀  ⠸⢿⣿⡿⠿⢸⣿⠉⠉⠀⠀⠀⠀⠀  ⠀⣿⡇⣸⣿⠘⠛⢻⣿⡟⠛⠛⠛⠀  ⠀⣿⡇⣿⡇⠿⣿⣿⠇⣿⡏⢹⣿⠀  ⠰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡷⠀
@@ -249,10 +251,12 @@ def cf(c, path, data=None, method=None):
     return obj.get('result')
 
 def ensure_firewall_ports(c):
-    """自动放行本机防火墙端口，防止外部测试连通性显示 -1"""
+    """自动放行本机防火墙端口（TCP 和 Hysteria2 UDP）"""
     ports = [c['reality_port'], c['ss_port']]
     if c.get('domain'):
         ports.extend([80, 443])
+    hy_udp_port = c.get('hy2_port') if c.get('hy2_enabled') else None
+
     if shutil.which('ufw'):
         try:
             status = run('ufw', 'status', capture=True, check=False)
@@ -261,17 +265,168 @@ def ensure_firewall_ports(c):
                     run('ufw', 'allow', f'{p}/tcp', check=False)
                     if p == c['ss_port']:
                         run('ufw', 'allow', f'{p}/udp', check=False)
-                print(f'已在 UFW 防火墙自动放行端口：{ports}')
+                if hy_udp_port:
+                    run('ufw', 'allow', f'{hy_udp_port}/udp', check=False)
+                print(f'已在 UFW 防火墙自动放行端口：TCP {ports}' + (f'，UDP {hy_udp_port}' if hy_udp_port else ''))
         except Exception:
             pass
+
     if shutil.which('iptables'):
         try:
             for p in ports:
                 run('iptables', '-I', 'INPUT', '-p', 'tcp', '--dport', str(p), '-j', 'ACCEPT', check=False)
                 if p == c['ss_port']:
                     run('iptables', '-I', 'INPUT', '-p', 'udp', '--dport', str(p), '-j', 'ACCEPT', check=False)
+            if hy_udp_port:
+                run('iptables', '-I', 'INPUT', '-p', 'udp', '--dport', str(hy_udp_port), '-j', 'ACCEPT', check=False)
         except Exception:
             pass
+
+def is_hy2_installed():
+    return Path('/usr/local/bin/hysteria').exists() and HY_CONFIG_FILE.exists()
+
+def setup_hy2(c, domain_in=None, port_in=None, token_in=None, email_in=None):
+    print('\n--- Hysteria 2 安装与配置 ---')
+    print('说明：Hysteria 2 基于 UDP (QUIC)，抗封锁能力极强且弱网速度飞快。')
+    print('注意：')
+    print('  1. 域名解析：必须使用已解析到本机 IP 的域名（Cloudflare 解析记录务必为【仅 DNS/灰色云朵】，不可开启橙色代理小云朵）')
+    print('  2. 权限要求：Cloudflare API Token 需具备 Zone:DNS:Edit 与 Zone:Zone:Read 权限，用于 DNS-01 申请正规证书\n')
+    
+    default_domain = domain_in or c.get('domain') or c.get('cf_hostname') or c.get('hy2_domain') or ''
+    h_domain = ask(f'输入已指向本机的域名 [{default_domain}]：', default_domain)
+    h_domain = domain(h_domain)
+    
+    default_port = port_in or str(c.get('hy2_port', 443))
+    while True:
+        h_port_str = ask(f'UDP 端口 [{default_port}]：', default_port)
+        try:
+            h_port = int(h_port_str)
+            if not 1 <= h_port <= 65535:
+                print('端口必须在 1～65535 之间')
+                continue
+            if c.get('hy2_port') != h_port:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.bind(('0.0.0.0', h_port))
+            break
+        except Exception as e:
+            print(f'端口无效或已被占用：{e}，请更换其他端口')
+            default_port = '8443' if default_port == '443' else '443'
+
+    default_token = token_in or c.get('cf_api_token') or c.get('hy2_token') or ''
+    h_token = ask(f'Cloudflare API Token [{default_token}]：', default_token)
+    if not h_token:
+        raise ValueError('Cloudflare API Token 不能为空')
+
+    default_email = email_in or c.get('hy2_email') or ''
+    h_email = ask(f'证书通知邮箱（可留空）[{default_email}]：', default_email)
+
+    print('\n正在下载并安装 Hysteria 2 官方程序...')
+    run('apt-get', 'update')
+    run('apt-get', 'install', '-y', 'curl', 'ca-certificates')
+
+    installer = run('mktemp', capture=True)
+    try:
+        run('curl', '-fsSL', '--retry', '3', 'https://get.hy2.sh/', '-o', installer)
+        run('bash', installer)
+    finally:
+        if Path(installer).exists():
+            Path(installer).unlink()
+
+    password = c.get('hy2_password') or secrets.token_urlsafe(32)
+    config = {
+        "listen": f":{h_port}",
+        "acme": {
+            "domains": [h_domain],
+            "email": h_email.strip(),
+            "type": "dns",
+            "dns": {
+                "name": "cloudflare",
+                "config": {
+                    "cloudflare_api_token": h_token.strip()
+                }
+            }
+        },
+        "auth": {
+            "type": "password",
+            "password": password
+        },
+        "masquerade": {
+            "type": "proxy",
+            "proxy": {
+                "url": "https://www.cloudflare.com",
+                "rewriteHost": True
+            }
+        }
+    }
+
+    HY_CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o750)
+    write(HY_CONFIG_FILE, json.dumps(config, indent=2) + "\n", 0o640)
+
+    try:
+        shutil.chown(HY_CONFIG_FILE, user='root', group='hysteria')
+    except Exception:
+        pass
+
+    c['hy2_enabled'] = True
+    c['hy2_domain'] = h_domain
+    c['hy2_port'] = h_port
+    c['hy2_password'] = password
+    c['hy2_email'] = h_email
+    c['hy2_token'] = h_token
+    save(c)
+
+    ensure_firewall_ports(c)
+
+    run('systemctl', 'daemon-reload')
+    run('systemctl', 'enable', '--now', 'hysteria-server')
+    run('systemctl', 'restart', 'hysteria-server')
+
+    print('\n✅ Hysteria 2 服务已启动！')
+    print(f'已在系统防火墙放行 UDP {h_port}。若使用了云服务商（AWS/阿里云/腾讯云/甲骨文等），请务必在后台安全组放行 UDP {h_port}！')
+    print('注意：首次启动 DNS-01 证书申请通常需要 30~90 秒，可通过命令查看日志：')
+    print('journalctl -u hysteria-server -n 30 --no-pager')
+
+def remove_hy2(c):
+    if ask('确认卸载 Hysteria 2 吗？输入 y 确认：', 'n').lower() != 'y':
+        return
+    run('systemctl', 'disable', '--now', 'hysteria-server', check=False)
+    if HY_CONFIG_FILE.exists():
+        HY_CONFIG_FILE.unlink(missing_ok=True)
+    c['hy2_enabled'] = False
+    save(c)
+    print('已卸载 Hysteria 2 服务。')
+
+def manage_hy2_menu():
+    c = load()
+    while True:
+        print('\n--- Hysteria 2 管理菜单 ---')
+        if c.get('hy2_enabled') and is_hy2_installed():
+            status = run('systemctl', 'is-active', 'hysteria-server', capture=True, check=False)
+            print(f'运行状态：{status}')
+            print(f"节点域名：{c.get('hy2_domain')}，UDP 端口：{c.get('hy2_port')}")
+            hy_name = urllib.parse.quote(c.get('subscription_name', DEFAULT_SUB_NAME) + '-Hysteria2')
+            print(f"节点链接：hysteria2://{c.get('hy2_password')}@{c.get('hy2_domain')}:{c.get('hy2_port')}/?sni={c.get('hy2_domain')}#{hy_name}")
+            print('\n1 查看实时运行日志\n2 重启服务\n3 重新配置\n4 卸载 Hysteria 2\n0 返回主菜单')
+            choice = ask('选择：', '0')
+            if choice == '0':
+                return
+            elif choice == '1':
+                run('journalctl', '-u', 'hysteria-server', '-n', '50', '--no-pager', check=False)
+            elif choice == '2':
+                run('systemctl', 'restart', 'hysteria-server')
+                print('已重启 Hysteria 2 服务')
+            elif choice == '3':
+                setup_hy2(c)
+            elif choice == '4':
+                remove_hy2(c)
+                return
+        else:
+            print('当前系统尚未配置 Hysteria 2。')
+            print('1 开始配置安装 Hysteria 2\n0 返回主菜单')
+            choice = ask('选择：', '0')
+            if choice == '1':
+                setup_hy2(c)
+            return
 
 def resolve_cf_identity(c):
     host = c['cf_hostname']
@@ -315,12 +470,10 @@ def setup_cf(c):
 def setup_nodes(c):
     api = Panel(c)
     api.wait()
-    # 修复旧配置中使用的失效 SNI（microsoft.com 证书过长导致 Xray 握手失败）
     if c.get('sni') in ('www.microsoft.com', 'microsoft.com', None, ''):
         c['sni'] = DEFAULT_REALITY_TARGET
         save(c)
     inbound_list = api.call('panel/api/inbounds/list')
-    # 若存在旧版失效的 reality 入站（目标域名为 microsoft 或缺少 minClientVer），先删除后重建
     for item in inbound_list:
         if item.get('remark') == 'xiazt-reality':
             try:
@@ -353,7 +506,6 @@ def setup_nodes(c):
         add('xiazt-' + proto + '-ws', c[proto + '_port'], proto, settings,
             {'network': 'ws', 'security': 'none',
              'wsSettings': {'path': c['ws_prefix'] + '/' + proto, 'headers': {}}})
-    # 修复：显式加入 minClientVer: 1.0.0 避免 Xray-core 新版本默认拦截旧客户端
     add('xiazt-reality', c['reality_port'], 'vless',
         {'clients': [{'id': c['uuid'], 'email': 'xiazt-reality', 'enable': True,
                       'flow': 'xtls-rprx-vision', 'subId': c['sub_token']}], 'decryption': 'none'},
@@ -432,12 +584,10 @@ def node_links(c, name=None):
                 q['encryption'] = 'none'
             links.append(link(proto, c['uuid'] if proto == 'vless' else c['node_password'],
                               host, 443, q, name + '-' + proto + '-' + host))
-        # 修复：port 与 aid 必须为整数，否则在部分客户端中解析失败报 -1
         links.append('vmess://' + b64(json.dumps({'v': '2', 'ps': name + '-vmess-' + host,
             'add': host, 'port': 443, 'id': c['uuid'], 'aid': 0, 'scy': 'auto',
             'net': 'ws', 'type': 'none', 'host': host, 'path': c['ws_prefix'] + '/vmess',
             'tls': 'tls', 'sni': host}, ensure_ascii=False)))
-        # 固定隧道或自定义域名增加 Cloudflare 优选节点，避免国内 Anycast IP 丢包导致 -1
         if 'trycloudflare.com' not in host:
             for pref in cf_preferred:
                 q_vless = {'security': 'tls', 'sni': host, 'type': 'ws', 'host': host,
@@ -447,6 +597,9 @@ def node_links(c, name=None):
                     'add': pref, 'port': 443, 'id': c['uuid'], 'aid': 0, 'scy': 'auto',
                     'net': 'ws', 'type': 'none', 'host': host, 'path': c['ws_prefix'] + '/vmess',
                     'tls': 'tls', 'sni': host}, ensure_ascii=False)))
+    if c.get('hy2_enabled') and c.get('hy2_domain') and c.get('hy2_port'):
+        hy_name = urllib.parse.quote(name + '-Hysteria2')
+        links.append(f"hysteria2://{c['hy2_password']}@{c['hy2_domain']}:{c['hy2_port']}/?sni={c['hy2_domain']}#{hy_name}")
     return links
 
 def subscription_response(c, query, merged):
@@ -564,11 +717,11 @@ def serve():
 
 def caddy_config(c):
     routes = ''
-    # 修复：加上 * 通配符，防止客户端携带斜杠或路径参数时返回 404
     for proto in ('vless', 'vmess', 'trojan'):
         routes += f"    handle {c['ws_prefix']}/{proto}* {{\n        reverse_proxy 127.0.0.1:{c[proto + '_port']}\n    }}\n"
     routes += f"    handle /sub/* {{\n        reverse_proxy 127.0.0.1:{c['sub_port']}\n    }}\n    handle /health {{\n        respond ok\n    }}\n    handle {{\n        respond 404\n    }}\n"
-    config = '{\n    admin off\n'
+    # 修复：禁用 Caddy 默认开启的 HTTP/3 (QUIC)，防止与 Hysteria 2 在 UDP 443 发生端口冲突
+    config = '{\n    admin off\n    servers {\n        protocols h1 h2\n    }\n'
     if not c.get('http_challenge', True):
         config += '    auto_https disable_redirects\n'
     config += '}\n'
@@ -630,4 +783,347 @@ def verify_public(c):
             try:
                 req = urllib.request.Request(f"https://{host}/sub/{c['sub_token']}",
                                              headers={'User-Agent': 'v2rayN/xiazt'})
-                with urllib
+                with urllib.request.urlopen(req, timeout=6) as r:
+                    parsed = parse_subscription(r.read(MAX_BODY))
+                    ok = len(parsed) >= 5
+                if ok:
+                    break
+            except Exception:
+                time.sleep(2)
+        results[host] = ok
+    c['public_checks'] = results
+    save(c)
+    if not hosts or not all(results.values()):
+        print('公网订阅未验证通过：检查 DNS、80/443、安全组及 CF 日志。未标记部署成功。')
+        return False
+    return True
+
+def show(c):
+    print('订阅名称：' + c.get('subscription_name', DEFAULT_SUB_NAME))
+    print('\n3x-ui 后台通过 SSH 转发访问：')
+    sshhost = '[' + c['ip'] + ']' if ':' in c['ip'] else c['ip']
+    print(f"ssh -N -L {c['panel_port']}:127.0.0.1:{c['panel_port']} root@{sshhost}")
+    print(f"3x-ui 后台：http://127.0.0.1:{c['panel_port']}{c['panel_path']}")
+    print('3x-ui 后台账号：' + c['username'] + '\n3x-ui 后台密码：' + c['password'])
+    for host in endpoints(c):
+        print(f"订阅：https://{host}/sub/{c['sub_token']}")
+    print(f"需放行：TCP {c['reality_port']}；TCP/UDP {c['ss_port']}" +
+          (('；TCP 80/443' if c.get('http_challenge', True) else '；TCP 443') + '（域名直连）' if c['domain'] else ''))
+    print('WS 端口、后台、订阅源站只监听本机；不自动改动你的防火墙或云安全组。')
+    if c['tunnel'] == 'quick':
+        print('临时隧道重启会换域名：运行 x 查看新订阅。节点订阅内容会自动使用当前域名。')
+    if c.get('hy2_enabled') and c.get('hy2_domain'):
+        hy_name = urllib.parse.quote(c.get('subscription_name', DEFAULT_SUB_NAME) + '-Hysteria2')
+        print(f"\nHysteria2 节点：hysteria2://{c['hy2_password']}@{c['hy2_domain']}:{c['hy2_port']}/?sni={c['hy2_domain']}#{hy_name}")
+        print(f"Hysteria2 端口：UDP {c['hy2_port']}（云安全组需放行该 UDP 端口）")
+    print('快捷管理：x；凭据保存：/opt/xiazt/state.json（root 专用）')
+    print('\n【节点连通性排查指南】')
+    print('1. REALITY / SS 直连节点：若测速显示 -1，请务必在云服务器服务商（如 AWS / 阿里云 / 腾讯云 / 甲骨文）的安全组后台添加入站规则，放行 TCP ' + str(c['reality_port']) + ' 和 TCP/UDP ' + str(c['ss_port']) + '。')
+    if c.get('hy2_enabled'):
+        print('2. Hysteria 2 节点：需在云服务器安全组放行 UDP ' + str(c['hy2_port']) + '，且 Cloudflare 上的 A 记录必须为【仅 DNS/灰色云朵】。')
+    if c['tunnel'] == 'quick':
+        print('3. 临时隧道说明：Cloudflare 临时域名 (*.trycloudflare.com) 在中国境内已被 GFW 阻断 SNI / DNS 污染，国内客户端测试临时隧道节点显示 -1 属正常现象。请在境内优先使用 REALITY / Hysteria2 节点，或改用 [固定隧道] 并绑定自己的域名！')
+
+def install():
+    host = ask('输入已解析的域名（没有就回车跳过）：')
+    if host:
+        host = domain(host)
+    if STATE.exists():
+        raise RuntimeError('已有专用实例，请使用 x 管理或先卸载；拒绝覆盖现有凭据')
+    if ROOT.exists() and any(ROOT.iterdir()):
+        raise RuntimeError('/opt/xiazt 已存在且非空，拒绝覆盖')
+    if Path('/usr/local/bin/x').exists():
+        raise RuntimeError('/usr/local/bin/x 已存在，拒绝覆盖已有快捷命令')
+    for n in NAMES:
+        if shutil.which('docker') and run('docker', 'inspect', '--format', '{{.Id}}', n, capture=True, check=False):
+            raise RuntimeError(f'容器名 {n} 已存在，拒绝覆盖')
+    tunnel = ask('CF 隧道：0 不使用 / 1 临时(国内被墙慎用) / 2 固定(推荐) [' + ('0' if host else '1') + ']：', '0' if host else '1')
+    if tunnel not in ('0', '1', '2'):
+        raise ValueError('隧道选项必须是 0/1/2')
+    if not host and tunnel == '0':
+        raise ValueError('无域名时请选择临时或固定隧道，以提供 HTTPS 订阅')
+    ip = detect_public_ip()
+    sni = DEFAULT_REALITY_TARGET
+    print('自动识别 VPS 公网 IP：' + ip)
+    print('REALITY 目标域名自动设置为：' + sni)
+    username, password = panel_credentials()
+    custom_name = subscription_name(ask('自定义订阅名称 [我的订阅]：', DEFAULT_SUB_NAME))
+    c = {'domain': host, 'ip': ip, 'tunnel': {'0': 'none', '1': 'quick', '2': 'fixed'}[tunnel],
+         'username': username, 'password': password, 'panel_path': '/' + secrets.token_hex(12) + '/',
+         'uuid': str(uuid.uuid4()), 'node_password': secrets.token_urlsafe(24),
+         'sub_token': secrets.token_urlsafe(32), 'short_id': secrets.token_hex(8),
+         'sni': sni, 'ws_prefix': '/' + secrets.token_hex(12), 'sources': [], 'complete': False,
+         'subscription_name': custom_name}
+    if tunnel == '2':
+        c['cf_hostname'] = domain(ask('固定隧道域名（CF 托管的空闲子域名）：'))
+        c['cf_api_token'] = ask('Cloudflare API Token（明文显示；Tunnel Edit / DNS Edit / Zone Read）：')
+        if not c['cf_api_token']:
+            raise ValueError('API Token 不能为空')
+        resolve_cf_identity(c)
+        print('已自动识别 Cloudflare 域名区域及所属账户。')
+    if host:
+        try:
+            resolved = {a[4][0] for a in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
+        except socket.gaierror:
+            resolved = set()
+        if ip not in resolved:
+            for kind in ('A', 'AAAA'):
+                answer = request('https://dns.google/resolve?' + urllib.parse.urlencode({'name': host, 'type': kind}))
+                resolved.update(a['data'] for a in answer.get('Answer', []) if a['type'] in (1, 28))
+        if ip not in resolved:
+            raise ValueError('域名未解析到所选公网 IP。直连模式请关闭 CF 橙云，或改用固定隧道')
+        if not port_free(443):
+            raise RuntimeError('443 端口已占用；请使用隧道模式，脚本不会抢占服务')
+        c['http_challenge'] = port_free(80)
+        if not c['http_challenge']:
+            print('80 端口已有服务，保留原服务；HTTPS 证书改用 443 TLS-ALPN 验证。')
+    reserved = set()
+    for name, preferred in [('panel', 20530), ('sub', 20531), ('edge', 20532),
+                            ('vless', 20533), ('vmess', 20534), ('trojan', 20535),
+                            ('reality', 8443), ('ss', 18443)]:
+        p = choose_port(preferred)
+        while p in reserved:
+            p = choose_port(secrets.randbelow(30000) + 20000)
+        c[name + '_port'] = p
+        reserved.add(p)
+    print('安装系统依赖；不会卸载或接管已有 3x-ui。')
+    run('apt-get', 'update')
+    
+    pkgs = ['ca-certificates', 'curl', 'openssl']
+    if not shutil.which('docker'):
+        pkgs.append('docker.io')
+        
+    run('apt-get', 'install', '-y', *pkgs)
+    run('systemctl', 'enable', '--now', 'docker')
+    release = request('https://api.github.com/repos/MHSanaei/3x-ui/releases/latest')['tag_name']
+    c['panel_version'] = release
+    c['panel_image'] = image('ghcr.io/mhsanaei/3x-ui:' + release)
+    c['edge_image'] = image('caddy:2')
+    if tunnel != '0':
+        c['cf_image'] = image('cloudflare/cloudflared:latest')
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (ROOT / 'db').mkdir(mode=0o700)
+    save(c)
+    shutil.copyfile(Path(__file__), ROOT / 'manager.py')
+    os.chmod(ROOT / 'manager.py', 0o700)
+    write('/usr/local/bin/x', '#!/bin/sh\nexec /usr/bin/python3 /opt/xiazt/manager.py "$@"\n', 0o755)
+
+    if ask('是否同时安装配置 Hysteria 2 (高速抗封锁 UDP 协议) [y/N]：', 'n').lower() == 'y':
+        try:
+            setup_hy2(c)
+        except Exception as e:
+            print(f'Hysteria 2 安装未完成：{e}，后续可在管理菜单按 8 单独配置')
+    resume(c)
+
+def resume(c):
+    if not owned('xiazt-panel'):
+        panel_cli(c, '-username', c['username'], '-password', c['password'],
+              '-port', str(c['panel_port']), '-listenIP', '127.0.0.1', '-webBasePath', c['panel_path'])
+        with sqlite3.connect(ROOT / 'db/x-ui.db') as db:
+            for key, value in [('subEnable', 'false'), ('subListen', '127.0.0.1')]:
+                db.execute('DELETE FROM settings WHERE key = ?', (key,))
+                db.execute('INSERT INTO settings (key, value) VALUES (?, ?)', (key, value))
+        container('xiazt-panel', c['panel_image'], volumes=[(ROOT / 'db', '/etc/x-ui')],
+              env=['XUI_ENABLE_FAIL2BAN=false', 'TZ=Asia/Shanghai'])
+    else:
+        run('docker', 'start', 'xiazt-panel', capture=True)
+    Panel(c).wait()
+    if not c.get('private_key'):
+        key = subprocess.check_output(['openssl', 'genpkey', '-algorithm', 'X25519'])
+        private = subprocess.check_output(['openssl', 'pkey', '-outform', 'DER'], input=key)[-32:]
+        public = subprocess.check_output(['openssl', 'pkey', '-pubout', '-outform', 'DER'], input=key)[-32:]
+        c['private_key'] = base64.urlsafe_b64encode(private).decode().rstrip('=')
+        c['public_key'] = base64.urlsafe_b64encode(public).decode().rstrip('=')
+        save(c)
+    setup_nodes(c)
+    install_services(c)
+    if c.get('hy2_enabled') and is_hy2_installed():
+        run('systemctl', 'restart', 'hysteria-server', check=False)
+    c['complete'] = verify_public(c)
+    save(c)
+    show(c)
+    if not c['complete']:
+        raise RuntimeError('部署未通过公网订阅检查，运行 x → 检查/恢复')
+    print('服务与 HTTPS 订阅检查通过。真实代理通断仍需从客户端测试。')
+
+def remove():
+    c = load()
+    if ask('删除本脚本全部节点、后台、凭据和订阅；输入 DELETE 确认：') != 'DELETE':
+        return
+    if c.get('cf_tunnel_id'):
+        if c.get('cf_dns_id'):
+            cf(c, f"/zones/{c['cf_zone']}/dns_records/{c['cf_dns_id']}", method='DELETE')
+            c.pop('cf_dns_id')
+            save(c)
+        if owned('xiazt-cf'):
+            run('docker', 'rm', '-f', 'xiazt-cf', capture=True)
+        cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel/{c['cf_tunnel_id']}/connections", method='DELETE')
+        cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel/{c['cf_tunnel_id']}", method='DELETE')
+        c.pop('cf_tunnel_id')
+        save(c)
+    run('systemctl', 'disable', '--now', 'xiazt-sub.service', check=False)
+    for name in NAMES:
+        if owned(name):
+            run('docker', 'rm', '-f', name, capture=True)
+    if c.get('hy2_enabled'):
+        run('systemctl', 'disable', '--now', 'hysteria-server', check=False)
+        if HY_CONFIG_FILE.exists():
+            HY_CONFIG_FILE.unlink(missing_ok=True)
+    unit = Path('/etc/systemd/system/xiazt-sub.service')
+    unit.unlink(missing_ok=True)
+    shortcut = Path('/usr/local/bin/x')
+    if shortcut.exists() and '/opt/xiazt/manager.py' in shortcut.read_text():
+        shortcut.unlink()
+    if ROOT.is_symlink() or ROOT.resolve() != Path('/opt/xiazt'):
+        raise RuntimeError('目录校验失败，拒绝删除')
+    shutil.rmtree(ROOT)
+    run('systemctl', 'daemon-reload')
+    print('本脚本创建的节点、Hysteria2 与 CF 资源已删除。Docker 和其他应用保留。')
+
+def interaction_error(exc):
+    if isinstance(exc, KeyboardInterrupt):
+        print('\n已取消当前操作，返回菜单。')
+    elif isinstance(exc, (urllib.error.URLError, urllib.error.HTTPError)):
+        print('网络请求失败：' + type(exc).__name__ + '；请检查网络或 API 权限，已返回菜单。')
+    else:
+        print('操作未完成：' + str(exc) + '；已返回菜单。')
+
+def menu():
+    while STATE.exists():
+        try:
+            _menu_loop()
+            return
+        except EOFError:
+            return
+        except (Exception, KeyboardInterrupt) as exc:
+            interaction_error(exc)
+
+def installation_menu():
+    while True:
+        try:
+            install()
+            return
+        except EOFError:
+            return
+        except (Exception, KeyboardInterrupt) as exc:
+            interaction_error(exc)
+        if STATE.exists():
+            menu()
+            return
+        while True:
+            try:
+                print('\n安装菜单\n1 重新配置并安装\n0 退出')
+                choice = ask('选择：', '0')
+                if choice == '0':
+                    return
+                if choice == '1':
+                    break
+                print('输入错误：请选择 0 或 1。')
+            except EOFError:
+                return
+            except KeyboardInterrupt:
+                print('\n已取消输入；选择 0 可退出。')
+
+def _menu_loop():
+    while True:
+        print('\n瞎折腾一键脚本\n1 查看账号/订阅\n2 添加外部订阅\n3 清空外部订阅\n4 状态与日志\n5 检查/恢复节点\n6 重启服务\n7 自定义订阅名称\n8 Hysteria2 管理与配置\n9 一键卸载全部节点\n0 退出')
+        choice = ask('选择：', '0')
+        if choice == '0':
+            return
+        c = load()
+        if choice == '1':
+            show(c)
+        elif choice == '2':
+            if len(c['sources']) >= 20:
+                print('最多整合 20 个外部订阅')
+                continue
+            url = ask('输入 HTTPS 订阅地址（输入不写入日志）：')
+            nodes = fetch_source(url)
+            if url not in c['sources']:
+                c['sources'].append(url)
+            save(c)
+            refresh_sources(c)
+            run('systemctl', 'restart', 'xiazt-sub')
+            print(f'已添加并验证 {len(nodes)} 条链接，后台每 5 分钟刷新')
+        elif choice == '3':
+            c['sources'] = []
+            save(c)
+            write(ROOT / 'cache.json', '{}')
+            run('systemctl', 'restart', 'xiazt-sub')
+        elif choice == '4':
+            for n in NAMES:
+                if owned(n):
+                    print(n, run('docker', 'inspect', '--format', '{{.State.Status}}', n, capture=True))
+            run('systemctl', 'status', '--no-pager', 'xiazt-sub', check=False)
+            if c.get('hy2_enabled'):
+                print('hysteria-server', run('systemctl', 'is-active', 'hysteria-server', capture=True, check=False))
+            print('详细日志：docker logs xiazt-panel / docker logs xiazt-edge / docker logs xiazt-cf / journalctl -u hysteria-server')
+        elif choice == '5':
+            resume(c)
+        elif choice == '6':
+            for n in NAMES:
+                if owned(n):
+                    run('docker', 'restart', n, capture=True)
+            run('systemctl', 'restart', 'xiazt-sub')
+            if c.get('hy2_enabled') and is_hy2_installed():
+                run('systemctl', 'restart', 'hysteria-server', check=False)
+            c['complete'] = verify_public(c)
+            save(c)
+        elif choice == '7':
+            current = c.get('subscription_name', DEFAULT_SUB_NAME)
+            value = ask(f'自定义订阅名称 [{current}]：', current)
+            try:
+                c['subscription_name'] = subscription_name(value)
+            except ValueError as exc:
+                print(str(exc))
+                continue
+            save(c)
+            print('已更新订阅名称：' + c['subscription_name'] + '。在客户端更新订阅即可生效。')
+        elif choice == '8':
+            manage_hy2_menu()
+        elif choice == '9':
+            remove()
+            if not STATE.exists():
+                return
+        else:
+            print('输入错误：请选择菜单中的编号。')
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'serve':
+        serve()
+        return
+    if os.geteuid() != 0:
+        raise RuntimeError('请用 root 或 sudo 运行')
+    import fcntl
+    lock_fd = os.open('/run/lock/xiazt.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise RuntimeError('另一个瞎折腾管理任务正在运行，请先退出它')
+    os.umask(0o077)
+    print(BANNER)
+    print('GitHub   https://github.com/xiazheteng8\n'
+          'TG       https://t.me/xiazheteng8\n'
+          'YouTube  https://www.youtube.com/@xiazheteng8\n')
+    if len(sys.argv) > 1 and sys.argv[1] == 'install':
+        installation_menu()
+    elif STATE.exists():
+        menu()
+    else:
+        installation_menu()
+    os.close(lock_fd)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('\n已中断；已有状态保留，可运行 x 管理。')
+        sys.exit(130)
+    except Exception as exc:
+        if isinstance(exc, (urllib.error.URLError, urllib.error.HTTPError)):
+            print('网络请求失败：' + type(exc).__name__ + '；请检查网络和 API 权限', file=sys.stderr)
+        else:
+            print('失败：' + str(exc), file=sys.stderr)
+        sys.exit(1)
+XIAZT_PYTHON_EOF_938715
+python3 "$workdir/manager.py" "$@"
