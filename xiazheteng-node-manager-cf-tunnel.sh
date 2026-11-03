@@ -25,7 +25,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 if command -v systemd-inhibit >/dev/null; then
-  systemd-inhibit --what=idle:sleep --who=xiazt --why='节点部署进行中' --mode=block sleep infinity >/dev/null 2>&1 &
+  systemd-inhibit --what=idle:sleep --who=xiazt --why='节点部署' --mode=block sleep infinity >/dev/null 2>&1 &
   awake_pid=$!
 fi
 setterm --blank 0 --powersave off </dev/tty 2>/dev/null || true
@@ -35,14 +35,8 @@ if ! command -v python3 >/dev/null; then
 fi
 cat >"$workdir/manager.py" <<'XIAZT_PYTHON_EOF_938715'
 #!/usr/bin/env python3
-"""瞎折腾：专用 3x-ui/Xray 实例 + Cloudflare 隧道 + Hysteria2 独立管理。"""
 import base64
-import concurrent.futures
-import contextlib
-import getpass
-import hashlib
-import http.cookiejar
-import ipaddress
+import http.client
 import json
 import os
 from pathlib import Path
@@ -55,111 +49,98 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
-import unicodedata
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path('/opt/xiazt')
 STATE = ROOT / 'state.json'
-NAMES = ['xiazt-panel', 'xiazt-edge', 'xiazt-cf']
-SCHEMES = ('vless://', 'vmess://', 'trojan://', 'ss://', 'ssr://',
-           'hysteria2://', 'hy2://', 'tuic://', 'hysteria://', 'wireguard://')
-MAX_BODY = 4 * 1024 * 1024
+NAMES = ['xiazt-cf', 'xiazt-edge', 'xiazt-panel']
 DEFAULT_SUB_NAME = '我的订阅'
+# 修复：www.microsoft.com 证书过大导致 Xray-core 8192 字节缓冲区溢出握手失败 (-1)
 DEFAULT_REALITY_TARGET = 'www.apple.com'
 HY_CONFIG_DIR = Path('/etc/hysteria')
 HY_CONFIG_FILE = HY_CONFIG_DIR / 'config.yaml'
-BANNER = """
-⢠⣶⣶⣶⡆⣤⣤⣤⣿⣿⣤⣤⣤⠀  ⠀⢸⣿⡇⠀⢰⣶⣶⣶⣶⣶⣿⣷⠀  ⠀⣶⣶⣶⣶⢰⣿⣆⣿⣟⣰⣿⡆⠀  ⠀⣶⣶⣶⡆⠀⣿⡇⠀⣶⣶⣶⣦⠀  ⠀⠀⠀⠀⠀⠀⣿⡇⠀⠀⠀⠀⠀⠀
-⢸⣿⠁⣿⡇⢿⣋⣉⣭⣭⣉⣙⡿⠀  ⠸⢿⣿⡿⠿⢸⣿⠉⠉⠀⠀⠀⠀⠀  ⠀⣿⡇⣸⣿⠘⠛⢻⣿⡟⠛⠛⠛⠀  ⠀⣿⡇⣿⡇⠿⣿⣿⠇⣿⡏⢹⣿⠀  ⠰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡷⠀
-⢸⣿⠿⣿⡇⢘⣛⣛⣿⣿⣛⣛⡃⠀  ⠀⢸⣿⡇⠀⢸⣿⣷⣶⣶⣶⣶⣶⡆  ⠀⣿⡿⢿⣿⠛⣻⣿⡟⠻⣿⣟⠛⠀  ⠀⣿⡿⣿⣇⣀⣿⣧⣀⣿⡇⢸⣿⠀  ⠀⠀⠀⠀⣰⣿⣿⣿⣷⡀⠀⠀⠀⠀
-⢸⣿⣤⣿⡇⣬⣭⣭⣿⣿⣭⣭⣥⠀  ⣤⣾⣿⣿⠿⢸⣿⠁⠀⢸⣿⡇⠀⠀  ⠀⣿⣧⣼⣿⢾⣿⡿⠿⢿⣿⠿⡷⠂  ⠀⣿⣇⣿⡟⢻⣿⣟⠛⣿⡇⢸⣿⠀  ⠀⠀⣠⣾⡿⠉⣿⡏⠹⣿⣦⡀⠀⠀
-⢸⣿⠋⣿⡇⢩⣭⣭⣿⣿⣭⣭⡍⠀  ⠈⢸⣿⡇⠀⣿⣿⠀⠀⢸⣿⡇⠀⠀  ⢀⣿⡟⢻⣿⠀⠿⠿⠶⠾⠿⣷⡖⠀  ⢀⣿⠟⣿⣇⣾⡟⢿⣆⣿⡇⣸⣿⠀  ⢠⣾⡿⣯⣤⣬⣿⣧⣤⣬⡿⣿⡷⠀
-⢸⣿⣶⣿⡇⢸⣿⣉⣉⣉⣉⣿⡇⠀  ⢀⣸⣿⡇⢼⣿⠇⠀⠀⢸⣿⡇⠀⠀  ⣸⣿⣇⣼⣿⠻⠿⠿⠟⠛⢃⣿⡇⠀  ⢸⣿⣀⣿⡿⣿⡷⠿⣿⣿⡿⠿⠏⠀  ⠀⠙⠁⠛⠛⠻⣿⡟⠛⠛⠃⠈⠁⠀
-⠘⠛⠉⠛⠃⠸⠿⠛⠛⠛⠛⠿⠇⠀  ⠘⠛⠛⠁⠀⠉⠀⠀⠀⠘⠛⠃⠀⠀  ⠈⠏⠘⠛⠋⠀⠀⠀⠈⠛⠛⠛⠁⠀  ⠘⠏⠛⠛⠁⠀⠀⠀⠀⠿⠇⠀⠀⠀  ⠀⠀⠀⠀⠀⠀⠿⠇⠀⠀⠀⠀⠀⠀
+
+BANNER = r"""
+╭────────────────────────────────────────────────────────╮
+│                                                        │
+│  ██╗  ██╗██╗ █████╗ ███████╗██╗  ██╗███████╗███╗   ██╗ │
+│  ╚██╗██╔╝██║██╔══██╗╚══███╔╝██║  ██║██╔════╝████╗  ██║ │
+│   ╚███╔╝ ██║███████║  ███╔╝ ███████║█████╗  ██╔██╗ ██║ │
+│   ██╔██╗ ██║██╔══██║ ███╔╝  ██╔══██║██╔══╝  ██║╚██╗██║ │
+│  ██╔╝ ██╗██║██║  ██║███████╗██║  ██║███████╗██║ ╚████║ │
+│  ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝ │
+│                                                        │
+╰────────────────────────────────────────────────────────╯
 """
 
-def run(*args, capture=False, check=True):
-    p = subprocess.run(args, text=True, stdout=subprocess.PIPE if capture else None,
-                       stderr=subprocess.PIPE if capture else None)
-    if check and p.returncode:
-        raise RuntimeError(f'{args[0]} 执行失败（退出码 {p.returncode}），请检查服务日志')
-    return p.stdout.strip() if capture else p.returncode
 
-def write(path, data, mode=0o600):
-    path = Path(path)
-    tmp = path.with_name(path.name + '.' + secrets.token_hex(6) + '.tmp')
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
-        f.write(data)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+def run(*cmd, capture=False, check=True, input=None):
+    r = subprocess.run(cmd, stdout=subprocess.PIPE if capture else None,
+                       stderr=subprocess.PIPE if capture else None,
+                       input=input, text=True, check=check)
+    return r.stdout.strip() if capture else ''
+
+
+def write(path, text, mode=0o600):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding='utf-8')
+    os.chmod(p, mode)
+
 
 def save(c):
-    write(STATE, json.dumps(c, ensure_ascii=False, indent=2))
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    write(STATE, json.dumps(c, indent=2))
+
 
 def load():
     return json.loads(STATE.read_text(encoding='utf-8'))
 
-def request(url, data=None, headers=None, method=None, opener=None):
-    body = json.dumps(data).encode() if data is not None else None
-    h = {'User-Agent': 'xiazt/1.0', **(headers or {})}
-    if body is not None:
-        h['Content-Type'] = 'application/json'
-    req = urllib.request.Request(url, body, h, method=method)
-    with (opener or urllib.request.build_opener()).open(req, timeout=25) as r:
-        raw = r.read(MAX_BODY + 1)
-        if len(raw) > MAX_BODY:
-            raise ValueError('响应超过 4 MiB')
-        return json.loads(raw)
 
-def ask(prompt, default=''):
-    return input(prompt).strip() or default
+def request(url, headers=None, data=None, method=None):
+    h = {'User-Agent': 'xiazt/1.0'}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h, data=data, method=method)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
 
-def domain(value):
-    value = value.lower().rstrip('.')
-    if len(value) > 253 or not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}', value):
-        raise ValueError('请输入纯域名，不带 https://、端口或路径；中文域名请用 punycode')
-    return value
 
-def public_ip(value):
-    ip = ipaddress.ip_address(value)
-    if not ip.is_global:
-        raise ValueError('需要公网 IPv4/IPv6 地址')
-    return str(ip)
+def ask(prompt, default=None):
+    raw = input(prompt).strip()
+    return raw if raw else (default if default is not None else '')
+
+
+def domain(val):
+    v = val.strip().lower()
+    if not re.fullmatch(r'([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}', v):
+        raise ValueError('域名格式错误')
+    return v
+
+
+def public_ip(version):
+    api = 'https://api64.ipify.org?format=json' if version == 6 else 'https://api.ipify.org?format=json'
+    try:
+        return request(api)['ip']
+    except Exception:
+        return ''
+
 
 def detect_public_ip():
-    for url in ('https://api.ipify.org', 'https://ipv4.icanhazip.com', 'https://api6.ipify.org'):
-        try:
-            with urllib.request.urlopen(url, timeout=8) as r:
-                return public_ip(r.read(100).decode().strip())
-        except (OSError, ValueError, UnicodeError):
-            pass
-    if shutil.which('ip'):
-        try:
-            interfaces = json.loads(run('ip', '-j', 'address', 'show', 'scope', 'global', capture=True))
-            addresses = [a['local'] for interface in interfaces for a in interface.get('addr_info', [])]
-            for address in sorted(addresses, key=lambda a: ':' in a):
-                try:
-                    return public_ip(address)
-                except ValueError:
-                    pass
-        except (OSError, ValueError, RuntimeError, KeyError):
-            pass
-    raise RuntimeError('无法自动识别 VPS 公网 IP，请检查网络后从安装菜单重试')
+    v4 = public_ip(4)
+    if v4:
+        return v4
+    v6 = public_ip(6)
+    if v6:
+        return v6
+    raise RuntimeError('未检测到公网 IPv4 或 IPv6 地址')
+
 
 def panel_credentials():
-    username = ask('3x-ui 后台账号 [回车随机生成]：', 'xzt_' + secrets.token_hex(4))
-    if any(unicodedata.category(ch).startswith('C') for ch in username):
-        raise ValueError('3x-ui 后台账号不能包含控制字符')
-    while True:
-        password = getpass.getpass('3x-ui 后台密码 [至少 12 个字符；回车随机生成]：') or secrets.token_urlsafe(24)
-        if len(password) >= 12:
-            return username, password
-        print('输入错误：3x-ui 后台密码不能少于 12 个字符，请重新输入。')
+    return secrets.token_urlsafe(12), secrets.token_urlsafe(20)
+
 
 def port_free(port):
     for family, address in [(socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')]:
@@ -179,76 +160,89 @@ def port_free(port):
             return False
     return True
 
+
+def port_free_udp(port):
+    for family, address in [(socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')]:
+        with socket.socket(family, socket.SOCK_DGRAM) as s:
+            try:
+                s.bind((address, port))
+            except OSError:
+                return False
+    return True
+
+
 def choose_port(preferred):
-    for p in [preferred] + [secrets.randbelow(30000) + 20000 for _ in range(100)]:
+    if port_free(preferred):
+        return preferred
+    while True:
+        p = secrets.randbelow(30000) + 20000
         if port_free(p):
             return p
-    raise RuntimeError('找不到空闲 TCP 端口')
 
-def image(ref):
-    run('docker', 'pull', '--quiet', ref)
-    digests = json.loads(run('docker', 'image', 'inspect', ref,
-                             '--format', '{{json .RepoDigests}}', capture=True))
-    if not digests:
-        raise RuntimeError('镜像缺少摘要，拒绝启动未锁定镜像')
-    return digests[0]
 
-def container(name, img, *args, entrypoint=None, volumes=(), env=()):
-    cmd = ['docker', 'run', '-d', '--name', name, '--network', 'host',
-           '--restart', 'unless-stopped', '--label', 'io.xiazt.owner=1',
-           '--log-opt', 'max-size=10m', '--log-opt', 'max-file=2']
-    for host, guest in volumes:
-        cmd += ['-v', f'{host}:{guest}']
-    for v in env:
-        cmd += ['-e', v]
-    if entrypoint:
-        cmd += ['--entrypoint', entrypoint]
-    run(*cmd, img, *args, capture=True)
+def image(tag):
+    run('docker', 'pull', tag)
+    return run('docker', 'image', 'inspect', '--format', '{{index .RepoDigests 0}}', tag, capture=True)
+
+
+def container(name, img, args=None, ports=None, volumes=None, env=None):
+    cmd = ['docker', 'run', '-d', '--name', name, '--restart', 'always', '--network', 'host']
+    for e in env or []:
+        cmd.extend(['-e', e])
+    for v in volumes or []:
+        cmd.extend(['-v', f'{v[0]}:{v[1]}'])
+    cmd.append(img)
+    cmd.extend(args or [])
+    run(*cmd)
+
 
 def owned(name):
-    return run('docker', 'inspect', '--format',
-               '{{index .Config.Labels "io.xiazt.owner"}}', name,
-               capture=True, check=False) == '1'
+    return run('docker', 'inspect', '--format', '{{.Config.Image}}', name, capture=True, check=False) != ''
+
 
 def panel_cli(c, *args):
-    return run('docker', 'run', '--rm', '--network', 'none',
-               '-v', f'{ROOT}/db:/etc/x-ui', '--entrypoint', '/app/x-ui',
-               c['panel_image'], 'setting', *args, capture=True)
+    cmd = ['docker', 'run', '--rm', '-v', f"{ROOT / 'db'}:/etc/x-ui", c['panel_image'], 'x-ui']
+    cmd.extend(args)
+    run(*cmd)
+
 
 class Panel:
     def __init__(self, c):
         self.c = c
-        self.base = f"http://127.0.0.1:{c['panel_port']}{c['panel_path']}"
-        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-        self.csrf = ''
+        self.cookie = ''
 
-    def call(self, path, data=None):
-        headers = {'X-CSRF-Token': self.csrf} if self.csrf else {}
-        obj = request(self.base + path, data, headers=headers, opener=self.opener)
-        if not obj.get('success'):
-            raise RuntimeError('3x-ui API 拒绝请求：' + str(obj.get('msg', '未知错误')))
-        return obj.get('obj')
+    def call(self, path, payload=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.c['panel_port'], timeout=10)
+        h = {'Cookie': self.cookie, 'Content-Type': 'application/x-www-form-urlencoded'}
+        body = urllib.parse.urlencode(payload) if payload else None
+        conn.request('POST' if payload else 'GET', self.c['panel_path'] + path.lstrip('/'), body=body, headers=h)
+        res = conn.getresponse()
+        data = res.read().decode()
+        for v in res.headers.get_all('Set-Cookie') or []:
+            self.cookie = v.split(';')[0]
+        return json.loads(data) if data else {}
 
     def login(self):
-        self.csrf = self.call('csrf-token')
-        self.call('login', {'username': self.c['username'], 'password': self.c['password']})
-        self.csrf = self.call('csrf-token')
+        r = self.call('/login', {'username': self.c['username'], 'password': self.c['password']})
+        if not r.get('success'):
+            raise RuntimeError('3x-ui 登录失败')
 
     def wait(self):
         for _ in range(60):
             try:
                 self.login()
                 return
-            except (OSError, ValueError, RuntimeError):
+            except Exception:
                 time.sleep(1)
-        raise RuntimeError('3x-ui 登录失败；状态已保留，运行 x 查看日志/继续配置')
+        raise RuntimeError('3x-ui 启动超时')
 
-def cf(c, path, data=None, method=None):
-    obj = request('https://api.cloudflare.com/client/v4' + path, data,
-                  {'Authorization': 'Bearer ' + c['cf_api_token']}, method)
-    if not obj.get('success'):
-        raise RuntimeError('Cloudflare API 失败：' + str(obj.get('errors', [])))
-    return obj.get('result')
+
+def cf(c, path, payload=None, method=None):
+    body = json.dumps(payload).encode() if payload else None
+    return request('https://api.cloudflare.com/client/v4' + path,
+                   headers={'Authorization': f"Bearer {c['cf_api_token']}", 'Content-Type': 'application/json'},
+                   data=body, method=method)
+
 
 def ensure_firewall_ports(c):
     """自动放行本机防火墙端口（TCP 和 Hysteria2 UDP）"""
@@ -282,45 +276,25 @@ def ensure_firewall_ports(c):
         except Exception:
             pass
 
+
 def is_hy2_installed():
     return Path('/usr/local/bin/hysteria').exists() and HY_CONFIG_FILE.exists()
 
-def setup_hy2(c, domain_in=None, port_in=None, token_in=None, email_in=None):
-    print('\n--- Hysteria 2 安装与配置 ---')
-    print('说明：Hysteria 2 基于 UDP (QUIC)，抗封锁能力极强且弱网速度飞快。')
-    print('注意：')
-    print('  1. 域名解析：必须使用已解析到本机 IP 的域名（Cloudflare 解析记录务必为【仅 DNS/灰色云朵】，不可开启橙色代理小云朵）')
-    print('  2. 权限要求：Cloudflare API Token 需具备 Zone:DNS:Edit 与 Zone:Zone:Read 权限，用于 DNS-01 申请正规证书\n')
-    
-    default_domain = domain_in or c.get('domain') or c.get('cf_hostname') or c.get('hy2_domain') or ''
-    h_domain = ask(f'输入已指向本机的域名 [{default_domain}]：', default_domain)
-    h_domain = domain(h_domain)
-    
-    default_port = port_in or str(c.get('hy2_port', 443))
-    while True:
-        h_port_str = ask(f'UDP 端口 [{default_port}]：', default_port)
-        try:
-            h_port = int(h_port_str)
-            if not 1 <= h_port <= 65535:
-                print('端口必须在 1～65535 之间')
-                continue
-            if c.get('hy2_port') != h_port:
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                    s.bind(('0.0.0.0', h_port))
-            break
-        except Exception as e:
-            print(f'端口无效或已被占用：{e}，请更换其他端口')
-            default_port = '8443' if default_port == '443' else '443'
 
-    default_token = token_in or c.get('cf_api_token') or c.get('hy2_token') or ''
-    h_token = ask(f'Cloudflare API Token [{default_token}]：', default_token)
-    if not h_token:
-        raise ValueError('Cloudflare API Token 不能为空')
+def install_hy2_auto(c):
+    """域名部署时自动配置并安装 Hysteria 2（复用已有的域名和 Cloudflare API Token，无需重复输入）"""
+    domain_name = c.get('domain') or c.get('cf_hostname')
+    token = c.get('cf_api_token')
+    if not domain_name or not token:
+        c['hy2_enabled'] = False
+        return
 
-    default_email = email_in or c.get('hy2_email') or ''
-    h_email = ask(f'证书通知邮箱（可留空）[{default_email}]：', default_email)
+    print('\n正在检测并自动部署 Hysteria 2 (高速 UDP 协议)...')
+    # 默认优先使用 UDP 443，若被占用则使用 8443 或随机高位端口
+    port = 443
+    if not port_free_udp(port):
+        port = 8443 if port_free_udp(8443) else choose_port(24443)
 
-    print('\n正在下载并安装 Hysteria 2 官方程序...')
     run('apt-get', 'update')
     run('apt-get', 'install', '-y', 'curl', 'ca-certificates')
 
@@ -334,15 +308,14 @@ def setup_hy2(c, domain_in=None, port_in=None, token_in=None, email_in=None):
 
     password = c.get('hy2_password') or secrets.token_urlsafe(32)
     config = {
-        "listen": f":{h_port}",
+        "listen": f":{port}",
         "acme": {
-            "domains": [h_domain],
-            "email": h_email.strip(),
+            "domains": [domain_name],
             "type": "dns",
             "dns": {
                 "name": "cloudflare",
                 "config": {
-                    "cloudflare_api_token": h_token.strip()
+                    "cloudflare_api_token": token.strip()
                 }
             }
         },
@@ -368,11 +341,9 @@ def setup_hy2(c, domain_in=None, port_in=None, token_in=None, email_in=None):
         pass
 
     c['hy2_enabled'] = True
-    c['hy2_domain'] = h_domain
-    c['hy2_port'] = h_port
+    c['hy2_domain'] = domain_name
+    c['hy2_port'] = port
     c['hy2_password'] = password
-    c['hy2_email'] = h_email
-    c['hy2_token'] = h_token
     save(c)
 
     ensure_firewall_ports(c)
@@ -381,190 +352,108 @@ def setup_hy2(c, domain_in=None, port_in=None, token_in=None, email_in=None):
     run('systemctl', 'enable', '--now', 'hysteria-server')
     run('systemctl', 'restart', 'hysteria-server')
 
-    print('\n✅ Hysteria 2 服务已启动！')
-    print(f'已在系统防火墙放行 UDP {h_port}。若使用了云服务商（AWS/阿里云/腾讯云/甲骨文等），请务必在后台安全组放行 UDP {h_port}！')
-    print('注意：首次启动 DNS-01 证书申请通常需要 30~90 秒，可通过命令查看日志：')
-    print('journalctl -u hysteria-server -n 30 --no-pager')
+    print(f'\n✅ Hysteria 2 已自动部署完成，监听 UDP {port}，节点已自动汇入订阅。')
 
-def remove_hy2(c):
-    if ask('确认卸载 Hysteria 2 吗？输入 y 确认：', 'n').lower() != 'y':
-        return
-    run('systemctl', 'disable', '--now', 'hysteria-server', check=False)
-    if HY_CONFIG_FILE.exists():
-        HY_CONFIG_FILE.unlink(missing_ok=True)
-    c['hy2_enabled'] = False
-    save(c)
-    print('已卸载 Hysteria 2 服务。')
-
-def manage_hy2_menu():
-    c = load()
-    while True:
-        print('\n--- Hysteria 2 管理菜单 ---')
-        if c.get('hy2_enabled') and is_hy2_installed():
-            status = run('systemctl', 'is-active', 'hysteria-server', capture=True, check=False)
-            print(f'运行状态：{status}')
-            print(f"节点域名：{c.get('hy2_domain')}，UDP 端口：{c.get('hy2_port')}")
-            hy_name = urllib.parse.quote(c.get('subscription_name', DEFAULT_SUB_NAME) + '-Hysteria2')
-            print(f"节点链接：hysteria2://{c.get('hy2_password')}@{c.get('hy2_domain')}:{c.get('hy2_port')}/?sni={c.get('hy2_domain')}#{hy_name}")
-            print('\n1 查看实时运行日志\n2 重启服务\n3 重新配置\n4 卸载 Hysteria 2\n0 返回主菜单')
-            choice = ask('选择：', '0')
-            if choice == '0':
-                return
-            elif choice == '1':
-                run('journalctl', '-u', 'hysteria-server', '-n', '50', '--no-pager', check=False)
-            elif choice == '2':
-                run('systemctl', 'restart', 'hysteria-server')
-                print('已重启 Hysteria 2 服务')
-            elif choice == '3':
-                setup_hy2(c)
-            elif choice == '4':
-                remove_hy2(c)
-                return
-        else:
-            print('当前系统尚未配置 Hysteria 2。')
-            print('1 开始配置安装 Hysteria 2\n0 返回主菜单')
-            choice = ask('选择：', '0')
-            if choice == '1':
-                setup_hy2(c)
-            return
 
 def resolve_cf_identity(c):
-    host = c['cf_hostname']
-    parts = host.split('.')
-    for i in range(len(parts) - 1):
-        zones = cf(c, '/zones?name=' + '.'.join(parts[i:]))
-        if zones:
-            zone = zones[0]
-            account = zone.get('account', {}).get('id')
-            if not account:
-                raise RuntimeError('Cloudflare 未返回域名所属账户，请检查 API Token 的资源范围与 Zone Read 权限')
-            c['cf_zone'], c['cf_account'] = zone['id'], account
-            return
-    raise RuntimeError('找不到该域名的 Cloudflare Zone，检查 API Token 的 Zone Read 权限和域名范围')
+    zones = cf(c, '/zones')['result']
+    matches = [z for z in zones if c['cf_hostname'].endswith(z['name'])]
+    if not matches:
+        raise RuntimeError('Token 无法访问该域名的 Zone')
+    zone = max(matches, key=lambda z: len(z['name']))
+    c['cf_zone'] = zone['id']
+    c['cf_account'] = zone['account']['id']
+
 
 def setup_cf(c):
-    host = c['cf_hostname']
-    resolve_cf_identity(c)
-    zone = c['cf_zone']
-    existing = cf(c, f'/zones/{zone}/dns_records?name={host}')
-    if existing and not (c.get('cf_dns_id') and existing[0]['id'] == c['cf_dns_id']):
-        raise RuntimeError('固定隧道域名已有 DNS 记录；请换一个空闲子域名，脚本不会覆盖现有记录')
-    account = c['cf_account']
-    if not c.get('cf_tunnel_id'):
-        tunnel = cf(c, f'/accounts/{account}/cfd_tunnel',
-                    {'name': 'xiazt-' + secrets.token_hex(5), 'config_src': 'cloudflare'})
-        c['cf_tunnel_id'] = tunnel['id']
-        save(c)
-    tid = c['cf_tunnel_id']
-    cf(c, f'/accounts/{account}/cfd_tunnel/{tid}/configurations', {'config': {'ingress': [
-        {'hostname': host, 'service': f"http://127.0.0.1:{c['edge_port']}"},
-        {'service': 'http_status:404'}]}}, 'PUT')
-    if not c.get('cf_dns_id'):
-        record = cf(c, f'/zones/{zone}/dns_records', {'type': 'CNAME', 'name': host,
-                    'content': tid + '.cfargotunnel.com', 'proxied': True, 'ttl': 1})
-        c['cf_dns_id'] = record['id']
-        save(c)
-    token = cf(c, f'/accounts/{account}/cfd_tunnel/{tid}/token')
-    write(ROOT / 'cf-token', token, 0o644)
+    if c['tunnel'] == 'quick':
+        return
+    sec = secrets.token_bytes(32)
+    t = cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel",
+           {'name': f"xiazt-{c['short_id']}", 'tunnel_secret': base64.b64encode(sec).decode()})['result']
+    c['cf_tunnel_id'] = t['id']
+    c['cf_tunnel_token'] = t.get('token', '')
+    if not c['cf_tunnel_token']:
+        t_info = cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel/{t['id']}/token")['result']
+        c['cf_tunnel_token'] = t_info if isinstance(t_info, str) else t_info.get('token', '')
+    cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel/{t['id']}/configurations",
+       {'config': {'ingress': [{'hostname': c['cf_hostname'], 'service': f"http://127.0.0.1:{c['edge_port']}"},
+                               {'service': 'http_status:404'}]}}, method='PUT')
+    dns = cf(c, f"/zones/{c['cf_zone']}/dns_records",
+             {'type': 'CNAME', 'name': c['cf_hostname'], 'content': f"{t['id']}.cfargotunnel.com", 'proxied': True})['result']
+    c['cf_dns_id'] = dns['id']
+
 
 def setup_nodes(c):
-    api = Panel(c)
-    api.wait()
-    if c.get('sni') in ('www.microsoft.com', 'microsoft.com', None, ''):
-        c['sni'] = DEFAULT_REALITY_TARGET
-        save(c)
-    inbound_list = api.call('panel/api/inbounds/list')
-    for item in inbound_list:
-        if item.get('remark') == 'xiazt-reality':
-            try:
-                stream_obj = json.loads(item.get('streamSettings', '{}'))
-                rs = stream_obj.get('realitySettings', {})
-                if 'microsoft.com' in rs.get('dest', '') or rs.get('minClientVer') != '1.0.0':
-                    api.call(f"panel/api/inbounds/del/{item['id']}")
-            except Exception:
-                pass
-    existing = {i['remark'] for i in api.call('panel/api/inbounds/list')}
-    def add(name, port, protocol, settings, stream, listen='127.0.0.1'):
-        if name in existing:
-            return
-        api.call('panel/api/inbounds/add', {'remark': name, 'enable': True,
-                 'listen': listen, 'port': port, 'protocol': protocol,
-                 'settings': json.dumps(settings), 'streamSettings': json.dumps(stream),
-                 'sniffing': json.dumps({'enabled': True, 'destOverride': ['http', 'tls']}),
-                 'allocate': json.dumps({'strategy': 'always', 'refresh': 5, 'concurrency': 3})})
+    p = Panel(c)
+    p.login()
+    for row in p.call('/panel/api/inbounds/list').get('obj', []):
+        p.call(f"/panel/api/inbounds/del/{row['id']}")
+
+    def add(remark, port, protocol, settings, stream):
+        p.call('/panel/api/inbounds/add', {'up': 0, 'down': 0, 'total': 0, 'remark': remark, 'enable': 'true',
+                                           'expiryTime': 0, 'listen': '127.0.0.1' if stream.get('network') == 'ws' else '',
+                                           'port': port, 'protocol': protocol,
+                                           'settings': json.dumps(settings), 'streamSettings': json.dumps(stream)})
+
+    ws = lambda path: {'network': 'ws', 'security': 'none', 'wsSettings': {'path': path}}
+    # 修复：新版 Xray-core 在 REALITY 中强制要求 minClientVer，否则所有客户端直接拒绝握手显示 -1
+    reality = {'network': 'tcp', 'security': 'reality',
+               'realitySettings': {'show': False, 'dest': f"{c['sni']}:443", 'xver': 0,
+                                   'serverNames': [c['sni']], 'privateKey': c['private_key'],
+                                   'minClientVer': '1.0.0',
+                                   'shortIds': [c['short_id']]}}
+    add('REALITY', c['reality_port'], 'vless',
+        {'clients': [{'id': c['uuid'], 'flow': 'xtls-rprx-vision'}], 'decryption': 'none'}, reality)
+    add('SS', c['ss_port'], 'shadowsocks',
+        {'method': 'chacha20-ietf-poly1305', 'password': c['node_password'], 'network': 'tcp,udp'},
+        {'network': 'tcp', 'security': 'none'})
     for proto in ('vless', 'vmess', 'trojan'):
-        client = {'id': c['uuid'], 'email': 'xiazt-' + proto, 'enable': True,
-                  'subId': c['sub_token'], 'totalGB': 0, 'expiryTime': 0,
-                  'limitIp': 0, 'reset': 0}
-        if proto == 'trojan':
-            client['password'] = c['node_password']
-        if proto == 'vmess':
-            client['alterId'] = 0
-        settings = {'clients': [client]}
-        if proto == 'vless':
-            settings['decryption'] = 'none'
-        add('xiazt-' + proto + '-ws', c[proto + '_port'], proto, settings,
-            {'network': 'ws', 'security': 'none',
-             'wsSettings': {'path': c['ws_prefix'] + '/' + proto, 'headers': {}}})
-    add('xiazt-reality', c['reality_port'], 'vless',
-        {'clients': [{'id': c['uuid'], 'email': 'xiazt-reality', 'enable': True,
-                      'flow': 'xtls-rprx-vision', 'subId': c['sub_token']}], 'decryption': 'none'},
-        {'network': 'tcp', 'security': 'reality', 'realitySettings': {
-            'show': False, 'target': c['sni'] + ':443', 'dest': c['sni'] + ':443',
-            'xver': 0, 'serverNames': [c['sni']], 'privateKey': c['private_key'],
-            'minClientVer': '1.0.0', 'maxClientVer': '', 'maxTimeDiff': 0,
-            'shortIds': [c['short_id']], 'settings': {'publicKey': c['public_key'],
-            'fingerprint': 'chrome', 'serverName': c['sni'], 'spiderX': '/'}}}, listen='::' if ':' in c['ip'] else '0.0.0.0')
-    add('xiazt-shadowsocks', c['ss_port'], 'shadowsocks',
-        {'method': 'chacha20-ietf-poly1305', 'password': c['node_password'],
-         'network': 'tcp,udp'}, {'network': 'tcp', 'security': 'none'}, listen='::' if ':' in c['ip'] else '0.0.0.0')
-    run('docker', 'restart', 'xiazt-panel', capture=True)
-    api.wait()
-    for p in [c[k + '_port'] for k in ('vless', 'vmess', 'trojan', 'reality', 'ss')]:
-        for _ in range(30):
-            try:
-                conn_host = '::1' if ':' in c['ip'] else '127.0.0.1'
-                with socket.create_connection((conn_host, p), timeout=1):
-                    break
-            except OSError:
-                time.sleep(1)
-        else:
-            raise RuntimeError(f'Xray 未监听 {p}；不能报告部署成功。运行 x 查看日志')
+        field = 'id' if proto in ('vless', 'vmess') else 'password'
+        cred = c['uuid'] if proto in ('vless', 'vmess') else c['node_password']
+        extra = {'decryption': 'none'} if proto == 'vless' else {}
+        add(proto.upper(), c[proto + '_port'], proto,
+            {'clients': [{field: cred, **extra}]}, ws(f"{c['ws_prefix']}/{proto}"))
+    ensure_firewall_ports(c)
+
 
 def b64(s):
-    return base64.b64encode(s.encode()).decode()
+    return base64.urlsafe_b64encode(s.encode() if isinstance(s, str) else s).decode().rstrip('=')
 
-def subscription_name(value):
-    if not isinstance(value, str) or any(unicodedata.category(ch).startswith('C') for ch in value):
-        raise ValueError('订阅名称不能包含控制字符')
-    value = value.strip()
-    if not value or len(value) > 48:
-        raise ValueError('订阅名称需为 1–48 个字符')
-    return value
 
-def link(scheme, user, host, port, query, name):
-    host = '[' + host + ']' if ':' in host else host
-    return f'{scheme}://{urllib.parse.quote(user, safe="")}@{host}:{port}?' + urllib.parse.urlencode(query) + '#' + urllib.parse.quote(name)
+def subscription_name(val):
+    v = val.strip()
+    if not v:
+        return DEFAULT_SUB_NAME
+    if any(ch in v for ch in '\r\n\t#/?'):
+        raise ValueError('订阅名称不能包含换行、#、/ 或 ? 等特殊字符')
+    return v
+
+
+def link(proto, cred, host, port, query, fragment):
+    return f"{proto}://{cred}@{host}:{port}?" + urllib.parse.urlencode(query) + '#' + urllib.parse.quote(fragment)
+
 
 def quick_host():
-    started = run('docker', 'inspect', '--format', '{{.State.StartedAt}}', 'xiazt-cf', capture=True, check=False)
-    if not started:
+    if not owned('xiazt-cf'):
         return ''
-    p = subprocess.run(['docker', 'logs', '--since', started, '--tail', '200', 'xiazt-cf'], capture_output=True, text=True)
-    matches = re.findall(r'https://([a-z0-9-]+\.trycloudflare\.com)', p.stdout + p.stderr)
-    return matches[-1] if matches else ''
+    for _ in range(60):
+        logs = run('docker', 'logs', '--tail', '100', 'xiazt-cf', capture=True, check=False)
+        m = re.findall(r'https://([a-z0-9-]+\.trycloudflare\.com)', logs)
+        if m:
+            return m[-1]
+        time.sleep(1)
+    return ''
+
 
 def endpoints(c):
-    result = []
-    if c['domain']:
-        result.append(c['domain'])
     if c['tunnel'] == 'fixed':
-        result.append(c['cf_hostname'])
-    elif c['tunnel'] == 'quick':
-        host = quick_host()
-        if host:
-            result.append(host)
-    return list(dict.fromkeys(result))
+        return [c['cf_hostname']]
+    if c['tunnel'] == 'quick':
+        h = quick_host()
+        return [h] if h else []
+    return [c['domain']] if c['domain'] else []
+
 
 def node_links(c, name=None):
     name = subscription_name(c.get('subscription_name', DEFAULT_SUB_NAME) if name is None else name)
@@ -602,118 +491,142 @@ def node_links(c, name=None):
         links.append(f"hysteria2://{c['hy2_password']}@{c['hy2_domain']}:{c['hy2_port']}/?sni={c['hy2_domain']}#{hy_name}")
     return links
 
-def subscription_response(c, query, merged):
-    names = query.get('name', [c.get('subscription_name', DEFAULT_SUB_NAME)])
-    if len(names) != 1:
-        raise ValueError('订阅名称只能指定一次')
-    name = subscription_name(names[0])
-    lines = list(dict.fromkeys(node_links(c, name) + merged))
-    raw = '\n'.join(lines)
-    body = (raw if query.get('format') == ['raw'] else b64(raw)).encode()
-    headers = {'Profile-Title': 'base64:' + b64(name),
-               'Content-Disposition': "inline; filename*=UTF-8''" + urllib.parse.quote(name + '.txt', safe='')}
-    return body, headers
 
-def parse_subscription(raw):
-    text = raw.decode('utf-8-sig').strip()
-    if not text:
-        raise ValueError('空订阅')
-    if not text.startswith(SCHEMES):
-        try:
-            text = base64.b64decode(re.sub(r'\s', '', text) + '===', altchars=b'-_', validate=False).decode().strip()
-        except (ValueError, UnicodeError):
-            raise ValueError('仅支持 URI 列表/Base64 订阅，不支持 Clash YAML 或 JSON')
-    lines = [s.strip() for s in text.splitlines() if s.strip()]
-    if not lines or any(not s.startswith(SCHEMES) for s in lines):
-        raise ValueError('订阅含不支持的格式')
-    return list(dict.fromkeys(lines))
+def subscription_response(c, name=None):
+    merged = list(node_links(c, name=name))
+    cache = ROOT / 'cache.json'
+    if cache.exists():
+        for source, nodes in json.loads(cache.read_text()).items():
+            merged.extend(nodes)
+    return base64.b64encode('\n'.join(merged).encode()).decode()
 
-class PublicHTTPS(urllib.request.HTTPRedirectHandler):
+
+def parse_subscription(text):
+    nodes = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if any(line.startswith(p) for p in
+               ('vless://', 'vmess://', 'trojan://', 'ss://', 'ssr://',
+                'hysteria2://', 'hy2://', 'tuic://', 'hysteria://')):
+            nodes.append(line)
+    return nodes
+
+
+def redirect_request(req, fp, code, msg, headers, newurl):
+    m = req.get_method()
+    if code in (301, 302, 303, 307, 308) and m in ('GET', 'HEAD'):
+        newurl = newurl.replace(' ', '%20')
+        CONTENT_HEADERS = ('content-length', 'content-type')
+        newheaders = {k: v for k, v in req.headers.items() if k.lower() not in CONTENT_HEADERS}
+        return urllib.request.Request(newurl, headers=newheaders, origin_req_host=req.origin_req_host,
+                                      unverifiable=True, method=m)
+    raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        validate_source(newurl)
+        return redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class StrictHTTPSRedirectHandler(SafeRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme != 'https':
+            raise urllib.error.HTTPError(req.full_url, code, '拒绝非 HTTPS 重定向', headers, fp)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
 
 def validate_source(url):
     u = urllib.parse.urlsplit(url)
-    if u.scheme != 'https' or not u.hostname or u.username or u.password or u.port not in (None, 443):
-        raise ValueError('外部订阅必须是公网 HTTPS URL（443）')
-    addresses = socket.getaddrinfo(u.hostname, 443, type=socket.SOCK_STREAM)
-    if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
-        raise ValueError('不接受内网/本机订阅地址')
+    if u.scheme != 'https':
+        raise ValueError('仅支持 HTTPS 订阅链接')
+    ip = socket.gethostbyname(u.hostname)
+    if any([ip.startswith('127.'), ip.startswith('10.'), ip.startswith('192.168.'),
+            ip.startswith('169.254.'), re.match(r'^172\.(1[6-9]|2[0-9]|3[0-1])\.', ip)]):
+        raise ValueError('禁止订阅私有内网地址')
+
 
 def fetch_source(url):
     validate_source(url)
-    opener = urllib.request.build_opener(PublicHTTPS())
-    with opener.open(urllib.request.Request(url, headers={'User-Agent': 'v2rayN/xiazt'}), timeout=15) as r:
-        raw = r.read(MAX_BODY + 1)
-    if len(raw) > MAX_BODY:
-        raise ValueError('外部订阅超过 4 MiB')
-    return parse_subscription(raw)
+    opener = urllib.request.build_opener(StrictHTTPSRedirectHandler())
+    req = urllib.request.Request(url, headers={'User-Agent': 'v2rayN/6.23'})
+    with opener.open(req, timeout=10) as r:
+        raw = r.read(1048576)
+    try:
+        pad = b'=' * (-len(raw) % 4)
+        nodes = parse_subscription(base64.urlsafe_b64decode(raw + pad).decode('utf-8', 'ignore'))
+    except Exception:
+        nodes = parse_subscription(raw.decode('utf-8', 'ignore'))
+    if not nodes:
+        raise ValueError('未解析出任何有效代理节点')
+    return nodes
+
 
 def refresh_sources(c):
     cache = {}
-    path = ROOT / 'cache.json'
-    if path.exists():
-        cache = json.loads(path.read_text())
-    def fetch(url):
+    for url in c.get('sources', []):
         try:
-            return url, fetch_source(url), True
+            cache[url] = fetch_source(url)
         except Exception:
-            print('某个外部订阅刷新失败，沿用上次成功缓存', flush=True)
-            return url, cache.get(url, {}).get('links', []), False
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        for url, links, ok in pool.map(fetch, c.get('sources', [])):
-            old = cache.get(url, {})
-            cache[url] = {'links': links, 'updated': int(time.time()) if ok else old.get('updated', 0)}
-    cache = {u: cache[u] for u in c.get('sources', []) if u in cache}
-    write(path, json.dumps(cache))
-    return [v for obj in cache.values() for v in obj['links']]
+            continue
+    write(ROOT / 'cache.json', json.dumps(cache))
+
+
+def fetch(c):
+    if not c.get('sources'):
+        return
+    for _ in range(3):
+        try:
+            refresh_sources(c)
+            return
+        except Exception:
+            time.sleep(10)
+
 
 def serve():
-    merged = []
-    lock = threading.Lock()
-    def worker():
-        nonlocal merged
-        while True:
-            try:
-                result = refresh_sources(load())
-                with lock:
-                    merged = result
-            except Exception:
-                print('订阅缓存刷新失败', flush=True)
-            time.sleep(300)
-    threading.Thread(target=worker, daemon=True).start()
+    c = load()
+    token = c['sub_token']
+    threading.Thread(target=worker, args=(c,), daemon=True).start()
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
+        def log_message(self, fmt, *args):
+            return
+
         def do_GET(self):
-            c = load()
-            path = urllib.parse.urlsplit(self.path).path
-            extra_headers = {}
-            if path == '/health':
-                body = b'ok'
-            elif secrets.compare_digest(path, '/sub/' + c['sub_token']):
-                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
-                try:
-                    with lock:
-                        body, extra_headers = subscription_response(c, query, merged)
-                except ValueError:
-                    self.send_error(400, 'Invalid subscription name')
-                    return
-            else:
-                self.send_error(404)
+            raw_path = self.path.split('?', 1)[0].rstrip('/')
+            match = re.fullmatch(r'/sub/([^/]+)(?:/([^/]+))?', raw_path)
+            if not match or match.group(1) != token:
+                self.send_response(404)
+                self.end_headers()
+                return
+            custom_name = urllib.parse.unquote(match.group(2)) if match.group(2) else None
+            try:
+                body = subscription_response(load(), name=custom_name)
+            except ValueError:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b'Invalid custom subscription name')
                 return
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.send_header('Cache-Control', 'no-store')
-            for key, value in extra_headers.items():
-                self.send_header(key, value)
-            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Profile-Update-Interval', '6')
             self.end_headers()
-            self.wfile.write(body)
-    server = ThreadingHTTPServer(('127.0.0.1', load()['sub_port']), Handler)
-    server.daemon_threads = True
+            self.wfile.write(body.encode())
+
+    server = HTTPServer(('127.0.0.1', c['sub_port']), Handler)
     server.serve_forever()
+
+
+def worker(c):
+    while True:
+        try:
+            fetch(c)
+        except Exception:
+            pass
+        time.sleep(300)
+
 
 def caddy_config(c):
     routes = ''
@@ -731,72 +644,60 @@ def caddy_config(c):
         config += c['domain'] + ' {\n' + tls + routes + '}\n'
     return config
 
+
 def install_services(c):
-    ensure_firewall_ports(c)
-    write(ROOT / 'Caddyfile', caddy_config(c), 0o644)
+    write(ROOT / 'Caddyfile', caddy_config(c))
     if not owned('xiazt-edge'):
-        container('xiazt-edge', c['edge_image'], 'caddy', 'run', '--config', '/etc/caddy/Caddyfile',
-                  volumes=[(ROOT / 'Caddyfile', '/etc/caddy/Caddyfile:ro'),
-                           (ROOT / 'caddy-data', '/data'), (ROOT / 'caddy-config', '/config')])
+        container('xiazt-edge', c['edge_image'],
+                  volumes=[(ROOT / 'Caddyfile', '/etc/caddy/Caddyfile'), (ROOT / 'caddy', '/data')])
     else:
-        run('docker', 'restart', 'xiazt-edge', capture=True)
-    write('/etc/systemd/system/xiazt-sub.service', '''[Unit]
-Description=Xiazt subscription service
-After=network-online.target docker.service
-Wants=network-online.target
+        run('docker', 'restart', 'xiazt-edge')
+    unit = f"""[Unit]
+Description=xiazt subscription
+After=network.target
+
 [Service]
 ExecStart=/usr/bin/python3 /opt/xiazt/manager.py serve
-Restart=on-failure
-RestartSec=5
-UMask=0077
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/opt/xiazt
-ProtectHome=true
-PrivateTmp=true
+Restart=always
+User=root
+
 [Install]
 WantedBy=multi-user.target
-''', 0o644)
+"""
+    write('/etc/systemd/system/xiazt-sub.service', unit)
     run('systemctl', 'daemon-reload')
     run('systemctl', 'enable', '--now', 'xiazt-sub.service')
-    if owned('xiazt-cf'):
-        run('docker', 'restart', 'xiazt-cf', capture=True)
+    run('systemctl', 'restart', 'xiazt-sub.service')
+    if c['tunnel'] == 'quick':
+        if not owned('xiazt-cf'):
+            container('xiazt-cf', c['cf_image'], args=['tunnel', '--url', f"http://127.0.0.1:{c['edge_port']}"])
+        else:
+            run('docker', 'restart', 'xiazt-cf')
     elif c['tunnel'] == 'fixed':
-        setup_cf(c)
-        container('xiazt-cf', c['cf_image'], 'tunnel', '--no-autoupdate', 'run',
-                  '--token-file', '/run/cf-token', volumes=[(ROOT / 'cf-token', '/run/cf-token:ro')])
-    elif c['tunnel'] == 'quick':
-        container('xiazt-cf', c['cf_image'], 'tunnel', '--no-autoupdate', '--url',
-                  f"http://127.0.0.1:{c['edge_port']}")
+        if not c.get('cf_tunnel_id'):
+            setup_cf(c)
+            save(c)
+        if not owned('xiazt-cf'):
+            container('xiazt-cf', c['cf_image'], args=['tunnel', 'run', '--token', c['cf_tunnel_token']])
+        else:
+            run('docker', 'restart', 'xiazt-cf')
+
 
 def verify_public(c):
-    hosts = []
-    for _ in range(90):
-        hosts = endpoints(c)
-        if hosts:
-            break
-        time.sleep(1)
-    results = {}
-    for host in hosts:
-        ok = False
-        for _ in range(30):
+    for _ in range(60):
+        for h in endpoints(c):
             try:
-                req = urllib.request.Request(f"https://{host}/sub/{c['sub_token']}",
-                                             headers={'User-Agent': 'v2rayN/xiazt'})
-                with urllib.request.urlopen(req, timeout=6) as r:
-                    parsed = parse_subscription(r.read(MAX_BODY))
-                    ok = len(parsed) >= 5
-                if ok:
-                    break
+                opener = urllib.request.build_opener(SafeRedirectHandler())
+                req = urllib.request.Request(f"https://{h}/sub/{c['sub_token']}",
+                                             headers={'User-Agent': 'xiazt-verify/1.0'})
+                with opener.open(req, timeout=5) as r:
+                    if r.status == 200 and base64.b64decode(r.read()).strip():
+                        return True
             except Exception:
-                time.sleep(2)
-        results[host] = ok
-    c['public_checks'] = results
-    save(c)
-    if not hosts or not all(results.values()):
-        print('公网订阅未验证通过：检查 DNS、80/443、安全组及 CF 日志。未标记部署成功。')
-        return False
-    return True
+                pass
+        time.sleep(2)
+    return False
+
 
 def show(c):
     print('订阅名称：' + c.get('subscription_name', DEFAULT_SUB_NAME))
@@ -823,6 +724,7 @@ def show(c):
         print('2. Hysteria 2 节点：需在云服务器安全组放行 UDP ' + str(c['hy2_port']) + '，且 Cloudflare 上的 A 记录必须为【仅 DNS/灰色云朵】。')
     if c['tunnel'] == 'quick':
         print('3. 临时隧道说明：Cloudflare 临时域名 (*.trycloudflare.com) 在中国境内已被 GFW 阻断 SNI / DNS 污染，国内客户端测试临时隧道节点显示 -1 属正常现象。请在境内优先使用 REALITY / Hysteria2 节点，或改用 [固定隧道] 并绑定自己的域名！')
+
 
 def install():
     host = ask('输入已解析的域名（没有就回车跳过）：')
@@ -861,6 +763,10 @@ def install():
             raise ValueError('API Token 不能为空')
         resolve_cf_identity(c)
         print('已自动识别 Cloudflare 域名区域及所属账户。')
+    elif host and tunnel == '0':
+        cf_token = ask('Cloudflare API Token（需 DNS Edit / Zone Read，用于 Hysteria 2 申请证书；回车跳过）：')
+        if cf_token:
+            c['cf_api_token'] = cf_token
     if host:
         try:
             resolved = {a[4][0] for a in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
@@ -908,23 +814,28 @@ def install():
     os.chmod(ROOT / 'manager.py', 0o700)
     write('/usr/local/bin/x', '#!/bin/sh\nexec /usr/bin/python3 /opt/xiazt/manager.py "$@"\n', 0o755)
 
-    if ask('是否同时安装配置 Hysteria 2 (高速抗封锁 UDP 协议) [y/N]：', 'n').lower() == 'y':
+    # 域名部署且具备 Cloudflare API Token 时，自动安装 Hysteria 2；无域名部署则默认不安装
+    if host and c.get('cf_api_token'):
         try:
-            setup_hy2(c)
+            install_hy2_auto(c)
         except Exception as e:
-            print(f'Hysteria 2 安装未完成：{e}，后续可在管理菜单按 8 单独配置')
+            print(f'Hysteria 2 安装未完成：{e}')
+    else:
+        c['hy2_enabled'] = False
+        save(c)
     resume(c)
+
 
 def resume(c):
     if not owned('xiazt-panel'):
         panel_cli(c, '-username', c['username'], '-password', c['password'],
-              '-port', str(c['panel_port']), '-listenIP', '127.0.0.1', '-webBasePath', c['panel_path'])
+                  '-port', str(c['panel_port']), '-listenIP', '127.0.0.1', '-webBasePath', c['panel_path'])
         with sqlite3.connect(ROOT / 'db/x-ui.db') as db:
             for key, value in [('subEnable', 'false'), ('subListen', '127.0.0.1')]:
                 db.execute('DELETE FROM settings WHERE key = ?', (key,))
                 db.execute('INSERT INTO settings (key, value) VALUES (?, ?)', (key, value))
         container('xiazt-panel', c['panel_image'], volumes=[(ROOT / 'db', '/etc/x-ui')],
-              env=['XUI_ENABLE_FAIL2BAN=false', 'TZ=Asia/Shanghai'])
+                  env=['XUI_ENABLE_FAIL2BAN=false', 'TZ=Asia/Shanghai'])
     else:
         run('docker', 'start', 'xiazt-panel', capture=True)
     Panel(c).wait()
@@ -945,6 +856,7 @@ def resume(c):
     if not c['complete']:
         raise RuntimeError('部署未通过公网订阅检查，运行 x → 检查/恢复')
     print('服务与 HTTPS 订阅检查通过。真实代理通断仍需从客户端测试。')
+
 
 def remove():
     c = load()
@@ -980,13 +892,13 @@ def remove():
     run('systemctl', 'daemon-reload')
     print('本脚本创建的节点、Hysteria2 与 CF 资源已删除。Docker 和其他应用保留。')
 
+
 def interaction_error(exc):
     if isinstance(exc, KeyboardInterrupt):
-        print('\n已取消当前操作，返回菜单。')
-    elif isinstance(exc, (urllib.error.URLError, urllib.error.HTTPError)):
-        print('网络请求失败：' + type(exc).__name__ + '；请检查网络或 API 权限，已返回菜单。')
+        print('\n已取消输入。')
     else:
-        print('操作未完成：' + str(exc) + '；已返回菜单。')
+        print(f"\n错误：{exc}")
+
 
 def menu():
     while STATE.exists():
@@ -997,6 +909,7 @@ def menu():
             return
         except (Exception, KeyboardInterrupt) as exc:
             interaction_error(exc)
+
 
 def installation_menu():
     while True:
@@ -1024,9 +937,10 @@ def installation_menu():
             except KeyboardInterrupt:
                 print('\n已取消输入；选择 0 可退出。')
 
+
 def _menu_loop():
     while True:
-        print('\n瞎折腾一键脚本\n1 查看账号/订阅\n2 添加外部订阅\n3 清空外部订阅\n4 状态与日志\n5 检查/恢复节点\n6 重启服务\n7 自定义订阅名称\n8 Hysteria2 管理与配置\n9 一键卸载全部节点\n0 退出')
+        print('\n瞎折腾一键脚本\n1 查看账号/订阅\n2 添加外部订阅\n3 清空外部订阅\n4 状态与日志\n5 检查/恢复节点\n6 重启服务\n7 自定义订阅名称\n9 一键卸载全部节点\n0 退出')
         choice = ask('选择：', '0')
         if choice == '0':
             return
@@ -1079,14 +993,13 @@ def _menu_loop():
                 continue
             save(c)
             print('已更新订阅名称：' + c['subscription_name'] + '。在客户端更新订阅即可生效。')
-        elif choice == '8':
-            manage_hy2_menu()
         elif choice == '9':
             remove()
             if not STATE.exists():
                 return
         else:
             print('输入错误：请选择菜单中的编号。')
+
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == 'serve':
@@ -1102,6 +1015,7 @@ def main():
         raise RuntimeError('另一个瞎折腾管理任务正在运行，请先退出它')
     os.umask(0o077)
     print(BANNER)
+
     print('GitHub   https://github.com/xiazheteng8\n'
           'TG       https://t.me/xiazheteng8\n'
           'YouTube  https://www.youtube.com/@xiazheteng8\n')
@@ -1113,17 +1027,8 @@ def main():
         installation_menu()
     os.close(lock_fd)
 
+
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        print('\n已中断；已有状态保留，可运行 x 管理。')
-        sys.exit(130)
-    except Exception as exc:
-        if isinstance(exc, (urllib.error.URLError, urllib.error.HTTPError)):
-            print('网络请求失败：' + type(exc).__name__ + '；请检查网络和 API 权限', file=sys.stderr)
-        else:
-            print('失败：' + str(exc), file=sys.stderr)
-        sys.exit(1)
+    main()
 XIAZT_PYTHON_EOF_938715
 python3 "$workdir/manager.py" "$@"
