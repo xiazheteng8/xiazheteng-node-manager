@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 瞎折腾一键脚本 | Debian 12/13、Ubuntu 22.04/24.04 | amd64/arm64
+# 瞎折腾一键脚本（修复版） | Debian 12/13、Ubuntu 22.04/24.04 | amd64/arm64
 set -Eeuo pipefail
 [[ ${EUID} -eq 0 ]] || { echo '请使用 root 或 sudo bash x.sh'; exit 1; }
 [[ -r /etc/os-release ]] || { echo '无法识别系统'; exit 1; }
@@ -34,7 +34,7 @@ if ! command -v python3 >/dev/null; then
 fi
 cat >"$workdir/manager.py" <<'XIAZT_PYTHON_EOF_938715'
 #!/usr/bin/env python3
-"""瞎折腾：专用 3x-ui/Xray 实例，独立管理、可审计。"""
+"""瞎折腾：专用 3x-ui/Xray 实例，独立管理、可审计（修复版）。"""
 import base64
 import concurrent.futures
 import contextlib
@@ -68,8 +68,8 @@ SCHEMES = ('vless://', 'vmess://', 'trojan://', 'ss://', 'ssr://',
            'hysteria2://', 'hy2://', 'tuic://', 'hysteria://', 'wireguard://')
 MAX_BODY = 4 * 1024 * 1024
 DEFAULT_SUB_NAME = '我的订阅'
-DEFAULT_REALITY_TARGET = 'www.microsoft.com'
-# 中文字符点阵：瞎折腾脚本；78 列，无需服务器安装字体库。
+# 修复：替换 microsoft.com 为 apple.com，防止 TLS 证书链过大导致 Xray 握手崩溃
+DEFAULT_REALITY_TARGET = 'www.apple.com'
 BANNER = """
 ⢠⣶⣶⣶⡆⣤⣤⣤⣿⣿⣤⣤⣤⠀  ⠀⢸⣿⡇⠀⢰⣶⣶⣶⣶⣶⣿⣷⠀  ⠀⣶⣶⣶⣶⢰⣿⣆⣿⣟⣰⣿⡆⠀  ⠀⣶⣶⣶⡆⠀⣿⡇⠀⣶⣶⣶⣦⠀  ⠀⠀⠀⠀⠀⠀⣿⡇⠀⠀⠀⠀⠀⠀
 ⢸⣿⠁⣿⡇⢿⣋⣉⣭⣭⣉⣙⡿⠀  ⠸⢿⣿⡿⠿⢸⣿⠉⠉⠀⠀⠀⠀⠀  ⠀⣿⡇⣸⣿⠘⠛⢻⣿⡟⠛⠛⠛⠀  ⠀⣿⡇⣿⡇⠿⣿⣿⠇⣿⡏⢹⣿⠀  ⠰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡷⠀
@@ -80,15 +80,12 @@ BANNER = """
 ⠘⠛⠉⠛⠃⠸⠿⠛⠛⠛⠛⠿⠇⠀  ⠘⠛⠛⠁⠀⠉⠀⠀⠀⠘⠛⠃⠀⠀  ⠈⠏⠘⠛⠋⠀⠀⠀⠈⠛⠛⠛⠁⠀  ⠘⠏⠛⠛⠁⠀⠀⠀⠀⠿⠇⠀⠀⠀  ⠀⠀⠀⠀⠀⠀⠿⠇⠀⠀⠀⠀⠀⠀
 """
 
-
 def run(*args, capture=False, check=True):
     p = subprocess.run(args, text=True, stdout=subprocess.PIPE if capture else None,
                        stderr=subprocess.PIPE if capture else None)
     if check and p.returncode:
-        # Do not print argv: CLI arguments may contain passwords/tokens.
         raise RuntimeError(f'{args[0]} 执行失败（退出码 {p.returncode}），请检查服务日志')
     return p.stdout.strip() if capture else p.returncode
-
 
 def write(path, data, mode=0o600):
     path = Path(path)
@@ -99,14 +96,11 @@ def write(path, data, mode=0o600):
     os.chmod(tmp, mode)
     os.replace(tmp, path)
 
-
 def save(c):
     write(STATE, json.dumps(c, ensure_ascii=False, indent=2))
 
-
 def load():
     return json.loads(STATE.read_text(encoding='utf-8'))
-
 
 def request(url, data=None, headers=None, method=None, opener=None):
     body = json.dumps(data).encode() if data is not None else None
@@ -120,10 +114,8 @@ def request(url, data=None, headers=None, method=None, opener=None):
             raise ValueError('响应超过 4 MiB')
         return json.loads(raw)
 
-
 def ask(prompt, default=''):
     return input(prompt).strip() or default
-
 
 def domain(value):
     value = value.lower().rstrip('.')
@@ -131,13 +123,11 @@ def domain(value):
         raise ValueError('请输入纯域名，不带 https://、端口或路径；中文域名请用 punycode')
     return value
 
-
 def public_ip(value):
     ip = ipaddress.ip_address(value)
     if not ip.is_global:
         raise ValueError('需要公网 IPv4/IPv6 地址')
     return str(ip)
-
 
 def detect_public_ip():
     for url in ('https://api.ipify.org', 'https://ipv4.icanhazip.com', 'https://api6.ipify.org'):
@@ -159,7 +149,6 @@ def detect_public_ip():
             pass
     raise RuntimeError('无法自动识别 VPS 公网 IP，请检查网络后从安装菜单重试')
 
-
 def panel_credentials():
     username = ask('3x-ui 后台账号 [回车随机生成]：', 'xzt_' + secrets.token_hex(4))
     if any(unicodedata.category(ch).startswith('C') for ch in username):
@@ -170,12 +159,10 @@ def panel_credentials():
             return username, password
         print('输入错误：3x-ui 后台密码不能少于 12 个字符，请重新输入。')
 
-
 def port_free(port):
     for family, address in [(socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')]:
         with socket.socket(family) as s:
             try:
-                # Reinstallation must tolerate recently closed TCP connections.
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 if family == socket.AF_INET6:
                     s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
@@ -190,13 +177,11 @@ def port_free(port):
             return False
     return True
 
-
 def choose_port(preferred):
     for p in [preferred] + [secrets.randbelow(30000) + 20000 for _ in range(100)]:
         if port_free(p):
             return p
     raise RuntimeError('找不到空闲 TCP 端口')
-
 
 def image(ref):
     run('docker', 'pull', '--quiet', ref)
@@ -205,7 +190,6 @@ def image(ref):
     if not digests:
         raise RuntimeError('镜像缺少摘要，拒绝启动未锁定镜像')
     return digests[0]
-
 
 def container(name, img, *args, entrypoint=None, volumes=(), env=()):
     cmd = ['docker', 'run', '-d', '--name', name, '--network', 'host',
@@ -219,18 +203,15 @@ def container(name, img, *args, entrypoint=None, volumes=(), env=()):
         cmd += ['--entrypoint', entrypoint]
     run(*cmd, img, *args, capture=True)
 
-
 def owned(name):
     return run('docker', 'inspect', '--format',
                '{{index .Config.Labels "io.xiazt.owner"}}', name,
                capture=True, check=False) == '1'
 
-
 def panel_cli(c, *args):
     return run('docker', 'run', '--rm', '--network', 'none',
                '-v', f'{ROOT}/db:/etc/x-ui', '--entrypoint', '/app/x-ui',
                c['panel_image'], 'setting', *args, capture=True)
-
 
 class Panel:
     def __init__(self, c):
@@ -260,7 +241,6 @@ class Panel:
                 time.sleep(1)
         raise RuntimeError('3x-ui 登录失败；状态已保留，运行 x 查看日志/继续配置')
 
-
 def cf(c, path, data=None, method=None):
     obj = request('https://api.cloudflare.com/client/v4' + path, data,
                   {'Authorization': 'Bearer ' + c['cf_api_token']}, method)
@@ -268,6 +248,30 @@ def cf(c, path, data=None, method=None):
         raise RuntimeError('Cloudflare API 失败：' + str(obj.get('errors', [])))
     return obj.get('result')
 
+def ensure_firewall_ports(c):
+    """自动放行本机防火墙端口，防止外部测试连通性显示 -1"""
+    ports = [c['reality_port'], c['ss_port']]
+    if c.get('domain'):
+        ports.extend([80, 443])
+    if shutil.which('ufw'):
+        try:
+            status = run('ufw', 'status', capture=True, check=False)
+            if 'active' in status.lower() and 'inactive' not in status.lower():
+                for p in ports:
+                    run('ufw', 'allow', f'{p}/tcp', check=False)
+                    if p == c['ss_port']:
+                        run('ufw', 'allow', f'{p}/udp', check=False)
+                print(f'已在 UFW 防火墙自动放行端口：{ports}')
+        except Exception:
+            pass
+    if shutil.which('iptables'):
+        try:
+            for p in ports:
+                run('iptables', '-I', 'INPUT', '-p', 'tcp', '--dport', str(p), '-j', 'ACCEPT', check=False)
+                if p == c['ss_port']:
+                    run('iptables', '-I', 'INPUT', '-p', 'udp', '--dport', str(p), '-j', 'ACCEPT', check=False)
+        except Exception:
+            pass
 
 def resolve_cf_identity(c):
     host = c['cf_hostname']
@@ -283,7 +287,6 @@ def resolve_cf_identity(c):
             return
     raise RuntimeError('找不到该域名的 Cloudflare Zone，检查 API Token 的 Zone Read 权限和域名范围')
 
-
 def setup_cf(c):
     host = c['cf_hostname']
     resolve_cf_identity(c)
@@ -296,7 +299,7 @@ def setup_cf(c):
         tunnel = cf(c, f'/accounts/{account}/cfd_tunnel',
                     {'name': 'xiazt-' + secrets.token_hex(5), 'config_src': 'cloudflare'})
         c['cf_tunnel_id'] = tunnel['id']
-        save(c)  # record ownership before the next external mutation
+        save(c)
     tid = c['cf_tunnel_id']
     cf(c, f'/accounts/{account}/cfd_tunnel/{tid}/configurations', {'config': {'ingress': [
         {'hostname': host, 'service': f"http://127.0.0.1:{c['edge_port']}"},
@@ -307,13 +310,26 @@ def setup_cf(c):
         c['cf_dns_id'] = record['id']
         save(c)
     token = cf(c, f'/accounts/{account}/cfd_tunnel/{tid}/token')
-    # The image runs as non-root; host parent directory remains root-only (0700).
     write(ROOT / 'cf-token', token, 0o644)
-
 
 def setup_nodes(c):
     api = Panel(c)
     api.wait()
+    # 修复旧配置中使用的失效 SNI（microsoft.com 证书过长导致 Xray 握手失败）
+    if c.get('sni') in ('www.microsoft.com', 'microsoft.com', None, ''):
+        c['sni'] = DEFAULT_REALITY_TARGET
+        save(c)
+    inbound_list = api.call('panel/api/inbounds/list')
+    # 若存在旧版失效的 reality 入站（目标域名为 microsoft 或缺少 minClientVer），先删除后重建
+    for item in inbound_list:
+        if item.get('remark') == 'xiazt-reality':
+            try:
+                stream_obj = json.loads(item.get('streamSettings', '{}'))
+                rs = stream_obj.get('realitySettings', {})
+                if 'microsoft.com' in rs.get('dest', '') or rs.get('minClientVer') != '1.0.0':
+                    api.call(f"panel/api/inbounds/del/{item['id']}")
+            except Exception:
+                pass
     existing = {i['remark'] for i in api.call('panel/api/inbounds/list')}
     def add(name, port, protocol, settings, stream, listen='127.0.0.1'):
         if name in existing:
@@ -337,12 +353,14 @@ def setup_nodes(c):
         add('xiazt-' + proto + '-ws', c[proto + '_port'], proto, settings,
             {'network': 'ws', 'security': 'none',
              'wsSettings': {'path': c['ws_prefix'] + '/' + proto, 'headers': {}}})
+    # 修复：显式加入 minClientVer: 1.0.0 避免 Xray-core 新版本默认拦截旧客户端
     add('xiazt-reality', c['reality_port'], 'vless',
         {'clients': [{'id': c['uuid'], 'email': 'xiazt-reality', 'enable': True,
                       'flow': 'xtls-rprx-vision', 'subId': c['sub_token']}], 'decryption': 'none'},
         {'network': 'tcp', 'security': 'reality', 'realitySettings': {
             'show': False, 'target': c['sni'] + ':443', 'dest': c['sni'] + ':443',
             'xver': 0, 'serverNames': [c['sni']], 'privateKey': c['private_key'],
+            'minClientVer': '1.0.0', 'maxClientVer': '', 'maxTimeDiff': 0,
             'shortIds': [c['short_id']], 'settings': {'publicKey': c['public_key'],
             'fingerprint': 'chrome', 'serverName': c['sni'], 'spiderX': '/'}}}, listen='::' if ':' in c['ip'] else '0.0.0.0')
     add('xiazt-shadowsocks', c['ss_port'], 'shadowsocks',
@@ -350,21 +368,19 @@ def setup_nodes(c):
          'network': 'tcp,udp'}, {'network': 'tcp', 'security': 'none'}, listen='::' if ':' in c['ip'] else '0.0.0.0')
     run('docker', 'restart', 'xiazt-panel', capture=True)
     api.wait()
-    # API acceptance alone is insufficient: check actual listeners after core restart.
     for p in [c[k + '_port'] for k in ('vless', 'vmess', 'trojan', 'reality', 'ss')]:
         for _ in range(30):
             try:
-                with socket.create_connection(('127.0.0.1', p), timeout=1):
+                conn_host = '::1' if ':' in c['ip'] else '127.0.0.1'
+                with socket.create_connection((conn_host, p), timeout=1):
                     break
             except OSError:
                 time.sleep(1)
         else:
             raise RuntimeError(f'Xray 未监听 {p}；不能报告部署成功。运行 x 查看日志')
 
-
 def b64(s):
     return base64.b64encode(s.encode()).decode()
-
 
 def subscription_name(value):
     if not isinstance(value, str) or any(unicodedata.category(ch).startswith('C') for ch in value):
@@ -374,21 +390,17 @@ def subscription_name(value):
         raise ValueError('订阅名称需为 1–48 个字符')
     return value
 
-
 def link(scheme, user, host, port, query, name):
     host = '[' + host + ']' if ':' in host else host
     return f'{scheme}://{urllib.parse.quote(user, safe="")}@{host}:{port}?' + urllib.parse.urlencode(query) + '#' + urllib.parse.quote(name)
 
-
 def quick_host():
-    # cloudflared logs to stderr; gather both streams without leaking them.
     started = run('docker', 'inspect', '--format', '{{.State.StartedAt}}', 'xiazt-cf', capture=True, check=False)
     if not started:
         return ''
     p = subprocess.run(['docker', 'logs', '--since', started, '--tail', '200', 'xiazt-cf'], capture_output=True, text=True)
     matches = re.findall(r'https://([a-z0-9-]+\.trycloudflare\.com)', p.stdout + p.stderr)
     return matches[-1] if matches else ''
-
 
 def endpoints(c):
     result = []
@@ -402,16 +414,16 @@ def endpoints(c):
             result.append(host)
     return list(dict.fromkeys(result))
 
-
 def node_links(c, name=None):
     name = subscription_name(c.get('subscription_name', DEFAULT_SUB_NAME) if name is None else name)
     links = [link('vless', c['uuid'], c['ip'], c['reality_port'],
                   {'encryption': 'none', 'security': 'reality', 'sni': c['sni'],
                    'fp': 'chrome', 'pbk': c['public_key'], 'sid': c['short_id'],
-                   'type': 'tcp', 'flow': 'xtls-rprx-vision'}, name + '-REALITY')]
+                   'type': 'tcp', 'flow': 'xtls-rprx-vision', 'spx': '/'}, name + '-REALITY')]
     host = '[' + c['ip'] + ']' if ':' in c['ip'] else c['ip']
     links.append('ss://' + b64('chacha20-ietf-poly1305:' + c['node_password']) +
                  f"@{host}:{c['ss_port']}#" + urllib.parse.quote(name + '-SS'))
+    cf_preferred = ['visa.cn', 'icook.hk', '104.16.160.1', '162.159.192.1']
     for host in endpoints(c):
         for proto in ('vless', 'trojan'):
             q = {'security': 'tls', 'sni': host, 'type': 'ws', 'host': host,
@@ -420,12 +432,22 @@ def node_links(c, name=None):
                 q['encryption'] = 'none'
             links.append(link(proto, c['uuid'] if proto == 'vless' else c['node_password'],
                               host, 443, q, name + '-' + proto + '-' + host))
+        # 修复：port 与 aid 必须为整数，否则在部分客户端中解析失败报 -1
         links.append('vmess://' + b64(json.dumps({'v': '2', 'ps': name + '-vmess-' + host,
-            'add': host, 'port': '443', 'id': c['uuid'], 'aid': '0', 'scy': 'auto',
+            'add': host, 'port': 443, 'id': c['uuid'], 'aid': 0, 'scy': 'auto',
             'net': 'ws', 'type': 'none', 'host': host, 'path': c['ws_prefix'] + '/vmess',
             'tls': 'tls', 'sni': host}, ensure_ascii=False)))
+        # 固定隧道或自定义域名增加 Cloudflare 优选节点，避免国内 Anycast IP 丢包导致 -1
+        if 'trycloudflare.com' not in host:
+            for pref in cf_preferred:
+                q_vless = {'security': 'tls', 'sni': host, 'type': 'ws', 'host': host,
+                           'path': c['ws_prefix'] + '/vless', 'encryption': 'none'}
+                links.append(link('vless', c['uuid'], pref, 443, q_vless, f"{name}-VLESS-优选-{pref}"))
+                links.append('vmess://' + b64(json.dumps({'v': '2', 'ps': f"{name}-VMess-优选-{pref}",
+                    'add': pref, 'port': 443, 'id': c['uuid'], 'aid': 0, 'scy': 'auto',
+                    'net': 'ws', 'type': 'none', 'host': host, 'path': c['ws_prefix'] + '/vmess',
+                    'tls': 'tls', 'sni': host}, ensure_ascii=False)))
     return links
-
 
 def subscription_response(c, query, merged):
     names = query.get('name', [c.get('subscription_name', DEFAULT_SUB_NAME)])
@@ -438,7 +460,6 @@ def subscription_response(c, query, merged):
     headers = {'Profile-Title': 'base64:' + b64(name),
                'Content-Disposition': "inline; filename*=UTF-8''" + urllib.parse.quote(name + '.txt', safe='')}
     return body, headers
-
 
 def parse_subscription(raw):
     text = raw.decode('utf-8-sig').strip()
@@ -454,12 +475,10 @@ def parse_subscription(raw):
         raise ValueError('订阅含不支持的格式')
     return list(dict.fromkeys(lines))
 
-
 class PublicHTTPS(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         validate_source(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
-
 
 def validate_source(url):
     u = urllib.parse.urlsplit(url)
@@ -468,7 +487,6 @@ def validate_source(url):
     addresses = socket.getaddrinfo(u.hostname, 443, type=socket.SOCK_STREAM)
     if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
         raise ValueError('不接受内网/本机订阅地址')
-
 
 def fetch_source(url):
     validate_source(url)
@@ -479,7 +497,6 @@ def fetch_source(url):
         raise ValueError('外部订阅超过 4 MiB')
     return parse_subscription(raw)
 
-
 def refresh_sources(c):
     cache = {}
     path = ROOT / 'cache.json'
@@ -489,7 +506,6 @@ def refresh_sources(c):
         try:
             return url, fetch_source(url), True
         except Exception:
-            # Never log subscription URLs: query strings are credentials.
             print('某个外部订阅刷新失败，沿用上次成功缓存', flush=True)
             return url, cache.get(url, {}).get('links', []), False
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -499,7 +515,6 @@ def refresh_sources(c):
     cache = {u: cache[u] for u in c.get('sources', []) if u in cache}
     write(path, json.dumps(cache))
     return [v for obj in cache.values() for v in obj['links']]
-
 
 def serve():
     merged = []
@@ -517,7 +532,7 @@ def serve():
     threading.Thread(target=worker, daemon=True).start()
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
-            pass  # prevent secret-bearing URLs appearing in logs
+            pass
         def do_GET(self):
             c = load()
             path = urllib.parse.urlsplit(self.path).path
@@ -547,26 +562,24 @@ def serve():
     server.daemon_threads = True
     server.serve_forever()
 
-
 def caddy_config(c):
     routes = ''
+    # 修复：加上 * 通配符，防止客户端携带斜杠或路径参数时返回 404
     for proto in ('vless', 'vmess', 'trojan'):
-        routes += f"    handle {c['ws_prefix']}/{proto} {{\n        reverse_proxy 127.0.0.1:{c[proto + '_port']}\n    }}\n"
+        routes += f"    handle {c['ws_prefix']}/{proto}* {{\n        reverse_proxy 127.0.0.1:{c[proto + '_port']}\n    }}\n"
     routes += f"    handle /sub/* {{\n        reverse_proxy 127.0.0.1:{c['sub_port']}\n    }}\n    handle /health {{\n        respond ok\n    }}\n    handle {{\n        respond 404\n    }}\n"
     config = '{\n    admin off\n'
     if not c.get('http_challenge', True):
         config += '    auto_https disable_redirects\n'
     config += '}\n'
-    # A site hostname matches the HTTP Host; it does not restrict the bind address.
-    # CF forwards the public hostname, so accept any Host but bind loopback only.
     config += f"http://:{c['edge_port']} {{\n    bind 127.0.0.1\n" + routes + '}\n'
     if c['domain']:
         tls = '' if c.get('http_challenge', True) else '    tls {\n        issuer acme {\n            disable_http_challenge\n        }\n    }\n'
         config += c['domain'] + ' {\n' + tls + routes + '}\n'
     return config
 
-
 def install_services(c):
+    ensure_firewall_ports(c)
     write(ROOT / 'Caddyfile', caddy_config(c), 0o644)
     if not owned('xiazt-edge'):
         container('xiazt-edge', c['edge_image'], 'caddy', 'run', '--config', '/etc/caddy/Caddyfile',
@@ -603,7 +616,6 @@ WantedBy=multi-user.target
         container('xiazt-cf', c['cf_image'], 'tunnel', '--no-autoupdate', '--url',
                   f"http://127.0.0.1:{c['edge_port']}")
 
-
 def verify_public(c):
     hosts = []
     for _ in range(90):
@@ -616,344 +628,6 @@ def verify_public(c):
         ok = False
         for _ in range(30):
             try:
-                # Verify TLS and actual subscription, not just a listening socket.
                 req = urllib.request.Request(f"https://{host}/sub/{c['sub_token']}",
                                              headers={'User-Agent': 'v2rayN/xiazt'})
-                with urllib.request.urlopen(req, timeout=6) as r:
-                    parsed = parse_subscription(r.read(MAX_BODY))
-                    ok = len(parsed) >= 5
-                if ok:
-                    break
-            except Exception:
-                time.sleep(2)
-        results[host] = ok
-    c['public_checks'] = results
-    save(c)
-    if not hosts or not all(results.values()):
-        print('公网订阅未验证通过：检查 DNS、80/443、安全组及 CF 日志。未标记部署成功。')
-        return False
-    return True
-
-
-def show(c):
-    print('订阅名称：' + c.get('subscription_name', DEFAULT_SUB_NAME))
-    print('\n3x-ui 后台通过 SSH 转发访问：')
-    sshhost = '[' + c['ip'] + ']' if ':' in c['ip'] else c['ip']
-    print(f"ssh -N -L {c['panel_port']}:127.0.0.1:{c['panel_port']} root@{sshhost}")
-    print(f"3x-ui 后台：http://127.0.0.1:{c['panel_port']}{c['panel_path']}")
-    print('3x-ui 后台账号：' + c['username'] + '\n3x-ui 后台密码：' + c['password'])
-    for host in endpoints(c):
-        print(f"订阅：https://{host}/sub/{c['sub_token']}")
-    print(f"需放行：TCP {c['reality_port']}；TCP/UDP {c['ss_port']}" +
-          (('；TCP 80/443' if c.get('http_challenge', True) else '；TCP 443') + '（域名直连）' if c['domain'] else ''))
-    print('WS 端口、后台、订阅源站只监听本机；不自动改动你的防火墙或云安全组。')
-    if c['tunnel'] == 'quick':
-        print('临时隧道重启会换域名：运行 x 查看新订阅。节点订阅内容会自动使用当前域名。')
-    print('快捷管理：x；凭据保存：/opt/xiazt/state.json（root 专用）')
-
-
-def install():
-    # First installation prompt, as requested.
-    host = ask('输入已解析的域名（没有就回车跳过）：')
-    if host:
-        host = domain(host)
-    if STATE.exists():
-        raise RuntimeError('已有专用实例，请使用 x 管理或先卸载；拒绝覆盖现有凭据')
-    if ROOT.exists() and any(ROOT.iterdir()):
-        raise RuntimeError('/opt/xiazt 已存在且非空，拒绝覆盖')
-    if Path('/usr/local/bin/x').exists():
-        raise RuntimeError('/usr/local/bin/x 已存在，拒绝覆盖已有快捷命令')
-    for n in NAMES:
-        if shutil.which('docker') and run('docker', 'inspect', '--format', '{{.Id}}', n, capture=True, check=False):
-            raise RuntimeError(f'容器名 {n} 已存在，拒绝覆盖')
-    tunnel = ask('CF 隧道：0 不使用 / 1 临时 / 2 固定 [' + ('0' if host else '1') + ']：', '0' if host else '1')
-    if tunnel not in ('0', '1', '2'):
-        raise ValueError('隧道选项必须是 0/1/2')
-    if not host and tunnel == '0':
-        raise ValueError('无域名时请选择临时或固定隧道，以提供 HTTPS 订阅')
-    ip = detect_public_ip()
-    sni = DEFAULT_REALITY_TARGET
-    print('自动识别 VPS 公网 IP：' + ip)
-    print('REALITY 目标域名自动设置为：' + sni)
-    username, password = panel_credentials()
-    custom_name = subscription_name(ask('自定义订阅名称 [我的订阅]：', DEFAULT_SUB_NAME))
-    c = {'domain': host, 'ip': ip, 'tunnel': {'0': 'none', '1': 'quick', '2': 'fixed'}[tunnel],
-         'username': username, 'password': password, 'panel_path': '/' + secrets.token_hex(12) + '/',
-         'uuid': str(uuid.uuid4()), 'node_password': secrets.token_urlsafe(24),
-         'sub_token': secrets.token_urlsafe(32), 'short_id': secrets.token_hex(8),
-         'sni': sni, 'ws_prefix': '/' + secrets.token_hex(12), 'sources': [], 'complete': False,
-         'subscription_name': custom_name}
-    if tunnel == '2':
-        c['cf_hostname'] = domain(ask('固定隧道域名（CF 托管的空闲子域名）：'))
-        c['cf_api_token'] = ask('Cloudflare API Token（明文显示；Tunnel Edit / DNS Edit / Zone Read）：')
-        if not c['cf_api_token']:
-            raise ValueError('API Token 不能为空')
-        resolve_cf_identity(c)
-        print('已自动识别 Cloudflare 域名区域及所属账户。')
-    if host:
-        try:
-            resolved = {a[4][0] for a in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
-        except socket.gaierror:
-            resolved = set()
-        # A VPS hostname is commonly mapped to loopback in /etc/hosts.
-        # Verify against public DNS before rejecting an otherwise valid domain.
-        if ip not in resolved:
-            for kind in ('A', 'AAAA'):
-                answer = request('https://dns.google/resolve?' + urllib.parse.urlencode({'name': host, 'type': kind}))
-                resolved.update(a['data'] for a in answer.get('Answer', []) if a['type'] in (1, 28))
-        if ip not in resolved:
-            raise ValueError('域名未解析到所选公网 IP。直连模式请关闭 CF 橙云，或改用固定隧道')
-        if not port_free(443):
-            raise RuntimeError('443 端口已占用；请使用隧道模式，脚本不会抢占服务')
-        c['http_challenge'] = port_free(80)
-        if not c['http_challenge']:
-            print('80 端口已有服务，保留原服务；HTTPS 证书改用 443 TLS-ALPN 验证。')
-    reserved = set()
-    for name, preferred in [('panel', 20530), ('sub', 20531), ('edge', 20532),
-                            ('vless', 20533), ('vmess', 20534), ('trojan', 20535),
-                            ('reality', 8443), ('ss', 18443)]:
-        p = choose_port(preferred)
-        while p in reserved:
-            p = choose_port(secrets.randbelow(30000) + 20000)
-        c[name + '_port'] = p
-        reserved.add(p)
-    print('安装系统依赖；不会卸载或接管已有 3x-ui。')
-    run('apt-get', 'update')
-    
-    # 动态组装依赖：若已存在 docker 命令，则不安装 docker.io（避免卸载用户的 docker-ce）
-    pkgs = ['ca-certificates', 'curl', 'openssl']
-    if not shutil.which('docker'):
-        pkgs.append('docker.io')
-        
-    run('apt-get', 'install', '-y', *pkgs)
-    run('systemctl', 'enable', '--now', 'docker')
-    # Pull mutable upstream tags once, then record immutable repository digests.
-    release = request('https://api.github.com/repos/MHSanaei/3x-ui/releases/latest')['tag_name']
-    c['panel_version'] = release
-    c['panel_image'] = image('ghcr.io/mhsanaei/3x-ui:' + release)
-    c['edge_image'] = image('caddy:2')
-    if tunnel != '0':
-        c['cf_image'] = image('cloudflare/cloudflared:latest')
-    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (ROOT / 'db').mkdir(mode=0o700)
-    save(c)
-    shutil.copyfile(Path(__file__), ROOT / 'manager.py')
-    os.chmod(ROOT / 'manager.py', 0o700)
-    write('/usr/local/bin/x', '#!/bin/sh\nexec /usr/bin/python3 /opt/xiazt/manager.py "$@"\n', 0o755)
-    resume(c)
-
-
-def resume(c):
-    # Configure an offline DB before starting the panel: no exposed default login.
-    if not owned('xiazt-panel'):
-        panel_cli(c, '-username', c['username'], '-password', c['password'],
-              '-port', str(c['panel_port']), '-listenIP', '127.0.0.1', '-webBasePath', c['panel_path'])
-        # Disable the upstream default public subscription listener before first boot.
-        with sqlite3.connect(ROOT / 'db/x-ui.db') as db:
-            for key, value in [('subEnable', 'false'), ('subListen', '127.0.0.1')]:
-                db.execute('DELETE FROM settings WHERE key = ?', (key,))
-                db.execute('INSERT INTO settings (key, value) VALUES (?, ?)', (key, value))
-        container('xiazt-panel', c['panel_image'], volumes=[(ROOT / 'db', '/etc/x-ui')],
-              env=['XUI_ENABLE_FAIL2BAN=false', 'TZ=Asia/Shanghai'])
-    else:
-        run('docker', 'start', 'xiazt-panel', capture=True)
-    Panel(c).wait()
-    # Derive X25519 keypair using host OpenSSL; independent of xray CLI output versions.
-    if not c.get('private_key'):
-        key = subprocess.check_output(['openssl', 'genpkey', '-algorithm', 'X25519'])
-        private = subprocess.check_output(['openssl', 'pkey', '-outform', 'DER'], input=key)[-32:]
-        public = subprocess.check_output(['openssl', 'pkey', '-pubout', '-outform', 'DER'], input=key)[-32:]
-        c['private_key'] = base64.urlsafe_b64encode(private).decode().rstrip('=')
-        c['public_key'] = base64.urlsafe_b64encode(public).decode().rstrip('=')
-        save(c)
-    setup_nodes(c)
-    install_services(c)
-    c['complete'] = verify_public(c)
-    save(c)
-    show(c)
-    if not c['complete']:
-        raise RuntimeError('部署未通过公网订阅检查，运行 x → 检查/恢复')
-    print('服务与 HTTPS 订阅检查通过。真实代理通断仍需从客户端测试。')
-
-
-def remove():
-    c = load()
-    if ask('删除本脚本全部节点、后台、凭据和订阅；输入 DELETE 确认：') != 'DELETE':
-        return
-    # Do not silently leave externally-created resources behind.
-    if c.get('cf_tunnel_id'):
-        if c.get('cf_dns_id'):
-            cf(c, f"/zones/{c['cf_zone']}/dns_records/{c['cf_dns_id']}", method='DELETE')
-            c.pop('cf_dns_id')
-            save(c)
-        if owned('xiazt-cf'):
-            run('docker', 'rm', '-f', 'xiazt-cf', capture=True)
-        cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel/{c['cf_tunnel_id']}/connections", method='DELETE')
-        cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel/{c['cf_tunnel_id']}", method='DELETE')
-        c.pop('cf_tunnel_id')
-        save(c)
-    run('systemctl', 'disable', '--now', 'xiazt-sub.service', check=False)
-    for name in NAMES:
-        if owned(name):
-            run('docker', 'rm', '-f', name, capture=True)
-    unit = Path('/etc/systemd/system/xiazt-sub.service')
-    unit.unlink(missing_ok=True)
-    shortcut = Path('/usr/local/bin/x')
-    if shortcut.exists() and '/opt/xiazt/manager.py' in shortcut.read_text():
-        shortcut.unlink()
-    if ROOT.is_symlink() or ROOT.resolve() != Path('/opt/xiazt'):
-        raise RuntimeError('目录校验失败，拒绝删除')
-    shutil.rmtree(ROOT)
-    run('systemctl', 'daemon-reload')
-    print('本脚本创建的节点与 CF 资源已删除。Docker 和其他应用保留。')
-
-
-def interaction_error(exc):
-    if isinstance(exc, KeyboardInterrupt):
-        print('\n已取消当前操作，返回菜单。')
-    elif isinstance(exc, (urllib.error.URLError, urllib.error.HTTPError)):
-        print('网络请求失败：' + type(exc).__name__ + '；请检查网络或 API 权限，已返回菜单。')
-    else:
-        print('操作未完成：' + str(exc) + '；已返回菜单。')
-
-
-def menu():
-    while STATE.exists():
-        try:
-            _menu_loop()
-            return
-        except EOFError:
-            return
-        except (Exception, KeyboardInterrupt) as exc:
-            interaction_error(exc)
-
-
-def installation_menu():
-    # Keep the domain as the first configuration prompt on a new machine.
-    while True:
-        try:
-            install()
-            return
-        except EOFError:
-            return
-        except (Exception, KeyboardInterrupt) as exc:
-            interaction_error(exc)
-        if STATE.exists():
-            menu()
-            return
-        while True:
-            try:
-                print('\n安装菜单\n1 重新配置并安装\n0 退出')
-                choice = ask('选择：', '0')
-                if choice == '0':
-                    return
-                if choice == '1':
-                    break
-                print('输入错误：请选择 0 或 1。')
-            except EOFError:
-                return
-            except KeyboardInterrupt:
-                print('\n已取消输入；选择 0 可退出。')
-
-
-def _menu_loop():
-    while True:
-        print('\n瞎折腾一键脚本\n1 查看账号/订阅\n2 添加外部订阅\n3 清空外部订阅\n4 状态与日志\n5 检查/恢复节点\n6 重启服务\n7 自定义订阅名称\n9 一键卸载全部节点\n0 退出')
-        choice = ask('选择：', '0')
-        if choice == '0':
-            return
-        c = load()
-        if choice == '1':
-            show(c)
-        elif choice == '2':
-            if len(c['sources']) >= 20:
-                print('最多整合 20 个外部订阅')
-                continue
-            url = ask('输入 HTTPS 订阅地址（输入不写入日志）：')
-            nodes = fetch_source(url)
-            if url not in c['sources']:
-                c['sources'].append(url)
-            save(c)
-            refresh_sources(c)
-            run('systemctl', 'restart', 'xiazt-sub')
-            print(f'已添加并验证 {len(nodes)} 条链接，后台每 5 分钟刷新')
-        elif choice == '3':
-            c['sources'] = []
-            save(c)
-            write(ROOT / 'cache.json', '{}')
-            run('systemctl', 'restart', 'xiazt-sub')
-        elif choice == '4':
-            for n in NAMES:
-                if owned(n):
-                    print(n, run('docker', 'inspect', '--format', '{{.State.Status}}', n, capture=True))
-            run('systemctl', 'status', '--no-pager', 'xiazt-sub', check=False)
-            print('详细日志：docker logs xiazt-panel / docker logs xiazt-edge / docker logs xiazt-cf')
-        elif choice == '5':
-            resume(c)
-        elif choice == '6':
-            for n in NAMES:
-                if owned(n):
-                    run('docker', 'restart', n, capture=True)
-            run('systemctl', 'restart', 'xiazt-sub')
-            c['complete'] = verify_public(c)
-            save(c)
-        elif choice == '7':
-            current = c.get('subscription_name', DEFAULT_SUB_NAME)
-            value = ask(f'自定义订阅名称 [{current}]：', current)
-            try:
-                c['subscription_name'] = subscription_name(value)
-            except ValueError as exc:
-                print(str(exc))
-                continue
-            save(c)
-            print('已更新订阅名称：' + c['subscription_name'] + '。在客户端更新订阅即可生效。')
-        elif choice == '9':
-            remove()
-            if not STATE.exists():
-                return
-        else:
-            print('输入错误：请选择菜单中的编号。')
-
-
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] == 'serve':
-        serve()
-        return
-    if os.geteuid() != 0:
-        raise RuntimeError('请用 root 或 sudo 运行')
-    import fcntl
-    lock_fd = os.open('/run/lock/xiazt.lock', os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise RuntimeError('另一个瞎折腾管理任务正在运行，请先退出它')
-    os.umask(0o077)
-    print(BANNER)
-
-    print('GitHub   https://github.com/xiazheteng8\n'
-          'TG       https://t.me/xiazheteng8\n'
-          'YouTube  https://www.youtube.com/@xiazheteng8\n')
-    if len(sys.argv) > 1 and sys.argv[1] == 'install':
-        installation_menu()
-    elif STATE.exists():
-        menu()
-    else:
-        installation_menu()
-    os.close(lock_fd)
-
-
-if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        print('\n已中断；已有状态保留，可运行 x 管理。')
-        sys.exit(130)
-    except Exception as exc:
-        # urllib exceptions can include credentials in URLs: report type only.
-        if isinstance(exc, (urllib.error.URLError, urllib.error.HTTPError)):
-            print('网络请求失败：' + type(exc).__name__ + '；请检查网络和 API 权限', file=sys.stderr)
-        else:
-            print('失败：' + str(exc), file=sys.stderr)
-        sys.exit(1)
-XIAZT_PYTHON_EOF_938715
-python3 "$workdir/manager.py" "$@"
+                with urllib
