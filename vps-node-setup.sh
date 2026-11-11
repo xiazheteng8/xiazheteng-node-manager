@@ -214,8 +214,8 @@ class Panel:
     def call(self, path, payload=None):
         conn = http.client.HTTPConnection('127.0.0.1', self.c['panel_port'], timeout=10)
         h = {'Cookie': self.cookie, 'Content-Type': 'application/x-www-form-urlencoded'}
-        body = urllib.parse.urlencode(payload) if payload else None
-        conn.request('POST' if payload else 'GET', self.c['panel_path'] + path.lstrip('/'), body=body, headers=h)
+        body = urllib.parse.urlencode(payload) if payload is not None else None
+        conn.request('POST' if payload is not None else 'GET', self.c['panel_path'] + path.lstrip('/'), body=body, headers=h)
         res = conn.getresponse()
         data = res.read().decode()
         for v in res.headers.get_all('Set-Cookie') or []:
@@ -339,24 +339,22 @@ def install_hy2_auto(c):
     except Exception:
         pass
 
-    c['hy2_enabled'] = True
-    c['hy2_domain'] = domain_name
-    c['hy2_port'] = port
-    c['hy2_password'] = password
-    save(c)
-
-    ensure_firewall_ports(c)
-
     run('systemctl', 'daemon-reload')
-    run('systemctl', 'enable', '--now', 'hysteria-server')
+    run('systemctl', 'enable', 'hysteria-server')
     run('systemctl', 'restart', 'hysteria-server')
+    run('systemctl', 'is-active', '--quiet', 'hysteria-server')
+
+    c.update(hy2_enabled=True, hy2_domain=domain_name, hy2_port=port, hy2_password=password)
+    ensure_firewall_ports(c)
+    save(c)
 
     print(f'\n✅ Hysteria 2 已自动部署完成，监听 UDP {port}，节点已自动汇入订阅。')
 
 
 def resolve_cf_identity(c):
     zones = cf(c, '/zones')['result']
-    matches = [z for z in zones if c['cf_hostname'].endswith(z['name'])]
+    matches = [z for z in zones if c['cf_hostname'] == z['name']
+               or c['cf_hostname'].endswith('.' + z['name'])]
     if not matches:
         raise RuntimeError('Token 无法访问该域名的 Zone')
     zone = max(matches, key=lambda z: len(z['name']))
@@ -367,30 +365,60 @@ def resolve_cf_identity(c):
 def setup_cf(c):
     if c['tunnel'] == 'quick':
         return
-    sec = secrets.token_bytes(32)
-    t = cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel",
-           {'name': f"xiazt-{c['short_id']}", 'tunnel_secret': base64.b64encode(sec).decode()})['result']
-    c['cf_tunnel_id'] = t['id']
-    c['cf_tunnel_token'] = t.get('token', '')
-    if not c['cf_tunnel_token']:
-        t_info = cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel/{t['id']}/token")['result']
-        c['cf_tunnel_token'] = t_info if isinstance(t_info, str) else t_info.get('token', '')
-    cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel/{t['id']}/configurations",
+    account = f"/accounts/{c['cf_account']}/cfd_tunnel"
+    records = f"/zones/{c['cf_zone']}/dns_records"
+    params = urllib.parse.urlencode({'name': c['cf_hostname']})
+    existing = cf(c, records + '?' + params)['result']
+    tunnel_id = c.get('cf_tunnel_id')
+    if not tunnel_id:
+        if existing:
+            raise RuntimeError(f"{c['cf_hostname']} 已有 DNS 记录，请使用空闲子域名")
+        tunnel = cf(c, account, {
+            'name': f"xiazt-{c['short_id']}",
+            'config_src': 'cloudflare',
+        })['result']
+        tunnel_id = c['cf_tunnel_id'] = tunnel['id']
+        save(c)
+    target = f"{tunnel_id}.cfargotunnel.com"
+    if any(r['type'] != 'CNAME' or r['content'].rstrip('.') != target for r in existing):
+        raise RuntimeError(f"{c['cf_hostname']} 的 DNS 记录与当前隧道不匹配")
+    if not c.get('cf_tunnel_token'):
+        info = cf(c, f"{account}/{tunnel_id}/token")['result']
+        token = info if isinstance(info, str) else info.get('token')
+        if not token:
+            raise RuntimeError('Cloudflare 未返回隧道运行凭据')
+        c['cf_tunnel_token'] = token
+        save(c)
+    cf(c, f"{account}/{tunnel_id}/configurations",
        {'config': {'ingress': [{'hostname': c['cf_hostname'], 'service': f"http://127.0.0.1:{c['edge_port']}"},
                                {'service': 'http_status:404'}]}}, method='PUT')
-    dns = cf(c, f"/zones/{c['cf_zone']}/dns_records",
-             {'type': 'CNAME', 'name': c['cf_hostname'], 'content': f"{t['id']}.cfargotunnel.com", 'proxied': True})['result']
-    c['cf_dns_id'] = dns['id']
+    payload = {'type': 'CNAME', 'name': c['cf_hostname'], 'content': target, 'proxied': True}
+    if existing:
+        record = existing[0]
+        if not record.get('proxied'):
+            record = cf(c, f"{records}/{record['id']}", payload, method='PATCH')['result']
+    else:
+        record = cf(c, records, payload)['result']
+    c['cf_dns_id'] = record['id']
+    save(c)
 
 
 def setup_nodes(c):
     p = Panel(c)
     p.login()
-    for row in p.call('/panel/api/inbounds/list').get('obj', []):
-        p.call(f"/panel/api/inbounds/del/{row['id']}")
+    def checked(path, payload=None):
+        result = p.call(path, payload)
+        if not result.get('success'):
+            raise RuntimeError(f'3x-ui API {path}: {result.get("msg") or "操作失败"}')
+        return result.get('obj')
+
+    managed_ports = {c[key + '_port'] for key in ('reality', 'ss', 'vless', 'vmess', 'trojan')}
+    for row in checked('/panel/api/inbounds/list') or []:
+        if row['port'] in managed_ports:
+            checked(f"/panel/api/inbounds/del/{row['id']}", {})
 
     def add(remark, port, protocol, settings, stream):
-        p.call('/panel/api/inbounds/add', {'up': 0, 'down': 0, 'total': 0, 'remark': remark, 'enable': 'true',
+        checked('/panel/api/inbounds/add', {'up': 0, 'down': 0, 'total': 0, 'remark': remark, 'enable': 'true',
                                            'expiryTime': 0, 'listen': '127.0.0.1' if stream.get('network') == 'ws' else '',
                                            'port': port, 'protocol': protocol,
                                            'settings': json.dumps(settings), 'streamSettings': json.dumps(stream)})
@@ -412,7 +440,7 @@ def setup_nodes(c):
         cred = c['uuid'] if proto in ('vless', 'vmess') else c['node_password']
         extra = {'decryption': 'none'} if proto == 'vless' else {}
         add(proto.upper(), c[proto + '_port'], proto,
-            {'clients': [{field: cred, **extra}]}, ws(f"{c['ws_prefix']}/{proto}"))
+            {'clients': [{field: cred}], **extra}, ws(f"{c['ws_prefix']}/{proto}"))
     ensure_firewall_ports(c)
 
 
@@ -468,14 +496,13 @@ def subscription_url(c, host):
 
 def node_links(c, name=None):
     name = subscription_name(c.get('subscription_name', DEFAULT_SUB_NAME) if name is None else name)
-    links = [link('vless', c['uuid'], c['ip'], c['reality_port'],
+    ip_host = '[' + c['ip'] + ']' if ':' in c['ip'] else c['ip']
+    links = [link('vless', c['uuid'], ip_host, c['reality_port'],
                   {'encryption': 'none', 'security': 'reality', 'sni': c['sni'],
                    'fp': 'chrome', 'pbk': c['public_key'], 'sid': c['short_id'],
                    'type': 'tcp', 'flow': 'xtls-rprx-vision', 'spx': '/'}, name + '-REALITY')]
-    host = '[' + c['ip'] + ']' if ':' in c['ip'] else c['ip']
     links.append('ss://' + b64('chacha20-ietf-poly1305:' + c['node_password']) +
-                 f"@{host}:{c['ss_port']}#" + urllib.parse.quote(name + '-SS'))
-    cf_preferred = ['visa.cn', 'icook.hk', '104.16.160.1', '162.159.192.1']
+                 f"@{ip_host}:{c['ss_port']}#" + urllib.parse.quote(name + '-SS'))
     for host in endpoints(c):
         port = endpoint_port(c, host)
         for proto in ('vless', 'trojan'):
@@ -489,15 +516,6 @@ def node_links(c, name=None):
             'add': host, 'port': port, 'id': c['uuid'], 'aid': 0, 'scy': 'auto',
             'net': 'ws', 'type': 'none', 'host': host, 'path': c['ws_prefix'] + '/vmess',
             'tls': 'tls', 'sni': host}, ensure_ascii=False)))
-        if port == 443 and 'trycloudflare.com' not in host:
-            for pref in cf_preferred:
-                q_vless = {'security': 'tls', 'sni': host, 'type': 'ws', 'host': host,
-                           'path': c['ws_prefix'] + '/vless', 'encryption': 'none'}
-                links.append(link('vless', c['uuid'], pref, 443, q_vless, f"{name}-VLESS-优选-{pref}"))
-                links.append('vmess://' + b64(json.dumps({'v': '2', 'ps': f"{name}-VMess-优选-{pref}",
-                    'add': pref, 'port': 443, 'id': c['uuid'], 'aid': 0, 'scy': 'auto',
-                    'net': 'ws', 'type': 'none', 'host': host, 'path': c['ws_prefix'] + '/vmess',
-                    'tls': 'tls', 'sni': host}, ensure_ascii=False)))
     if c.get('hy2_enabled') and c.get('hy2_domain') and c.get('hy2_port'):
         hy_name = urllib.parse.quote(name + '-Hysteria2')
         links.append(f"hysteria2://{c['hy2_password']}@{c['hy2_domain']}:{c['hy2_port']}/?sni={c['hy2_domain']}#{hy_name}")
@@ -510,7 +528,7 @@ def subscription_response(c, name=None):
     if cache.exists():
         for source, nodes in json.loads(cache.read_text()).items():
             merged.extend(nodes)
-    return base64.b64encode('\n'.join(merged).encode()).decode()
+    return base64.b64encode('\n'.join(dict.fromkeys(merged)).encode()).decode()
 
 
 def parse_subscription(text):
@@ -565,11 +583,15 @@ def fetch_source(url):
     req = urllib.request.Request(url, headers={'User-Agent': 'v2rayN/6.23'})
     with opener.open(req, timeout=10) as r:
         raw = r.read(1048576)
-    try:
-        pad = b'=' * (-len(raw) % 4)
-        nodes = parse_subscription(base64.urlsafe_b64decode(raw + pad).decode('utf-8', 'ignore'))
-    except Exception:
-        nodes = parse_subscription(raw.decode('utf-8', 'ignore'))
+    nodes = parse_subscription(raw.decode('utf-8', 'ignore'))
+    if not nodes:
+        encoded = b''.join(raw.split())
+        try:
+            decoded = base64.b64decode(encoded + b'=' * (-len(encoded) % 4),
+                                       altchars=b'-_', validate=True)
+            nodes = parse_subscription(decoded.decode('utf-8'))
+        except (ValueError, UnicodeError):
+            nodes = []
     if not nodes:
         raise ValueError('未解析出任何有效代理节点')
     return nodes
@@ -692,9 +714,7 @@ WantedBy=multi-user.target
         else:
             run('docker', 'restart', 'xiazt-cf')
     elif c['tunnel'] == 'fixed':
-        if not c.get('cf_tunnel_id'):
-            setup_cf(c)
-            save(c)
+        setup_cf(c)
         if not owned('xiazt-cf'):
             container('xiazt-cf', c['cf_image'], args=['tunnel', 'run', '--token', c['cf_tunnel_token']])
         else:
@@ -709,7 +729,9 @@ def verify_public(c):
                 req = urllib.request.Request(subscription_url(c, h),
                                              headers={'User-Agent': 'xiazt-verify/1.0'})
                 with opener.open(req, timeout=5) as r:
-                    if r.status == 200 and base64.b64decode(r.read()).strip():
+                    payload = r.read(2 * 1024 * 1024)
+                    actual = set(parse_subscription(base64.b64decode(payload, validate=True).decode('utf-8')))
+                    if r.status == 200 and set(node_links(c)).issubset(actual):
                         return True
             except Exception:
                 pass
@@ -812,18 +834,12 @@ def install():
     os.chmod(ROOT / 'manager.py', 0o700)
     write('/usr/local/bin/x', '#!/bin/sh\nexec /usr/bin/python3 /opt/xiazt/manager.py "$@"\n', 0o755)
 
-    if c.get('hy2_hostname') and c.get('cf_api_token'):
-        try:
-            install_hy2_auto(c)
-        except Exception as e:
-            print(f'Hysteria 2 安装未完成：{e}')
-    else:
-        c['hy2_enabled'] = False
-        save(c)
     resume(c)
 
 
 def resume(c):
+    c['complete'] = False
+    save(c)
     if not owned('xiazt-panel'):
         panel_cli(c, '-username', c['username'], '-password', c['password'],
                   '-port', str(c['panel_port']), '-listenIP', '127.0.0.1', '-webBasePath', c['panel_path'])
@@ -845,8 +861,12 @@ def resume(c):
         save(c)
     setup_nodes(c)
     install_services(c)
-    if c.get('hy2_enabled') and is_hy2_installed():
-        run('systemctl', 'restart', 'hysteria-server', check=False)
+    if c.get('hy2_hostname'):
+        if not c.get('hy2_enabled') or not is_hy2_installed():
+            install_hy2_auto(c)
+        else:
+            run('systemctl', 'restart', 'hysteria-server')
+        run('systemctl', 'is-active', '--quiet', 'hysteria-server')
     c['complete'] = verify_public(c)
     save(c)
     show(c)
@@ -1016,7 +1036,12 @@ def main():
     print('GitHub   https://github.com/xiazheteng8\n'
           'TG       https://t.me/xiazheteng8\n'
           'YouTube  https://www.youtube.com/@xiazheteng8\n')
-    if len(sys.argv) > 1 and sys.argv[1] == 'install':
+    if len(sys.argv) > 1 and sys.argv[1] == 'update':
+        if not STATE.exists():
+            raise RuntimeError('找不到现有部署，首次安装请直接运行脚本')
+        write(ROOT / 'manager.py', Path(__file__).read_text(encoding='utf-8'), 0o700)
+        resume(load())
+    elif len(sys.argv) > 1 and sys.argv[1] == 'install':
         installation_menu()
     elif STATE.exists():
         menu()
