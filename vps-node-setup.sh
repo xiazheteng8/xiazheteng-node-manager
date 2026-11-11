@@ -201,9 +201,24 @@ def owned(name):
 
 
 def panel_cli(c, *args):
-    cmd = ['docker', 'run', '--rm', '-v', f"{ROOT / 'db'}:/etc/x-ui", c['panel_image'], 'x-ui']
-    cmd.extend(args)
-    run(*cmd)
+    name = 'xiazt-panel-init-' + secrets.token_hex(8)
+    cmd = ['docker', 'run', '--rm', '--name', name, '--network', 'none',
+           '--workdir', '/app', '--entrypoint', '/app/x-ui',
+           '-v', f"{ROOT / 'db'}:/etc/x-ui", c['panel_image'], 'setting', *args]
+    print('正在初始化 3x-ui 面板设置…', flush=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            # Docker 和 x-ui 的原始输出可能包含面板凭据。
+            raise RuntimeError(f"3x-ui 面板初始化失败（退出码 {result.returncode}，镜像 {c['panel_image']}）")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('3x-ui 面板初始化超过 60 秒，已停止等待') from None
+    finally:
+        try:
+            subprocess.run(['docker', 'rm', '-f', name], capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
 
 
 class Panel:
@@ -238,10 +253,25 @@ class Panel:
 
 
 def cf(c, path, payload=None, method=None):
-    body = json.dumps(payload).encode() if payload else None
-    return request('https://api.cloudflare.com/client/v4' + path,
-                   headers={'Authorization': f"Bearer {c['cf_api_token']}", 'Content-Type': 'application/json'},
-                   data=body, method=method)
+    body = json.dumps(payload).encode() if payload is not None else None
+    verb = method or ('POST' if body is not None else 'GET')
+    endpoint = path.split('?', 1)[0]
+    status = 200
+    try:
+        response = request('https://api.cloudflare.com/client/v4' + path,
+                           headers={'Authorization': f"Bearer {c['cf_api_token']}",
+                                    'Content-Type': 'application/json'},
+                           data=body, method=verb)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        try:
+            response = json.loads(exc.read(65536))
+        except ValueError:
+            response = {}
+    if status >= 400 or not response.get('success'):
+        errors = ', '.join(str(error['code']) for error in response.get('errors', []) if 'code' in error)
+        raise RuntimeError(f'Cloudflare {verb} {endpoint} 失败（HTTP {status}，API 错误码：{errors or "无"}）')
+    return response
 
 
 def ensure_firewall_ports(c):
@@ -363,44 +393,64 @@ def resolve_cf_identity(c):
 
 
 def setup_cf(c):
-    if c['tunnel'] == 'quick':
+    if c['tunnel'] != 'fixed':
         return
+    resolve_cf_identity(c)
+    host = c['cf_hostname']
     account = f"/accounts/{c['cf_account']}/cfd_tunnel"
     records = f"/zones/{c['cf_zone']}/dns_records"
-    params = urllib.parse.urlencode({'name': c['cf_hostname']})
-    existing = cf(c, records + '?' + params)['result']
+    lookup = records + '?' + urllib.parse.urlencode({'name.exact': host})
+    existing = cf(c, lookup)['result']
     tunnel_id = c.get('cf_tunnel_id')
     if not tunnel_id:
-        if existing:
-            raise RuntimeError(f"{c['cf_hostname']} 已有 DNS 记录，请使用空闲子域名")
-        tunnel = cf(c, account, {
-            'name': f"xiazt-{c['short_id']}",
-            'config_src': 'cloudflare',
-        })['result']
-        tunnel_id = c['cf_tunnel_id'] = tunnel['id']
+        tunnel_name = f"xiazt-{c['short_id']}"
+        params = urllib.parse.urlencode({'name': tunnel_name, 'is_deleted': 'false'})
+        matches = [t for t in cf(c, account + '?' + params)['result'] if t['name'] == tunnel_name]
+        if len(matches) > 1:
+            raise RuntimeError(f'发现多个同名隧道：{tunnel_name}')
+        if matches:
+            tunnel_id = matches[0]['id']
+        elif existing:
+            raise RuntimeError(f'{host} 已有 DNS 记录，请使用空闲子域名')
+        else:
+            tunnel_id = cf(c, account, {
+                'name': tunnel_name,
+                'config_src': 'cloudflare',
+                'tunnel_secret': base64.b64encode(secrets.token_bytes(32)).decode(),
+            })['result']['id']
+        c['cf_tunnel_id'] = tunnel_id
+        c.pop('cf_tunnel_token', None)
         save(c)
-    target = f"{tunnel_id}.cfargotunnel.com"
+    target = f'{tunnel_id}.cfargotunnel.com'
     if any(r['type'] != 'CNAME' or r['content'].rstrip('.') != target for r in existing):
-        raise RuntimeError(f"{c['cf_hostname']} 的 DNS 记录与当前隧道不匹配")
+        raise RuntimeError(f'{host} 的 DNS 记录与脚本隧道不匹配，现有记录未改动')
     if not c.get('cf_tunnel_token'):
-        info = cf(c, f"{account}/{tunnel_id}/token")['result']
+        info = cf(c, f'{account}/{tunnel_id}/token')['result']
         token = info if isinstance(info, str) else info.get('token')
         if not token:
             raise RuntimeError('Cloudflare 未返回隧道运行凭据')
         c['cf_tunnel_token'] = token
         save(c)
-    cf(c, f"{account}/{tunnel_id}/configurations",
-       {'config': {'ingress': [{'hostname': c['cf_hostname'], 'service': f"http://127.0.0.1:{c['edge_port']}"},
-                               {'service': 'http_status:404'}]}}, method='PUT')
-    payload = {'type': 'CNAME', 'name': c['cf_hostname'], 'content': target, 'proxied': True}
-    if existing:
-        record = existing[0]
-        if not record.get('proxied'):
-            record = cf(c, f"{records}/{record['id']}", payload, method='PATCH')['result']
-    else:
-        record = cf(c, records, payload)['result']
-    c['cf_dns_id'] = record['id']
+    route = {'hostname': host, 'service': f"http://127.0.0.1:{c['edge_port']}"}
+    config_path = f'{account}/{tunnel_id}/configurations'
+    cf(c, config_path, {'config': {'ingress': [route, {'service': 'http_status:404'}]}}, method='PUT')
+    config = cf(c, config_path)['result']['config']
+    if not any(all(rule.get(k) == v for k, v in route.items()) for rule in config.get('ingress', [])):
+        raise RuntimeError(f'Cloudflare 未保存 {host} 的隧道路由')
+    print(f'Cloudflare 隧道路由已确认：{host} → {route["service"]}', flush=True)
+
+    payload = {'type': 'CNAME', 'name': host, 'content': target, 'proxied': True}
+    if not existing:
+        cf(c, records, payload)
+    elif not existing[0].get('proxied'):
+        cf(c, f"{records}/{existing[0]['id']}", {'proxied': True}, method='PATCH')
+    confirmed = [r for r in cf(c, lookup)['result']
+                 if r['type'] == 'CNAME' and r['content'].rstrip('.') == target and r.get('proxied')]
+    if not confirmed:
+        raise RuntimeError(f'Cloudflare 未保存 {host} 的橙云 CNAME')
+    c['cf_dns_id'] = confirmed[0]['id']
     save(c)
+    print(f'Cloudflare 橙云 CNAME 已确认：{host}', flush=True)
 
 
 def setup_nodes(c):
@@ -715,27 +765,47 @@ WantedBy=multi-user.target
             run('docker', 'restart', 'xiazt-cf')
     elif c['tunnel'] == 'fixed':
         setup_cf(c)
-        if not owned('xiazt-cf'):
-            container('xiazt-cf', c['cf_image'], args=['tunnel', 'run', '--token', c['cf_tunnel_token']])
-        else:
-            run('docker', 'restart', 'xiazt-cf')
+        args = ['tunnel', 'run', '--token', c['cf_tunnel_token']]
+        if owned('xiazt-cf'):
+            current = run('docker', 'inspect', '--format', '{{json .Config.Cmd}}', 'xiazt-cf', capture=True)
+            if json.loads(current) == args:
+                run('docker', 'restart', 'xiazt-cf')
+                return
+            run('docker', 'rm', '-f', 'xiazt-cf', capture=True)
+        container('xiazt-cf', c['cf_image'], args=args)
 
 
 def verify_public(c):
-    for _ in range(60):
-        for h in endpoints(c):
+    hosts = endpoints(c)
+    if not hosts:
+        print('未找到公网订阅域名。')
+        return False
+    expected = set(node_links(c))
+    opener = urllib.request.build_opener(StrictHTTPSRedirectHandler())
+    deadline = time.monotonic() + 150
+    failure = ''
+    print(f'正在检查 HTTPS 订阅：{hosts[0]}（最多约 150 秒）', flush=True)
+    while time.monotonic() < deadline:
+        for host in hosts:
             try:
-                opener = urllib.request.build_opener(SafeRedirectHandler())
-                req = urllib.request.Request(subscription_url(c, h),
+                req = urllib.request.Request(subscription_url(c, host),
                                              headers={'User-Agent': 'xiazt-verify/1.0'})
-                with opener.open(req, timeout=5) as r:
-                    payload = r.read(2 * 1024 * 1024)
+                with opener.open(req, timeout=5) as response:
+                    payload = response.read(2 * 1024 * 1024)
                     actual = set(parse_subscription(base64.b64decode(payload, validate=True).decode('utf-8')))
-                    if r.status == 200 and set(node_links(c)).issubset(actual):
+                    if response.status == 200 and expected and expected.issubset(actual):
                         return True
-            except Exception:
-                pass
+                failure = '订阅内容缺少预期节点'
+            except urllib.error.HTTPError as exc:
+                failure = f'HTTP {exc.code}'
+            except urllib.error.URLError as exc:
+                failure = str(exc.reason)
+            except ValueError:
+                failure = '响应无法解码为节点订阅'
+            except OSError as exc:
+                failure = type(exc).__name__
         time.sleep(2)
+    print(f'公网订阅检查失败：{hosts[0]}（{failure}）')
     return False
 
 
@@ -746,8 +816,11 @@ def show(c):
     print(f"ssh -N -L {c['panel_port']}:127.0.0.1:{c['panel_port']} root@{sshhost}")
     print(f"3x-ui 后台：http://127.0.0.1:{c['panel_port']}{c['panel_path']}")
     print('3x-ui 后台账号：' + c['username'] + '\n3x-ui 后台密码：' + c['password'])
-    for host in endpoints(c):
-        print('订阅：' + subscription_url(c, host))
+    if c.get('complete'):
+        for host in endpoints(c):
+            print('订阅：' + subscription_url(c, host))
+    else:
+        print('订阅尚未通过公网验证，请运行 x → 检查/恢复。')
     print(f"需放行：TCP {c['reality_port']}；TCP/UDP {c['ss_port']}" +
           (f"；TCP 80/{c.get('https_port', 443)}（域名直连）" if c['domain'] else ''))
     print('WS 源站、后台、订阅源站只监听本机。云安全组需手动放行上述端口。')
@@ -793,7 +866,7 @@ def install():
          'subscription_name': custom_name}
     if tunnel == '2':
         c['cf_hostname'] = domain(ask('固定隧道域名（CF 托管的空闲子域名）：'))
-        c['cf_api_token'] = __import__('getpass').getpass('Cloudflare API Token（Tunnel Edit / DNS Edit / Zone Read）：').strip()
+        c['cf_api_token'] = ask('Cloudflare API Token（Tunnel Edit / DNS Edit / Zone Read）：').strip()
         if not c['cf_api_token']:
             raise ValueError('API Token 不能为空')
         resolve_cf_identity(c)
@@ -869,9 +942,9 @@ def resume(c):
         run('systemctl', 'is-active', '--quiet', 'hysteria-server')
     c['complete'] = verify_public(c)
     save(c)
-    show(c)
     if not c['complete']:
         raise RuntimeError('部署未通过公网订阅检查，运行 x → 检查/恢复')
+    show(c)
     print('服务与 HTTPS 订阅检查通过。真实代理通断仍需从客户端测试。')
 
 
