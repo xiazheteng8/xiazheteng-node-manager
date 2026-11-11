@@ -37,6 +37,7 @@ cat >"$workdir/manager.py" <<'XIAZT_PYTHON_EOF_938715'
 #!/usr/bin/env python3
 import base64
 import http.client
+from http.cookies import SimpleCookie
 import json
 import os
 from pathlib import Path
@@ -224,32 +225,66 @@ def panel_cli(c, *args):
 class Panel:
     def __init__(self, c):
         self.c = c
-        self.cookie = ''
+        self.cookies = {}
+        self.csrf_token = ''
 
     def call(self, path, payload=None):
         conn = http.client.HTTPConnection('127.0.0.1', self.c['panel_port'], timeout=10)
-        h = {'Cookie': self.cookie, 'Content-Type': 'application/x-www-form-urlencoded'}
-        body = urllib.parse.urlencode(payload) if payload is not None else None
-        conn.request('POST' if payload is not None else 'GET', self.c['panel_path'] + path.lstrip('/'), body=body, headers=h)
-        res = conn.getresponse()
-        data = res.read().decode()
-        for v in res.headers.get_all('Set-Cookie') or []:
-            self.cookie = v.split(';')[0]
+        headers = {}
+        body = None
+        if self.cookies:
+            headers['Cookie'] = '; '.join(f'{key}={value}' for key, value in self.cookies.items())
+        if payload is not None:
+            body = urllib.parse.urlencode(payload)
+            headers['Content-Type'] = 'application/x-www-form-urlencoded'
+            headers['X-CSRF-Token'] = self.csrf_token
+
+        try:
+            endpoint = self.c['panel_path'] + path.lstrip('/')
+            conn.request('POST' if payload is not None else 'GET', endpoint, body=body, headers=headers)
+            res = conn.getresponse()
+            if res.status == 403:
+                raise RuntimeError(f'3x-ui {path} 返回 HTTP 403，请检查 CSRF 令牌和会话 Cookie')
+            if not 200 <= res.status < 300:
+                raise RuntimeError(f'3x-ui {path} 返回 HTTP {res.status}')
+            data = res.read()
+            for value in res.headers.get_all('Set-Cookie', []):
+                cookie = SimpleCookie()
+                cookie.load(value)
+                for key, item in cookie.items():
+                    if item['max-age'] == '0' or not item.value:
+                        self.cookies.pop(key, None)
+                    else:
+                        self.cookies[key] = item.coded_value
+        finally:
+            conn.close()
         return json.loads(data) if data else {}
 
+    def refresh_csrf(self):
+        result = self.call('/csrf-token')
+        token = result.get('obj')
+        if not result.get('success') or not isinstance(token, str) or not token:
+            raise RuntimeError('3x-ui 未返回有效的 CSRF 令牌')
+        self.csrf_token = token
+
     def login(self):
-        r = self.call('/login', {'username': self.c['username'], 'password': self.c['password']})
-        if not r.get('success'):
-            raise RuntimeError('3x-ui 登录失败')
+        self.cookies.clear()
+        self.refresh_csrf()
+        result = self.call('/login', {'username': self.c['username'], 'password': self.c['password']})
+        if not result.get('success'):
+            raise RuntimeError('3x-ui 登录失败，请检查初始化写入的面板账号和密码')
+        self.refresh_csrf()
 
     def wait(self):
-        for _ in range(60):
+        deadline = time.monotonic() + 60
+        while True:
             try:
                 self.login()
                 return
-            except Exception:
+            except (OSError, http.client.RemoteDisconnected) as exc:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f'3x-ui 本地面板连接超时（{type(exc).__name__}）') from exc
                 time.sleep(1)
-        raise RuntimeError('3x-ui 启动超时')
 
 
 def cf(c, path, payload=None, method=None):
