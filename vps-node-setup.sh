@@ -745,9 +745,6 @@ def show(c):
 
 
 def install():
-    host = ask('输入直连 HTTPS 域名（仅用隧道请回车跳过）：')
-    if host:
-        host = domain(host)
     if STATE.exists():
         raise RuntimeError('已有专用实例，请使用 x 管理或先卸载；拒绝覆盖现有凭据')
     if ROOT.exists() and any(ROOT.iterdir()):
@@ -757,18 +754,16 @@ def install():
     for n in NAMES:
         if shutil.which('docker') and run('docker', 'inspect', '--format', '{{.Id}}', n, capture=True, check=False):
             raise RuntimeError(f'容器名 {n} 已存在，拒绝覆盖')
-    tunnel = ask('CF 隧道：0 不使用 / 1 临时(国内被墙慎用) / 2 固定(推荐) [' + ('0' if host else '1') + ']：', '0' if host else '1')
-    if tunnel not in ('0', '1', '2'):
-        raise ValueError('隧道选项必须是 0/1/2')
-    if not host and tunnel == '0':
-        raise ValueError('无域名时请选择临时或固定隧道，以提供 HTTPS 订阅')
+    tunnel = ask('CF 隧道：1 临时 / 2 固定（推荐）[2]：', '2')
+    if tunnel not in ('1', '2'):
+        raise ValueError('隧道选项必须是 1 或 2')
     ip = detect_public_ip()
     sni = DEFAULT_REALITY_TARGET
     print('自动识别 VPS 公网 IP：' + ip)
     print('REALITY 目标域名自动设置为：' + sni)
     username, password = panel_credentials()
     custom_name = subscription_name(ask('自定义订阅名称 [我的订阅]：', DEFAULT_SUB_NAME))
-    c = {'domain': host, 'ip': ip, 'tunnel': {'0': 'none', '1': 'quick', '2': 'fixed'}[tunnel],
+    c = {'domain': '', 'ip': ip, 'tunnel': {'1': 'quick', '2': 'fixed'}[tunnel],
          'username': username, 'password': password, 'panel_path': '/' + secrets.token_hex(12) + '/',
          'uuid': str(uuid.uuid4()), 'node_password': secrets.token_urlsafe(24),
          'sub_token': secrets.token_urlsafe(32), 'short_id': secrets.token_hex(8),
@@ -776,37 +771,18 @@ def install():
          'subscription_name': custom_name}
     if tunnel == '2':
         c['cf_hostname'] = domain(ask('固定隧道域名（CF 托管的空闲子域名）：'))
-        c['cf_api_token'] = ask('Cloudflare API Token（明文显示；Tunnel Edit / DNS Edit / Zone Read）：')
+        c['cf_api_token'] = __import__('getpass').getpass('Cloudflare API Token（Tunnel Edit / DNS Edit / Zone Read）：').strip()
         if not c['cf_api_token']:
             raise ValueError('API Token 不能为空')
         resolve_cf_identity(c)
         print('已自动识别 Cloudflare 域名区域及所属账户。')
-    elif host and tunnel == '0':
-        cf_token = ask('Cloudflare API Token（需 DNS Edit / Zone Read，用于 Hysteria 2 申请证书；回车跳过）：')
-        if cf_token:
-            c['cf_api_token'] = cf_token
     if c.get('cf_api_token'):
-        hy2_hostname = ask('Hysteria 2 灰云域名（指向本 VPS，回车跳过）：', host or '')
+        hy2_hostname = ask('Hysteria 2 灰云域名（指向本 VPS，回车跳过）：')
         if hy2_hostname:
             c['hy2_hostname'] = domain(hy2_hostname)
             if c['hy2_hostname'] == c.get('cf_hostname'):
                 raise ValueError('Hysteria 2 请使用独立的灰云域名')
     reserved = set()
-    if host:
-        try:
-            resolved = {a[4][0] for a in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
-        except socket.gaierror:
-            resolved = set()
-        if ip not in resolved:
-            for kind in ('A', 'AAAA'):
-                answer = request('https://dns.google/resolve?' + urllib.parse.urlencode({'name': host, 'type': kind}))
-                resolved.update(a['data'] for a in answer.get('Answer', []) if a['type'] in (1, 28))
-        if ip not in resolved:
-            raise ValueError('域名未解析到所选公网 IP。直连模式请关闭 CF 橙云，或改用固定隧道')
-        if not port_free(80):
-            raise RuntimeError('直连 HTTPS 的 HTTP-01 验证需要 TCP 80；请改用仅隧道模式')
-        c['https_port'] = choose_port(9443)
-        reserved.add(c['https_port'])
     for name, preferred in [('panel', 20530), ('sub', 20531), ('edge', 20532),
                             ('vless', 20533), ('vmess', 20534), ('trojan', 20535),
                             ('reality', 8443), ('ss', 18443)]:
@@ -828,8 +804,7 @@ def install():
     c['panel_version'] = release
     c['panel_image'] = image('ghcr.io/mhsanaei/3x-ui:' + release)
     c['edge_image'] = image('caddy:2')
-    if tunnel != '0':
-        c['cf_image'] = image('cloudflare/cloudflared:latest')
+    c['cf_image'] = image('cloudflare/cloudflared:latest')
     ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
     (ROOT / 'db').mkdir(mode=0o700)
     save(c)
