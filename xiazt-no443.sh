@@ -251,7 +251,12 @@ def choose_port(preferred):
 
 def image(ref):
     print(f'正在拉取镜像 {ref}…', flush=True)
-    run('docker', 'pull', ref, timeout=600)
+    try:
+        run('docker', 'pull', ref, timeout=600)
+    except TimeoutError as exc:
+        raise RuntimeError(f'拉取 {ref} 超时：{exc}') from None
+    except RuntimeError:
+        raise RuntimeError(f'拉取 {ref} 失败，请查看上方 Docker 错误') from None
     digests = json.loads(run('docker', 'image', 'inspect', ref,
                              '--format', '{{json .RepoDigests}}', capture=True))
     if not digests:
@@ -803,10 +808,8 @@ def prepare_images(c):
         packages.append('docker.io')
     run('apt-get', 'install', '-y', *packages, timeout=600)
     run('systemctl', 'enable', '--now', 'docker')
-    # Pull mutable upstream tags once, then record immutable repository digests.
-    release = request('https://api.github.com/repos/MHSanaei/3x-ui/releases/latest')['tag_name']
-    c['panel_version'] = release
-    c['panel_image'] = image('ghcr.io/mhsanaei/3x-ui:' + release)
+    # Use the published registry tag directly, then record its repository digest.
+    c['panel_image'] = image('ghcr.io/mhsanaei/3x-ui:latest')
     c['edge_image'] = image('caddy:2')
     if c['tunnel'] != 'none':
         c['cf_image'] = image('cloudflare/cloudflared:latest')
