@@ -121,7 +121,7 @@ curl -fL https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/m
 443端口释放版
 
 ```bash
-curl -fL https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazheteng-node-manager-cf-tunnel.sh -o /tmp/xiazheteng-install.sh && sudo bash /tmp/vps-node-setup.sh
+curl -fL https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/vps-node-setup.sh -o /tmp/xiazheteng-install.sh && sudo bash /tmp/vps-node-setup.sh
 ```
 
 该命令会将脚本下载至 `/tmp/xiazheteng-install.sh`，下载成功后使用 sudo 执行。
