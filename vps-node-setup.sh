@@ -224,32 +224,72 @@ def panel_cli(c, *args):
 class Panel:
     def __init__(self, c):
         self.c = c
-        self.cookie = ''
+        self.cookies = {}
+        self.csrf_token = ''
 
     def call(self, path, payload=None):
-        conn = http.client.HTTPConnection('127.0.0.1', self.c['panel_port'], timeout=10)
-        h = {'Cookie': self.cookie, 'Content-Type': 'application/x-www-form-urlencoded'}
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+        if self.cookies:
+            headers['Cookie'] = '; '.join(self.cookies.values())
+        if payload is not None and self.csrf_token:
+            headers['X-CSRF-Token'] = self.csrf_token
         body = urllib.parse.urlencode(payload) if payload is not None else None
-        conn.request('POST' if payload is not None else 'GET', self.c['panel_path'] + path.lstrip('/'), body=body, headers=h)
-        res = conn.getresponse()
-        data = res.read().decode()
-        for v in res.headers.get_all('Set-Cookie') or []:
-            self.cookie = v.split(';')[0]
-        return json.loads(data) if data else {}
+        target = self.c['panel_path'].rstrip('/') + '/' + path.lstrip('/')
+        conn = http.client.HTTPConnection('127.0.0.1', self.c['panel_port'], timeout=3)
+        try:
+            conn.request('POST' if payload is not None else 'GET', target, body=body, headers=headers)
+            res = conn.getresponse()
+            if res.status != 200:
+                raise urllib.error.HTTPError(path, res.status, res.reason, res.headers, None)
+            for value in res.headers.get_all('Set-Cookie') or []:
+                cookie = value.split(';', 1)[0]
+                self.cookies[cookie.split('=', 1)[0]] = cookie
+            data = res.read()
+            return json.loads(data) if data else {}
+        finally:
+            conn.close()
+
+    def refresh_csrf(self):
+        try:
+            result = self.call('/csrf-token')
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise
+            self.csrf_token = ''
+            return
+        token = result.get('obj')
+        if not result.get('success') or not isinstance(token, str) or not token:
+            raise RuntimeError('3x-ui 未返回有效的 CSRF Token')
+        self.csrf_token = token
 
     def login(self):
-        r = self.call('/login', {'username': self.c['username'], 'password': self.c['password']})
-        if not r.get('success'):
-            raise RuntimeError('3x-ui 登录失败')
+        self.cookies.clear()
+        self.refresh_csrf()
+        result = self.call('/login', {'username': self.c['username'], 'password': self.c['password']})
+        if not result.get('success'):
+            raise RuntimeError('3x-ui 拒绝登录，请检查面板初始化和凭据')
+        if self.csrf_token:
+            self.refresh_csrf()
 
     def wait(self):
-        for _ in range(60):
+        print(f"等待 3x-ui 面板响应：127.0.0.1:{self.c['panel_port']}（最多约 30 秒）", flush=True)
+        deadline = time.monotonic() + 30
+        while True:
             try:
                 self.login()
+                print('3x-ui 面板登录成功。', flush=True)
                 return
-            except Exception:
-                time.sleep(1)
-        raise RuntimeError('3x-ui 启动超时')
+            except urllib.error.HTTPError as exc:
+                if exc.code < 500:
+                    raise RuntimeError(f'3x-ui {exc.filename} 返回 HTTP {exc.code}') from None
+                failure = f'HTTP {exc.code}'
+            except (OSError, http.client.HTTPException) as exc:
+                failure = type(exc).__name__
+            except ValueError:
+                raise RuntimeError('3x-ui 登录接口返回了非 JSON 响应') from None
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f'3x-ui 面板启动超时（{failure}），请查看 docker logs --tail 30 xiazt-panel')
+            time.sleep(1)
 
 
 def cf(c, path, payload=None, method=None):
@@ -932,7 +972,9 @@ def resume(c):
         c['private_key'] = base64.urlsafe_b64encode(private).decode().rstrip('=')
         c['public_key'] = base64.urlsafe_b64encode(public).decode().rstrip('=')
         save(c)
+    print("正在配置 3x-ui 节点…", flush=True)
     setup_nodes(c)
+    print("正在启动订阅服务和隧道…", flush=True)
     install_services(c)
     if c.get('hy2_hostname'):
         if not c.get('hy2_enabled') or not is_hy2_installed():
