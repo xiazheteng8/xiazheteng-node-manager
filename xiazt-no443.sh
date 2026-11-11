@@ -46,6 +46,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import secrets
 import shutil
@@ -250,13 +251,24 @@ def choose_port(preferred):
 
 
 def image(ref):
+    # An offline import can retain its tag without retaining repository digests.
+    if os.environ.get('XIAZT_USE_LOCAL_IMAGES') == '1':
+        info = run('docker', 'image', 'inspect', ref,
+                   '--format', '{{.Id}} {{.Os}} {{.Architecture}}', capture=True, check=False)
+        fields = info.split()
+        arch = {'x86_64': 'amd64', 'aarch64': 'arm64'}[platform.machine()]
+        if len(fields) != 3 or fields[1:] != ['linux', arch] or not re.fullmatch(r'sha256:[a-f0-9]{64}', fields[0]):
+            raise RuntimeError(f'本机缺少 {ref} 的 linux/{arch} 镜像，请先导入可信镜像')
+        print(f'使用本地镜像 {ref}（{fields[0]}）', flush=True)
+        return fields[0]
     print(f'正在拉取镜像 {ref}…', flush=True)
     try:
         run('docker', 'pull', ref, timeout=600)
     except TimeoutError as exc:
         raise RuntimeError(f'拉取 {ref} 超时：{exc}') from None
     except RuntimeError:
-        raise RuntimeError(f'拉取 {ref} 失败，请查看上方 Docker 错误') from None
+        raise RuntimeError(f'拉取 {ref} 失败，请查看上方 Docker 错误。'
+                           '若已导入可信镜像，可使用 XIAZT_USE_LOCAL_IMAGES=1 重试') from None
     digests = json.loads(run('docker', 'image', 'inspect', ref,
                              '--format', '{{json .RepoDigests}}', capture=True))
     if not digests:
