@@ -201,9 +201,24 @@ def owned(name):
 
 
 def panel_cli(c, *args):
-    cmd = ['docker', 'run', '--rm', '-v', f"{ROOT / 'db'}:/etc/x-ui", c['panel_image'], 'x-ui']
-    cmd.extend(args)
-    run(*cmd)
+    name = 'xiazt-panel-init-' + secrets.token_hex(8)
+    cmd = ['docker', 'run', '--rm', '--name', name, '--network', 'none',
+           '--workdir', '/app', '--entrypoint', '/app/x-ui',
+           '-v', f"{ROOT / 'db'}:/etc/x-ui", c['panel_image'], 'setting', *args]
+    print('正在初始化 3x-ui 面板设置…', flush=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            # Docker 和 x-ui 的原始输出可能包含面板凭据。
+            raise RuntimeError(f"3x-ui 面板初始化失败（退出码 {result.returncode}，镜像 {c['panel_image']}）")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('3x-ui 面板初始化超过 60 秒，已停止等待') from None
+    finally:
+        try:
+            subprocess.run(['docker', 'rm', '-f', name], capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
 
 
 class Panel:
@@ -214,8 +229,8 @@ class Panel:
     def call(self, path, payload=None):
         conn = http.client.HTTPConnection('127.0.0.1', self.c['panel_port'], timeout=10)
         h = {'Cookie': self.cookie, 'Content-Type': 'application/x-www-form-urlencoded'}
-        body = urllib.parse.urlencode(payload) if payload else None
-        conn.request('POST' if payload else 'GET', self.c['panel_path'] + path.lstrip('/'), body=body, headers=h)
+        body = urllib.parse.urlencode(payload) if payload is not None else None
+        conn.request('POST' if payload is not None else 'GET', self.c['panel_path'] + path.lstrip('/'), body=body, headers=h)
         res = conn.getresponse()
         data = res.read().decode()
         for v in res.headers.get_all('Set-Cookie') or []:
@@ -238,17 +253,32 @@ class Panel:
 
 
 def cf(c, path, payload=None, method=None):
-    body = json.dumps(payload).encode() if payload else None
-    return request('https://api.cloudflare.com/client/v4' + path,
-                   headers={'Authorization': f"Bearer {c['cf_api_token']}", 'Content-Type': 'application/json'},
-                   data=body, method=method)
+    body = json.dumps(payload).encode() if payload is not None else None
+    verb = method or ('POST' if body is not None else 'GET')
+    endpoint = path.split('?', 1)[0]
+    status = 200
+    try:
+        response = request('https://api.cloudflare.com/client/v4' + path,
+                           headers={'Authorization': f"Bearer {c['cf_api_token']}",
+                                    'Content-Type': 'application/json'},
+                           data=body, method=verb)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        try:
+            response = json.loads(exc.read(65536))
+        except ValueError:
+            response = {}
+    if status >= 400 or not response.get('success'):
+        errors = ', '.join(str(error['code']) for error in response.get('errors', []) if 'code' in error)
+        raise RuntimeError(f'Cloudflare {verb} {endpoint} 失败（HTTP {status}，API 错误码：{errors or "无"}）')
+    return response
 
 
 def ensure_firewall_ports(c):
     """自动放行本机防火墙端口（TCP 和 Hysteria2 UDP）"""
     ports = [c['reality_port'], c['ss_port']]
     if c.get('domain'):
-        ports.extend([80, 443])
+        ports.extend([80, c.get('https_port', 443)])
     hy_udp_port = c.get('hy2_port') if c.get('hy2_enabled') else None
 
     if shutil.which('ufw'):
@@ -283,17 +313,16 @@ def is_hy2_installed():
 
 def install_hy2_auto(c):
     """域名部署时自动配置并安装 Hysteria 2（复用已有的域名和 Cloudflare API Token，无需重复输入）"""
-    domain_name = c.get('domain') or c.get('cf_hostname')
+    domain_name = c.get('hy2_hostname')
     token = c.get('cf_api_token')
     if not domain_name or not token:
         c['hy2_enabled'] = False
         return
 
     print('\n正在检测并自动部署 Hysteria 2 (高速 UDP 协议)...')
-    # 默认优先使用 UDP 443，若被占用则使用 8443 或随机高位端口
-    port = 443
-    if not port_free_udp(port):
-        port = 8443 if port_free_udp(8443) else choose_port(24443)
+    port = 24443
+    while port == c['ss_port'] or not port_free_udp(port):
+        port = secrets.randbelow(30000) + 20000
 
     run('apt-get', 'update')
     run('apt-get', 'install', '-y', 'curl', 'ca-certificates')
@@ -340,24 +369,22 @@ def install_hy2_auto(c):
     except Exception:
         pass
 
-    c['hy2_enabled'] = True
-    c['hy2_domain'] = domain_name
-    c['hy2_port'] = port
-    c['hy2_password'] = password
-    save(c)
-
-    ensure_firewall_ports(c)
-
     run('systemctl', 'daemon-reload')
-    run('systemctl', 'enable', '--now', 'hysteria-server')
+    run('systemctl', 'enable', 'hysteria-server')
     run('systemctl', 'restart', 'hysteria-server')
+    run('systemctl', 'is-active', '--quiet', 'hysteria-server')
+
+    c.update(hy2_enabled=True, hy2_domain=domain_name, hy2_port=port, hy2_password=password)
+    ensure_firewall_ports(c)
+    save(c)
 
     print(f'\n✅ Hysteria 2 已自动部署完成，监听 UDP {port}，节点已自动汇入订阅。')
 
 
 def resolve_cf_identity(c):
     zones = cf(c, '/zones')['result']
-    matches = [z for z in zones if c['cf_hostname'].endswith(z['name'])]
+    matches = [z for z in zones if c['cf_hostname'] == z['name']
+               or c['cf_hostname'].endswith('.' + z['name'])]
     if not matches:
         raise RuntimeError('Token 无法访问该域名的 Zone')
     zone = max(matches, key=lambda z: len(z['name']))
@@ -366,32 +393,82 @@ def resolve_cf_identity(c):
 
 
 def setup_cf(c):
-    if c['tunnel'] == 'quick':
+    if c['tunnel'] != 'fixed':
         return
-    sec = secrets.token_bytes(32)
-    t = cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel",
-           {'name': f"xiazt-{c['short_id']}", 'tunnel_secret': base64.b64encode(sec).decode()})['result']
-    c['cf_tunnel_id'] = t['id']
-    c['cf_tunnel_token'] = t.get('token', '')
-    if not c['cf_tunnel_token']:
-        t_info = cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel/{t['id']}/token")['result']
-        c['cf_tunnel_token'] = t_info if isinstance(t_info, str) else t_info.get('token', '')
-    cf(c, f"/accounts/{c['cf_account']}/cfd_tunnel/{t['id']}/configurations",
-       {'config': {'ingress': [{'hostname': c['cf_hostname'], 'service': f"http://127.0.0.1:{c['edge_port']}"},
-                               {'service': 'http_status:404'}]}}, method='PUT')
-    dns = cf(c, f"/zones/{c['cf_zone']}/dns_records",
-             {'type': 'CNAME', 'name': c['cf_hostname'], 'content': f"{t['id']}.cfargotunnel.com", 'proxied': True})['result']
-    c['cf_dns_id'] = dns['id']
+    resolve_cf_identity(c)
+    host = c['cf_hostname']
+    account = f"/accounts/{c['cf_account']}/cfd_tunnel"
+    records = f"/zones/{c['cf_zone']}/dns_records"
+    lookup = records + '?' + urllib.parse.urlencode({'name.exact': host})
+    existing = cf(c, lookup)['result']
+    tunnel_id = c.get('cf_tunnel_id')
+    if not tunnel_id:
+        tunnel_name = f"xiazt-{c['short_id']}"
+        params = urllib.parse.urlencode({'name': tunnel_name, 'is_deleted': 'false'})
+        matches = [t for t in cf(c, account + '?' + params)['result'] if t['name'] == tunnel_name]
+        if len(matches) > 1:
+            raise RuntimeError(f'发现多个同名隧道：{tunnel_name}')
+        if matches:
+            tunnel_id = matches[0]['id']
+        elif existing:
+            raise RuntimeError(f'{host} 已有 DNS 记录，请使用空闲子域名')
+        else:
+            tunnel_id = cf(c, account, {
+                'name': tunnel_name,
+                'config_src': 'cloudflare',
+                'tunnel_secret': base64.b64encode(secrets.token_bytes(32)).decode(),
+            })['result']['id']
+        c['cf_tunnel_id'] = tunnel_id
+        c.pop('cf_tunnel_token', None)
+        save(c)
+    target = f'{tunnel_id}.cfargotunnel.com'
+    if any(r['type'] != 'CNAME' or r['content'].rstrip('.') != target for r in existing):
+        raise RuntimeError(f'{host} 的 DNS 记录与脚本隧道不匹配，现有记录未改动')
+    if not c.get('cf_tunnel_token'):
+        info = cf(c, f'{account}/{tunnel_id}/token')['result']
+        token = info if isinstance(info, str) else info.get('token')
+        if not token:
+            raise RuntimeError('Cloudflare 未返回隧道运行凭据')
+        c['cf_tunnel_token'] = token
+        save(c)
+    route = {'hostname': host, 'service': f"http://127.0.0.1:{c['edge_port']}"}
+    config_path = f'{account}/{tunnel_id}/configurations'
+    cf(c, config_path, {'config': {'ingress': [route, {'service': 'http_status:404'}]}}, method='PUT')
+    config = cf(c, config_path)['result']['config']
+    if not any(all(rule.get(k) == v for k, v in route.items()) for rule in config.get('ingress', [])):
+        raise RuntimeError(f'Cloudflare 未保存 {host} 的隧道路由')
+    print(f'Cloudflare 隧道路由已确认：{host} → {route["service"]}', flush=True)
+
+    payload = {'type': 'CNAME', 'name': host, 'content': target, 'proxied': True}
+    if not existing:
+        cf(c, records, payload)
+    elif not existing[0].get('proxied'):
+        cf(c, f"{records}/{existing[0]['id']}", {'proxied': True}, method='PATCH')
+    confirmed = [r for r in cf(c, lookup)['result']
+                 if r['type'] == 'CNAME' and r['content'].rstrip('.') == target and r.get('proxied')]
+    if not confirmed:
+        raise RuntimeError(f'Cloudflare 未保存 {host} 的橙云 CNAME')
+    c['cf_dns_id'] = confirmed[0]['id']
+    save(c)
+    print(f'Cloudflare 橙云 CNAME 已确认：{host}', flush=True)
 
 
 def setup_nodes(c):
     p = Panel(c)
     p.login()
-    for row in p.call('/panel/api/inbounds/list').get('obj', []):
-        p.call(f"/panel/api/inbounds/del/{row['id']}")
+    def checked(path, payload=None):
+        result = p.call(path, payload)
+        if not result.get('success'):
+            raise RuntimeError(f'3x-ui API {path}: {result.get("msg") or "操作失败"}')
+        return result.get('obj')
+
+    managed_ports = {c[key + '_port'] for key in ('reality', 'ss', 'vless', 'vmess', 'trojan')}
+    for row in checked('/panel/api/inbounds/list') or []:
+        if row['port'] in managed_ports:
+            checked(f"/panel/api/inbounds/del/{row['id']}", {})
 
     def add(remark, port, protocol, settings, stream):
-        p.call('/panel/api/inbounds/add', {'up': 0, 'down': 0, 'total': 0, 'remark': remark, 'enable': 'true',
+        checked('/panel/api/inbounds/add', {'up': 0, 'down': 0, 'total': 0, 'remark': remark, 'enable': 'true',
                                            'expiryTime': 0, 'listen': '127.0.0.1' if stream.get('network') == 'ws' else '',
                                            'port': port, 'protocol': protocol,
                                            'settings': json.dumps(settings), 'streamSettings': json.dumps(stream)})
@@ -413,7 +490,7 @@ def setup_nodes(c):
         cred = c['uuid'] if proto in ('vless', 'vmess') else c['node_password']
         extra = {'decryption': 'none'} if proto == 'vless' else {}
         add(proto.upper(), c[proto + '_port'], proto,
-            {'clients': [{field: cred, **extra}]}, ws(f"{c['ws_prefix']}/{proto}"))
+            {'clients': [{field: cred}], **extra}, ws(f"{c['ws_prefix']}/{proto}"))
     ensure_firewall_ports(c)
 
 
@@ -455,37 +532,40 @@ def endpoints(c):
     return [c['domain']] if c['domain'] else []
 
 
+def endpoint_port(c, host):
+    if host == c['domain'] and c['tunnel'] == 'none':
+        return c.get('https_port', 443)
+    return 443
+
+
+def subscription_url(c, host):
+    port = endpoint_port(c, host)
+    authority = host if port == 443 else f'{host}:{port}'
+    return f"https://{authority}/sub/{c['sub_token']}"
+
+
 def node_links(c, name=None):
     name = subscription_name(c.get('subscription_name', DEFAULT_SUB_NAME) if name is None else name)
-    links = [link('vless', c['uuid'], c['ip'], c['reality_port'],
+    ip_host = '[' + c['ip'] + ']' if ':' in c['ip'] else c['ip']
+    links = [link('vless', c['uuid'], ip_host, c['reality_port'],
                   {'encryption': 'none', 'security': 'reality', 'sni': c['sni'],
                    'fp': 'chrome', 'pbk': c['public_key'], 'sid': c['short_id'],
                    'type': 'tcp', 'flow': 'xtls-rprx-vision', 'spx': '/'}, name + '-REALITY')]
-    host = '[' + c['ip'] + ']' if ':' in c['ip'] else c['ip']
     links.append('ss://' + b64('chacha20-ietf-poly1305:' + c['node_password']) +
-                 f"@{host}:{c['ss_port']}#" + urllib.parse.quote(name + '-SS'))
-    cf_preferred = ['visa.cn', 'icook.hk', '104.16.160.1', '162.159.192.1']
+                 f"@{ip_host}:{c['ss_port']}#" + urllib.parse.quote(name + '-SS'))
     for host in endpoints(c):
+        port = endpoint_port(c, host)
         for proto in ('vless', 'trojan'):
             q = {'security': 'tls', 'sni': host, 'type': 'ws', 'host': host,
                  'path': c['ws_prefix'] + '/' + proto}
             if proto == 'vless':
                 q['encryption'] = 'none'
             links.append(link(proto, c['uuid'] if proto == 'vless' else c['node_password'],
-                              host, 443, q, name + '-' + proto + '-' + host))
+                              host, port, q, name + '-' + proto + '-' + host))
         links.append('vmess://' + b64(json.dumps({'v': '2', 'ps': name + '-vmess-' + host,
-            'add': host, 'port': 443, 'id': c['uuid'], 'aid': 0, 'scy': 'auto',
+            'add': host, 'port': port, 'id': c['uuid'], 'aid': 0, 'scy': 'auto',
             'net': 'ws', 'type': 'none', 'host': host, 'path': c['ws_prefix'] + '/vmess',
             'tls': 'tls', 'sni': host}, ensure_ascii=False)))
-        if 'trycloudflare.com' not in host:
-            for pref in cf_preferred:
-                q_vless = {'security': 'tls', 'sni': host, 'type': 'ws', 'host': host,
-                           'path': c['ws_prefix'] + '/vless', 'encryption': 'none'}
-                links.append(link('vless', c['uuid'], pref, 443, q_vless, f"{name}-VLESS-优选-{pref}"))
-                links.append('vmess://' + b64(json.dumps({'v': '2', 'ps': f"{name}-VMess-优选-{pref}",
-                    'add': pref, 'port': 443, 'id': c['uuid'], 'aid': 0, 'scy': 'auto',
-                    'net': 'ws', 'type': 'none', 'host': host, 'path': c['ws_prefix'] + '/vmess',
-                    'tls': 'tls', 'sni': host}, ensure_ascii=False)))
     if c.get('hy2_enabled') and c.get('hy2_domain') and c.get('hy2_port'):
         hy_name = urllib.parse.quote(name + '-Hysteria2')
         links.append(f"hysteria2://{c['hy2_password']}@{c['hy2_domain']}:{c['hy2_port']}/?sni={c['hy2_domain']}#{hy_name}")
@@ -498,7 +578,7 @@ def subscription_response(c, name=None):
     if cache.exists():
         for source, nodes in json.loads(cache.read_text()).items():
             merged.extend(nodes)
-    return base64.b64encode('\n'.join(merged).encode()).decode()
+    return base64.b64encode('\n'.join(dict.fromkeys(merged)).encode()).decode()
 
 
 def parse_subscription(text):
@@ -553,11 +633,15 @@ def fetch_source(url):
     req = urllib.request.Request(url, headers={'User-Agent': 'v2rayN/6.23'})
     with opener.open(req, timeout=10) as r:
         raw = r.read(1048576)
-    try:
-        pad = b'=' * (-len(raw) % 4)
-        nodes = parse_subscription(base64.urlsafe_b64decode(raw + pad).decode('utf-8', 'ignore'))
-    except Exception:
-        nodes = parse_subscription(raw.decode('utf-8', 'ignore'))
+    nodes = parse_subscription(raw.decode('utf-8', 'ignore'))
+    if not nodes:
+        encoded = b''.join(raw.split())
+        try:
+            decoded = base64.b64decode(encoded + b'=' * (-len(encoded) % 4),
+                                       altchars=b'-_', validate=True)
+            nodes = parse_subscription(decoded.decode('utf-8'))
+        except (ValueError, UnicodeError):
+            nodes = []
     if not nodes:
         raise ValueError('未解析出任何有效代理节点')
     return nodes
@@ -635,11 +719,17 @@ def caddy_config(c):
     routes += f"    handle /sub/* {{\n        reverse_proxy 127.0.0.1:{c['sub_port']}\n    }}\n    handle /health {{\n        respond ok\n    }}\n    handle {{\n        respond 404\n    }}\n"
     # 修复：禁用 Caddy 默认开启的 HTTP/3 (QUIC)，防止与 Hysteria 2 在 UDP 443 发生端口冲突
     config = '{\n    admin off\n    servers {\n        protocols h1 h2\n    }\n'
-    if not c.get('http_challenge', True):
+    if c.get('https_port') or not c.get('http_challenge', True):
         config += '    auto_https disable_redirects\n'
     config += '}\n'
     config += f"http://:{c['edge_port']} {{\n    bind 127.0.0.1\n" + routes + '}\n'
-    if c['domain']:
+    if c['domain'] and c.get('https_port'):
+        host = c['domain']
+        port = c['https_port']
+        config += f'http://{host} {{\n    respond 404\n}}\n'
+        tls = '    tls {\n        issuer acme {\n            disable_tlsalpn_challenge\n        }\n    }\n'
+        config += f'https://{host}:{port} {{\n' + tls + routes + '}\n'
+    elif c['domain']:
         tls = '' if c.get('http_challenge', True) else '    tls {\n        issuer acme {\n            disable_http_challenge\n        }\n    }\n'
         config += c['domain'] + ' {\n' + tls + routes + '}\n'
     return config
@@ -674,28 +764,48 @@ WantedBy=multi-user.target
         else:
             run('docker', 'restart', 'xiazt-cf')
     elif c['tunnel'] == 'fixed':
-        if not c.get('cf_tunnel_id'):
-            setup_cf(c)
-            save(c)
-        if not owned('xiazt-cf'):
-            container('xiazt-cf', c['cf_image'], args=['tunnel', 'run', '--token', c['cf_tunnel_token']])
-        else:
-            run('docker', 'restart', 'xiazt-cf')
+        setup_cf(c)
+        args = ['tunnel', 'run', '--token', c['cf_tunnel_token']]
+        if owned('xiazt-cf'):
+            current = run('docker', 'inspect', '--format', '{{json .Config.Cmd}}', 'xiazt-cf', capture=True)
+            if json.loads(current) == args:
+                run('docker', 'restart', 'xiazt-cf')
+                return
+            run('docker', 'rm', '-f', 'xiazt-cf', capture=True)
+        container('xiazt-cf', c['cf_image'], args=args)
 
 
 def verify_public(c):
-    for _ in range(60):
-        for h in endpoints(c):
+    hosts = endpoints(c)
+    if not hosts:
+        print('未找到公网订阅域名。')
+        return False
+    expected = set(node_links(c))
+    opener = urllib.request.build_opener(StrictHTTPSRedirectHandler())
+    deadline = time.monotonic() + 150
+    failure = ''
+    print(f'正在检查 HTTPS 订阅：{hosts[0]}（最多约 150 秒）', flush=True)
+    while time.monotonic() < deadline:
+        for host in hosts:
             try:
-                opener = urllib.request.build_opener(SafeRedirectHandler())
-                req = urllib.request.Request(f"https://{h}/sub/{c['sub_token']}",
+                req = urllib.request.Request(subscription_url(c, host),
                                              headers={'User-Agent': 'xiazt-verify/1.0'})
-                with opener.open(req, timeout=5) as r:
-                    if r.status == 200 and base64.b64decode(r.read()).strip():
+                with opener.open(req, timeout=5) as response:
+                    payload = response.read(2 * 1024 * 1024)
+                    actual = set(parse_subscription(base64.b64decode(payload, validate=True).decode('utf-8')))
+                    if response.status == 200 and expected and expected.issubset(actual):
                         return True
-            except Exception:
-                pass
+                failure = '订阅内容缺少预期节点'
+            except urllib.error.HTTPError as exc:
+                failure = f'HTTP {exc.code}'
+            except urllib.error.URLError as exc:
+                failure = str(exc.reason)
+            except ValueError:
+                failure = '响应无法解码为节点订阅'
+            except OSError as exc:
+                failure = type(exc).__name__
         time.sleep(2)
+    print(f'公网订阅检查失败：{hosts[0]}（{failure}）')
     return False
 
 
@@ -706,11 +816,14 @@ def show(c):
     print(f"ssh -N -L {c['panel_port']}:127.0.0.1:{c['panel_port']} root@{sshhost}")
     print(f"3x-ui 后台：http://127.0.0.1:{c['panel_port']}{c['panel_path']}")
     print('3x-ui 后台账号：' + c['username'] + '\n3x-ui 后台密码：' + c['password'])
-    for host in endpoints(c):
-        print(f"订阅：https://{host}/sub/{c['sub_token']}")
+    if c.get('complete'):
+        for host in endpoints(c):
+            print('订阅：' + subscription_url(c, host))
+    else:
+        print('订阅尚未通过公网验证，请运行 x → 检查/恢复。')
     print(f"需放行：TCP {c['reality_port']}；TCP/UDP {c['ss_port']}" +
-          (('；TCP 80/443' if c.get('http_challenge', True) else '；TCP 443') + '（域名直连）' if c['domain'] else ''))
-    print('WS 端口、后台、订阅源站只监听本机；不自动改动你的防火墙或云安全组。')
+          (f"；TCP 80/{c.get('https_port', 443)}（域名直连）" if c['domain'] else ''))
+    print('WS 源站、后台、订阅源站只监听本机。云安全组需手动放行上述端口。')
     if c['tunnel'] == 'quick':
         print('临时隧道重启会换域名：运行 x 查看新订阅。节点订阅内容会自动使用当前域名。')
     if c.get('hy2_enabled') and c.get('hy2_domain'):
@@ -727,9 +840,6 @@ def show(c):
 
 
 def install():
-    host = ask('输入已解析的域名（没有就回车跳过）：')
-    if host:
-        host = domain(host)
     if STATE.exists():
         raise RuntimeError('已有专用实例，请使用 x 管理或先卸载；拒绝覆盖现有凭据')
     if ROOT.exists() and any(ROOT.iterdir()):
@@ -739,18 +849,16 @@ def install():
     for n in NAMES:
         if shutil.which('docker') and run('docker', 'inspect', '--format', '{{.Id}}', n, capture=True, check=False):
             raise RuntimeError(f'容器名 {n} 已存在，拒绝覆盖')
-    tunnel = ask('CF 隧道：0 不使用 / 1 临时(国内被墙慎用) / 2 固定(推荐) [' + ('0' if host else '1') + ']：', '0' if host else '1')
-    if tunnel not in ('0', '1', '2'):
-        raise ValueError('隧道选项必须是 0/1/2')
-    if not host and tunnel == '0':
-        raise ValueError('无域名时请选择临时或固定隧道，以提供 HTTPS 订阅')
+    tunnel = ask('CF 隧道：1 临时 / 2 固定（推荐）[2]：', '2')
+    if tunnel not in ('1', '2'):
+        raise ValueError('隧道选项必须是 1 或 2')
     ip = detect_public_ip()
     sni = DEFAULT_REALITY_TARGET
     print('自动识别 VPS 公网 IP：' + ip)
     print('REALITY 目标域名自动设置为：' + sni)
     username, password = panel_credentials()
     custom_name = subscription_name(ask('自定义订阅名称 [我的订阅]：', DEFAULT_SUB_NAME))
-    c = {'domain': host, 'ip': ip, 'tunnel': {'0': 'none', '1': 'quick', '2': 'fixed'}[tunnel],
+    c = {'domain': '', 'ip': ip, 'tunnel': {'1': 'quick', '2': 'fixed'}[tunnel],
          'username': username, 'password': password, 'panel_path': '/' + secrets.token_hex(12) + '/',
          'uuid': str(uuid.uuid4()), 'node_password': secrets.token_urlsafe(24),
          'sub_token': secrets.token_urlsafe(32), 'short_id': secrets.token_hex(8),
@@ -758,31 +866,17 @@ def install():
          'subscription_name': custom_name}
     if tunnel == '2':
         c['cf_hostname'] = domain(ask('固定隧道域名（CF 托管的空闲子域名）：'))
-        c['cf_api_token'] = ask('Cloudflare API Token（明文显示；Tunnel Edit / DNS Edit / Zone Read）：')
+        c['cf_api_token'] = ask('Cloudflare API Token（Tunnel Edit / DNS Edit / Zone Read）：').strip()
         if not c['cf_api_token']:
             raise ValueError('API Token 不能为空')
         resolve_cf_identity(c)
         print('已自动识别 Cloudflare 域名区域及所属账户。')
-    elif host and tunnel == '0':
-        cf_token = ask('Cloudflare API Token（需 DNS Edit / Zone Read，用于 Hysteria 2 申请证书；回车跳过）：')
-        if cf_token:
-            c['cf_api_token'] = cf_token
-    if host:
-        try:
-            resolved = {a[4][0] for a in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
-        except socket.gaierror:
-            resolved = set()
-        if ip not in resolved:
-            for kind in ('A', 'AAAA'):
-                answer = request('https://dns.google/resolve?' + urllib.parse.urlencode({'name': host, 'type': kind}))
-                resolved.update(a['data'] for a in answer.get('Answer', []) if a['type'] in (1, 28))
-        if ip not in resolved:
-            raise ValueError('域名未解析到所选公网 IP。直连模式请关闭 CF 橙云，或改用固定隧道')
-        if not port_free(443):
-            raise RuntimeError('443 端口已占用；请使用隧道模式，脚本不会抢占服务')
-        c['http_challenge'] = port_free(80)
-        if not c['http_challenge']:
-            print('80 端口已有服务，保留原服务；HTTPS 证书改用 443 TLS-ALPN 验证。')
+    if c.get('cf_api_token'):
+        hy2_hostname = ask('Hysteria 2 灰云域名（指向本 VPS，回车跳过）：')
+        if hy2_hostname:
+            c['hy2_hostname'] = domain(hy2_hostname)
+            if c['hy2_hostname'] == c.get('cf_hostname'):
+                raise ValueError('Hysteria 2 请使用独立的灰云域名')
     reserved = set()
     for name, preferred in [('panel', 20530), ('sub', 20531), ('edge', 20532),
                             ('vless', 20533), ('vmess', 20534), ('trojan', 20535),
@@ -805,8 +899,7 @@ def install():
     c['panel_version'] = release
     c['panel_image'] = image('ghcr.io/mhsanaei/3x-ui:' + release)
     c['edge_image'] = image('caddy:2')
-    if tunnel != '0':
-        c['cf_image'] = image('cloudflare/cloudflared:latest')
+    c['cf_image'] = image('cloudflare/cloudflared:latest')
     ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
     (ROOT / 'db').mkdir(mode=0o700)
     save(c)
@@ -814,19 +907,12 @@ def install():
     os.chmod(ROOT / 'manager.py', 0o700)
     write('/usr/local/bin/x', '#!/bin/sh\nexec /usr/bin/python3 /opt/xiazt/manager.py "$@"\n', 0o755)
 
-    # 域名部署且具备 Cloudflare API Token 时，自动安装 Hysteria 2；无域名部署则默认不安装
-    if host and c.get('cf_api_token'):
-        try:
-            install_hy2_auto(c)
-        except Exception as e:
-            print(f'Hysteria 2 安装未完成：{e}')
-    else:
-        c['hy2_enabled'] = False
-        save(c)
     resume(c)
 
 
 def resume(c):
+    c['complete'] = False
+    save(c)
     if not owned('xiazt-panel'):
         panel_cli(c, '-username', c['username'], '-password', c['password'],
                   '-port', str(c['panel_port']), '-listenIP', '127.0.0.1', '-webBasePath', c['panel_path'])
@@ -848,13 +934,17 @@ def resume(c):
         save(c)
     setup_nodes(c)
     install_services(c)
-    if c.get('hy2_enabled') and is_hy2_installed():
-        run('systemctl', 'restart', 'hysteria-server', check=False)
+    if c.get('hy2_hostname'):
+        if not c.get('hy2_enabled') or not is_hy2_installed():
+            install_hy2_auto(c)
+        else:
+            run('systemctl', 'restart', 'hysteria-server')
+        run('systemctl', 'is-active', '--quiet', 'hysteria-server')
     c['complete'] = verify_public(c)
     save(c)
-    show(c)
     if not c['complete']:
         raise RuntimeError('部署未通过公网订阅检查，运行 x → 检查/恢复')
+    show(c)
     print('服务与 HTTPS 订阅检查通过。真实代理通断仍需从客户端测试。')
 
 
@@ -1019,7 +1109,12 @@ def main():
     print('GitHub   https://github.com/xiazheteng8\n'
           'TG       https://t.me/xiazheteng8\n'
           'YouTube  https://www.youtube.com/@xiazheteng8\n')
-    if len(sys.argv) > 1 and sys.argv[1] == 'install':
+    if len(sys.argv) > 1 and sys.argv[1] == 'update':
+        if not STATE.exists():
+            raise RuntimeError('找不到现有部署，首次安装请直接运行脚本')
+        write(ROOT / 'manager.py', Path(__file__).read_text(encoding='utf-8'), 0o700)
+        resume(load())
+    elif len(sys.argv) > 1 and sys.argv[1] == 'install':
         installation_menu()
     elif STATE.exists():
         menu()
