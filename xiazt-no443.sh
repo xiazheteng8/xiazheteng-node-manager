@@ -832,6 +832,28 @@ def prepare_images(c):
         c['cf_image'] = image('cloudflare/cloudflared:latest')
 
 
+class ContainerNameConflict(RuntimeError):
+    pass
+
+
+def check_container_names():
+    if not shutil.which('docker'):
+        return
+    rows = run('docker', 'container', 'ls', '--all', '--format',
+               '{{.Names}}\t{{.State}}', capture=True)
+    conflicts = []
+    for row in rows.splitlines():
+        name, state = row.split('\t', 1)
+        if name in NAMES:
+            conflicts.append(f'{name} ({state})')
+    if conflicts:
+        raise ContainerNameConflict(
+            '安装所需的容器名已被占用：' + '、'.join(conflicts) + '。\n'
+            '请在另一个 SSH 会话确认容器归属和挂载。仍在使用的实例请用原管理方式处理。\n'
+            '如果确认是已停用且需要保留的旧容器，可用 '
+            'docker container rename <旧名称> <未占用的备份名称> 释放原名称。')
+
+
 def install():
     # First installation prompt, as requested.
     host = '' if TUNNEL_ONLY else ask('输入已解析的域名（没有就回车跳过）：')
@@ -847,9 +869,7 @@ def install():
         raise RuntimeError('/opt/xiazt 已存在且非空，拒绝覆盖')
     if Path('/usr/local/bin/x').exists():
         raise RuntimeError('/usr/local/bin/x 已存在，拒绝覆盖已有快捷命令')
-    for n in NAMES:
-        if shutil.which('docker') and run('docker', 'inspect', '--format', '{{.Id}}', n, capture=True, check=False):
-            raise RuntimeError(f'容器名 {n} 已存在，拒绝覆盖')
+    check_container_names()
     if TUNNEL_ONLY:
         tunnel = ask('CF 隧道：1 临时 / 2 固定 [1]：', '1')
     else:
@@ -1037,6 +1057,8 @@ def installation_menu():
             return
         except EOFError:
             return
+        except ContainerNameConflict as exc:
+            print(str(exc))
         except (Exception, KeyboardInterrupt) as exc:
             interaction_error(exc)
         if STATE.exists():
@@ -1044,7 +1066,7 @@ def installation_menu():
             return
         while True:
             try:
-                print('\n安装菜单\n1 重新配置并安装\n0 退出')
+                print('\n安装菜单\n1 重新检查并安装\n0 退出')
                 choice = ask('选择：', '0')
                 if choice == '0':
                     return
