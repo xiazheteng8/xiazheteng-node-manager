@@ -304,7 +304,8 @@ def panel_cli(c, *args):
 class Panel:
     def __init__(self, c):
         self.c = c
-        self.base = f"http://127.0.0.1:{c['panel_port']}{c['panel_path']}"
+        loopback = '[::1]' if c.get('panel_listen') == '::' else '127.0.0.1'
+        self.base = f"http://{loopback}:{c['panel_port']}{c['panel_path']}"
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
             urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
         self.csrf = ''
@@ -789,11 +790,15 @@ def verify_public(c):
 
 def show(c):
     print('订阅名称：' + c.get('subscription_name', DEFAULT_SUB_NAME))
-    print('\n3x-ui 后台通过 SSH 转发访问：')
-    sshhost = '[' + c['ip'] + ']' if ':' in c['ip'] else c['ip']
-    print(f"ssh -N -L {c['panel_port']}:127.0.0.1:{c['panel_port']} "
-          f"你的SSH账号@{sshhost or 'VPS地址'}")
-    print(f"3x-ui 后台：http://127.0.0.1:{c['panel_port']}{c['panel_path']}")
+    host = '[' + c['ip'] + ']' if ':' in c['ip'] else c['ip']
+    if host and c.get('panel_listen') in ('0.0.0.0', '::'):
+        print(f"\n3x-ui 后台：http://{host}:{c['panel_port']}{c['panel_path']}")
+        print(f"面板使用 HTTP，建议只对自己的来源 IP 放行 TCP {c['panel_port']}。")
+    else:
+        print('\n3x-ui 后台通过 SSH 转发访问：')
+        print(f"ssh -N -L {c['panel_port']}:127.0.0.1:{c['panel_port']} "
+              f"你的SSH账号@{host or 'VPS地址'}")
+        print(f"3x-ui 后台：http://127.0.0.1:{c['panel_port']}{c['panel_path']}")
     print('3x-ui 后台账号：' + c['username'] + '\n3x-ui 后台密码：' + c['password'])
     for host in endpoints(c):
         print(f"订阅：https://{host}/sub/{c['sub_token']}")
@@ -805,7 +810,7 @@ def show(c):
         print('当前只部署隧道节点。可运行 x → 检查/恢复节点，填写公网 IP 后添加直连节点。')
     if c['domain']:
         print('域名 HTTPS 需放行 TCP ' + ('80/443' if c.get('http_challenge', True) else '443'))
-    print('WS 端口、后台、订阅源站只监听本机；不自动改动你的防火墙或云安全组。')
+    print('WS 端口、订阅源站只监听本机；不自动改动你的防火墙或云安全组。')
     if c['tunnel'] == 'quick':
         print('临时隧道重启会换域名：运行 x 查看新订阅。节点订阅内容会自动使用当前域名。')
     print('快捷管理：x；凭据保存：/opt/xiazt/state.json（root 专用）')
@@ -911,6 +916,27 @@ def install():
     resume(c)
 
 
+def panel_listen(c):
+    if not c['ip']:
+        return '127.0.0.1'
+    return '::' if ':' in c['ip'] else '0.0.0.0'
+
+
+def update_panel_listen(c):
+    desired = panel_listen(c)
+    if c.get('panel_listen', '127.0.0.1') == desired or not owned('xiazt-panel'):
+        return
+    print('正在更新 3x-ui 面板监听地址…', flush=True)
+    run('docker', 'stop', 'xiazt-panel', capture=True)
+    try:
+        panel_cli(c, '-listenIP', desired)
+    finally:
+        run('docker', 'start', 'xiazt-panel', capture=True)
+    c['panel_listen'] = desired
+    Panel(c).wait()
+    save(c)
+
+
 @with_progress('部署或恢复服务')
 def resume(c):
     c['complete'] = False
@@ -918,7 +944,7 @@ def resume(c):
     # Configure an offline DB before starting the panel: no exposed default login.
     if not owned('xiazt-panel'):
         panel_cli(c, '-username', c['username'], '-password', c['password'],
-              '-port', str(c['panel_port']), '-listenIP', '127.0.0.1', '-webBasePath', c['panel_path'])
+              '-port', str(c['panel_port']), '-listenIP', panel_listen(c), '-webBasePath', c['panel_path'])
         # Disable the upstream default public subscription listener before first boot.
         with sqlite3.connect(ROOT / 'db/x-ui.db') as db:
             for key, value in [('subEnable', 'false'), ('subListen', '127.0.0.1')]:
@@ -926,7 +952,10 @@ def resume(c):
                 db.execute('INSERT INTO settings (key, value) VALUES (?, ?)', (key, value))
         container('xiazt-panel', c['panel_image'], volumes=[(ROOT / 'db', '/etc/x-ui')],
               env=['XUI_ENABLE_FAIL2BAN=false', 'TZ=Asia/Shanghai'])
+        c['panel_listen'] = panel_listen(c)
+        save(c)
     else:
+        update_panel_listen(c)
         run('docker', 'start', 'xiazt-panel', capture=True)
     Panel(c).wait()
     # Derive X25519 keypair using host OpenSSL; independent of xray CLI output versions.
@@ -1120,7 +1149,9 @@ def main():
             write('/usr/local/bin/x', '#!/bin/sh\nexec /usr/bin/python3 /opt/xiazt/manager.py "$@"\n', 0o755)
         if run('systemctl', 'is-active', '--quiet', 'xiazt-sub.service', check=False) == 0:
             run('systemctl', 'restart', 'xiazt-sub.service')
-        print('管理器已更新。选择 5 检查/恢复节点，启用 Hysteria 2。')
+        c = load()
+        update_panel_listen(c)
+        print('管理器已更新。选择 1 查看面板地址。')
         menu()
     elif len(sys.argv) > 1 and sys.argv[1] == 'install':
         installation_menu()
