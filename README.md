@@ -23,14 +23,24 @@
 curl -fLO https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazt-fixed.sh &&
   sudo bash xiazt-fixed.sh
 ```
+### 常规(ip)版
 
+```bash
+curl -fLO https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazt-panel-public-ip.sh &&
+  sudo bash xiazt-panel-public-ip.sh
+```
 ### 免入站 443 版
 
 ```bash
 curl -fLO https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazt-no443.sh &&
   sudo bash xiazt-no443.sh
 ```
+### 免入站 443（ip） 版
 
+```bash
+curl -fLO https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazt-tunnel-panel-public-ip.sh &&
+  sudo bash xiazt-tunnel-panel-public-ip.sh
+```
 ## 配置入口
 
 - **临时隧道（选项 1）**。常规版先在直连域名提示处按回车，再选 `1`。免入站 443 版直接选 `1`。Cloudflare 会分配一个 `trycloudflare.com` 地址，隧道重启后地址可能变化。运行 `sudo x` 并选 `1` 查看当前订阅。
