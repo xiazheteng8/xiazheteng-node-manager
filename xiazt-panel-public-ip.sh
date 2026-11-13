@@ -816,7 +816,7 @@ def show(c):
         print('当前只部署隧道节点。可运行 x → 检查/恢复节点，填写公网 IP 后添加直连节点。')
     if c['domain']:
         print('域名 HTTPS 需放行 TCP ' + ('80/443' if c.get('http_challenge', True) else '443'))
-    print('WS 端口、订阅源站只监听本机；不自动改动你的防火墙或云安全组。')
+    print('WS 端口、订阅源站只监听本机；自动放行已启用的 UFW；云安全组请按实际端口配置。')
     if c['tunnel'] == 'quick':
         print('临时隧道重启会换域名：运行 x 查看新订阅。节点订阅内容会自动使用当前域名。')
     print('快捷管理：x；凭据保存：/opt/xiazt/state.json（root 专用）')
@@ -1007,6 +1007,37 @@ def verify_native_subscription(c):
         raise RuntimeError(f'3x-ui 原生订阅未监听 TCP {port}，请检查 docker logs xiazt-panel') from None
 
 
+def public_ports(c):
+    ports = set()
+    if c['ip']:
+        for key in ('panel_port', 'native_sub_port', 'reality_port', 'ss_port'):
+            if key in c:
+                ports.add((c[key], 'tcp'))
+        ports.add((c['ss_port'], 'udp'))
+        if c.get('h2_port'):
+            ports.add((c['h2_port'], 'udp'))
+    if c['domain']:
+        ports.update(((443, 'tcp'), (443, 'udp')))
+        if c.get('http_challenge', True):
+            ports.add((80, 'tcp'))
+    return ports
+
+
+def allow_public_ports(c):
+    ports = sorted(public_ports(c))
+    if not ports:
+        return
+    summary = '、'.join(f'{port}/{protocol.upper()}' for port, protocol in ports)
+    if shutil.which('ufw'):
+        status = run('env', 'LC_ALL=C', 'ufw', 'status', capture=True)
+        if status.startswith('Status: active'):
+            for port, protocol in ports:
+                run('ufw', 'allow', f'{port}/{protocol}', 'comment', 'xiazt')
+            print('UFW 已放行：' + summary)
+            return
+    print('未检测到启用的 UFW。若使用其他防火墙或云安全组，请核对：' + summary)
+
+
 @with_progress('部署或恢复服务')
 def resume(c):
     c['complete'] = False
@@ -1039,6 +1070,7 @@ def resume(c):
     setup_nodes(c)
     install_services(c)
     setup_h2(c)
+    allow_public_ports(c)
     c['complete'] = verify_public(c)
     save(c)
     show(c)
@@ -1233,6 +1265,7 @@ def main():
             run('docker', 'start', 'xiazt-panel', capture=True)
             Panel(c).wait()
             verify_native_subscription(c)
+            allow_public_ports(c)
             # Restore the subscription/WS routes when upgrading from the HTTPS-panel version.
             path = ROOT / 'Caddyfile'
             config = caddy_config(c)
