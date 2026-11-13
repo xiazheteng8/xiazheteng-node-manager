@@ -636,13 +636,31 @@ def serve():
 
 
 def caddy_config(c):
+    panel_path = c['panel_path']
+    if not re.fullmatch(r'/[0-9a-f]+/', panel_path):
+        raise ValueError('面板路径与脚本生成的格式不符，请检查面板配置')
     routes = ''
+    routes += (
+        f"    handle {panel_path}* {{\n"
+        f"        reverse_proxy 127.0.0.1:{c['panel_port']} {{\n"
+        "            header_up X-Forwarded-Proto https\n"
+        "            header_up X-Real-IP {client_ip}\n"
+        "            header_up X-Forwarded-For {client_ip}\n"
+        "            header_down Cache-Control no-store\n"
+        "        }\n"
+        "    }\n"
+    )
     for proto in ('vless', 'vmess', 'trojan'):
         routes += f"    handle {c['ws_prefix']}/{proto} {{\n        reverse_proxy 127.0.0.1:{c[proto + '_port']}\n    }}\n"
     routes += f"    handle /sub/* {{\n        reverse_proxy 127.0.0.1:{c['sub_port']}\n    }}\n    handle /health {{\n        respond ok\n    }}\n    handle {{\n        respond 404\n    }}\n"
     config = '{\n    admin off\n'
     if not c.get('http_challenge', True):
         config += '    auto_https disable_redirects\n'
+    if c['tunnel'] != 'none':
+        config += (f"    servers 127.0.0.1:{c['edge_port']} {{\n"
+                   "        trusted_proxies static 127.0.0.1/32\n"
+                   "        client_ip_headers CF-Connecting-IP\n"
+                   "    }\n")
     config += '}\n'
     # A site hostname matches the HTTP Host; it does not restrict the bind address.
     # CF forwards the public hostname, so accept any Host but bind loopback only.
@@ -704,15 +722,27 @@ def setup_h2(c):
     raise RuntimeError('Hysteria 2 未启动，请查看 docker logs xiazt-h2')
 
 
-@with_progress('启动 Caddy、订阅服务和隧道')
-def install_services(c):
-    write(ROOT / 'Caddyfile', caddy_config(c), 0o644)
+def install_edge(c):
+    config = caddy_config(c)
+    with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+        candidate = Path(directory) / 'Caddyfile'
+        write(candidate, config, 0o644)
+        run('docker', 'run', '--rm', '--network', 'none',
+            '-v', f'{candidate}:/etc/caddy/Caddyfile:ro', c['edge_image'],
+            'caddy', 'adapt', '--config', '/etc/caddy/Caddyfile', '--adapter', 'caddyfile',
+            capture=True)
+    write(ROOT / 'Caddyfile', config)
     if not owned('xiazt-edge'):
         container('xiazt-edge', c['edge_image'], 'caddy', 'run', '--config', '/etc/caddy/Caddyfile',
                   volumes=[(ROOT / 'Caddyfile', '/etc/caddy/Caddyfile:ro'),
                            (ROOT / 'caddy-data', '/data'), (ROOT / 'caddy-config', '/config')])
     else:
         run('docker', 'restart', 'xiazt-edge', capture=True)
+
+
+@with_progress('启动 Caddy、订阅服务和隧道')
+def install_services(c):
+    install_edge(c)
     write('/etc/systemd/system/xiazt-sub.service', '''[Unit]
 Description=Xiazt subscription service
 After=network-online.target docker.service
@@ -744,7 +774,22 @@ WantedBy=multi-user.target
                   f"http://127.0.0.1:{c['edge_port']}")
 
 
-@with_progress('检查公网订阅')
+def verify_panel(host, c):
+    url = f"https://{host}{c['panel_path']}csrf-token"
+    for attempt in range(8):
+        try:
+            result = request(url, timeout=5)
+            if isinstance(result, dict) and result.get('success') and result.get('obj'):
+                return True
+        except (OSError, ValueError):
+            pass
+        if attempt < 7:
+            time.sleep(2)
+    print(f'3x-ui HTTPS 转发未验证通过（{host}），请检查 xiazt-edge 和 xiazt-panel 的日志。')
+    return False
+
+
+@with_progress('检查公网订阅和 3x-ui HTTPS 入口')
 def verify_public(c):
     hosts = endpoints(c)
     quick_ready = True
@@ -780,27 +825,31 @@ def verify_public(c):
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 pass
             time.sleep(2)
+    panel_checks = {host: verify_panel(host, c) for host in hosts}
+    c['panel_checks'] = panel_checks
     c['public_checks'] = results
     save(c)
     if not quick_ready or not results or not all(results.values()):
         print('公网订阅未验证通过，请检查 DNS、端口和隧道日志。')
         return False
-    return True
+    return all(panel_checks.values())
 
 
 def show(c):
     print('订阅名称：' + c.get('subscription_name', DEFAULT_SUB_NAME))
     host = '[' + c['ip'] + ']' if ':' in c['ip'] else c['ip']
-    if host and c.get('panel_listen') in ('0.0.0.0', '::'):
-        print(f"\n3x-ui 后台：http://{host}:{c['panel_port']}{c['panel_path']}")
-        print(f"面板使用 HTTP，建议只对自己的来源 IP 放行 TCP {c['panel_port']}。")
+    hosts = endpoints(c)
+    if hosts:
+        for panel_host in hosts:
+            print(f"\n3x-ui 后台：https://{panel_host}{c['panel_path']}")
+        print('面板端口仅监听本机，通过 HTTPS 入口访问。')
     else:
-        print('\n3x-ui 后台通过 SSH 转发访问：')
-        print(f"ssh -N -L {c['panel_port']}:127.0.0.1:{c['panel_port']} "
+        print('\nHTTPS 入口暂未就绪，可通过 SSH 转发访问 3x-ui：')
+        print(f"ssh -N -L 127.0.0.1:{c['panel_port']}:127.0.0.1:{c['panel_port']} "
               f"你的SSH账号@{host or 'VPS地址'}")
         print(f"3x-ui 后台：http://127.0.0.1:{c['panel_port']}{c['panel_path']}")
     print('3x-ui 后台账号：' + c['username'] + '\n3x-ui 后台密码：' + c['password'])
-    for host in endpoints(c):
+    for host in hosts:
         print(f"订阅：https://{host}/sub/{c['sub_token']}")
     if c['ip']:
         print(f"直连需放行 TCP {c['reality_port']}、TCP/UDP {c['ss_port']}")
@@ -916,14 +965,11 @@ def install():
     resume(c)
 
 
-def panel_listen(c):
-    if not c['ip']:
-        return '127.0.0.1'
-    return '::' if ':' in c['ip'] else '0.0.0.0'
+PANEL_LISTEN = '127.0.0.1'
 
 
 def update_panel_listen(c):
-    desired = panel_listen(c)
+    desired = PANEL_LISTEN
     if c.get('panel_listen', '127.0.0.1') == desired or not owned('xiazt-panel'):
         return
     print('正在更新 3x-ui 面板监听地址…', flush=True)
@@ -933,8 +979,8 @@ def update_panel_listen(c):
     finally:
         run('docker', 'start', 'xiazt-panel', capture=True)
     c['panel_listen'] = desired
-    Panel(c).wait()
     save(c)
+    Panel(c).wait()
 
 
 @with_progress('部署或恢复服务')
@@ -944,7 +990,7 @@ def resume(c):
     # Configure an offline DB before starting the panel: no exposed default login.
     if not owned('xiazt-panel'):
         panel_cli(c, '-username', c['username'], '-password', c['password'],
-              '-port', str(c['panel_port']), '-listenIP', panel_listen(c), '-webBasePath', c['panel_path'])
+              '-port', str(c['panel_port']), '-listenIP', PANEL_LISTEN, '-webBasePath', c['panel_path'])
         # Disable the upstream default public subscription listener before first boot.
         with sqlite3.connect(ROOT / 'db/x-ui.db') as db:
             for key, value in [('subEnable', 'false'), ('subListen', '127.0.0.1')]:
@@ -952,7 +998,7 @@ def resume(c):
                 db.execute('INSERT INTO settings (key, value) VALUES (?, ?)', (key, value))
         container('xiazt-panel', c['panel_image'], volumes=[(ROOT / 'db', '/etc/x-ui')],
               env=['XUI_ENABLE_FAIL2BAN=false', 'TZ=Asia/Shanghai'])
-        c['panel_listen'] = panel_listen(c)
+        c['panel_listen'] = PANEL_LISTEN
         save(c)
     else:
         update_panel_listen(c)
@@ -973,8 +1019,8 @@ def resume(c):
     save(c)
     show(c)
     if not c['complete']:
-        raise RuntimeError('部署未通过公网订阅检查，运行 x → 检查/恢复')
-    print('服务与 HTTPS 订阅检查通过。请从客户端测试各节点连通性。')
+        raise RuntimeError('部署未通过公网订阅或面板检查，运行 x → 检查/恢复')
+    print('服务、HTTPS 订阅及面板检查通过。请从客户端测试各节点连通性。')
 
 
 def remove():
@@ -1150,8 +1196,18 @@ def main():
         if run('systemctl', 'is-active', '--quiet', 'xiazt-sub.service', check=False) == 0:
             run('systemctl', 'restart', 'xiazt-sub.service')
         c = load()
-        update_panel_listen(c)
-        print('管理器已更新。选择 1 查看面板地址。')
+        if owned('xiazt-panel') and owned('xiazt-edge'):
+            update_panel_listen(c)
+            run('docker', 'start', 'xiazt-panel', capture=True)
+            install_edge(c)
+            c['complete'] = verify_public(c)
+            save(c)
+            if c['complete']:
+                print('管理器和 HTTPS 转发已更新。选择 1 查看面板地址。')
+            else:
+                print('管理器已更新。公网检查未通过，可选 4 查看状态或选 5 恢复。')
+        else:
+            resume(c)
         menu()
     elif len(sys.argv) > 1 and sys.argv[1] == 'install':
         installation_menu()
