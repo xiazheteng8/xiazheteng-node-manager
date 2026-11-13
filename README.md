@@ -23,7 +23,7 @@
 curl -fLO https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazt-fixed.sh &&
   sudo bash xiazt-fixed.sh
 ```
-### 常规(ip)版
+### 常规(ip)端口放行原生订阅版
 
 ```bash
 curl -fLO https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazt-panel-public-ip.sh &&
@@ -35,7 +35,7 @@ curl -fLO https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/
 curl -fLO https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazt-no443.sh &&
   sudo bash xiazt-no443.sh
 ```
-### 免入站 443（ip） 版
+### 免入站 443（ip）端口放行原生订阅版
 
 ```bash
 curl -fLO https://raw.githubusercontent.com/xiazheteng8/xiazheteng-node-manager/main/xiazt-tunnel-panel-public-ip.sh &&
