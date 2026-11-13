@@ -796,6 +796,10 @@ def show(c):
         print(f"公网直连需在云安全组和系统防火墙放行 TCP {c['panel_port']}，"
               "建议仅允许自己的来源 IP。")
         print('请在浏览器地址栏输入完整地址（含 http://、端口和面板路径）。')
+        if c.get('native_sub_ready'):
+            print('3x-ui 原生订阅前缀：' + native_subscription_uri(c))
+            print(f"原生订阅需放行 TCP {c['native_sub_port']}。在入站列表添加客户端后，"
+                  "复制该客户端的订阅链接。")
     else:
         print('\n3x-ui 后台通过 SSH 转发访问：')
         print(f"ssh -N -L {c['panel_port']}:127.0.0.1:{c['panel_port']} "
@@ -946,6 +950,63 @@ def update_panel_listen(c):
     save(c)
 
 
+def native_subscription_port(c):
+    if 'native_sub_port' in c:
+        return c['native_sub_port']
+    reserved = {value for key, value in c.items() if key.endswith('_port')}
+    port = choose_port(2096)
+    while port in reserved:
+        port = choose_port(secrets.randbelow(30000) + 20000)
+    c['native_sub_port'] = port
+    save(c)
+    return port
+
+
+def native_subscription_uri(c):
+    address = c['ip']
+    host = f'[{address}]' if ':' in address else address
+    return f"http://{host}:{c['native_sub_port']}/sub/"
+
+
+def configure_native_subscription(c, existing=False):
+    if existing and c.get('native_sub_ready'):
+        return
+    port = native_subscription_port(c)
+    settings = {
+        'subEnable': 'true',
+        'subListen': panel_listen(c),
+        'subPort': str(port),
+        'subPath': '/sub/',
+        'subURI': native_subscription_uri(c),
+        'subDomain': '',
+        'subCertFile': '',
+        'subKeyFile': '',
+    }
+    if existing:
+        run('docker', 'stop', 'xiazt-panel', capture=True)
+    try:
+        with sqlite3.connect(ROOT / 'db/x-ui.db') as db:
+            for key, value in settings.items():
+                db.execute('DELETE FROM settings WHERE key = ?', (key,))
+                db.execute('INSERT INTO settings (key, value) VALUES (?, ?)', (key, value))
+        db.close()
+    finally:
+        if existing:
+            run('docker', 'start', 'xiazt-panel', capture=True)
+    c['native_sub_ready'] = True
+    save(c)
+
+
+def verify_native_subscription(c):
+    address = '::1' if panel_listen(c) == '::' else '127.0.0.1'
+    port = c['native_sub_port']
+    try:
+        with socket.create_connection((address, port), timeout=3):
+            pass
+    except OSError:
+        raise RuntimeError(f'3x-ui 原生订阅未监听 TCP {port}，请检查 docker logs xiazt-panel') from None
+
+
 @with_progress('部署或恢复服务')
 def resume(c):
     c['complete'] = False
@@ -954,19 +1015,19 @@ def resume(c):
     if not owned('xiazt-panel'):
         panel_cli(c, '-username', c['username'], '-password', c['password'],
               '-port', str(c['panel_port']), '-listenIP', panel_listen(c), '-webBasePath', c['panel_path'])
-        # Disable the upstream default public subscription listener before first boot.
-        with sqlite3.connect(ROOT / 'db/x-ui.db') as db:
-            for key, value in [('subEnable', 'false'), ('subListen', '127.0.0.1')]:
-                db.execute('DELETE FROM settings WHERE key = ?', (key,))
-                db.execute('INSERT INTO settings (key, value) VALUES (?, ?)', (key, value))
+        configure_native_subscription(c)
         container('xiazt-panel', c['panel_image'], volumes=[(ROOT / 'db', '/etc/x-ui')],
               env=['XUI_ENABLE_FAIL2BAN=false', 'TZ=Asia/Shanghai'])
         c['panel_listen'] = panel_listen(c)
         save(c)
     else:
         update_panel_listen(c)
+        if c['ip']:
+            configure_native_subscription(c, existing=True)
         run('docker', 'start', 'xiazt-panel', capture=True)
     Panel(c).wait()
+    if c['ip']:
+        verify_native_subscription(c)
     # Derive X25519 keypair using host OpenSSL; independent of xray CLI output versions.
     if not c.get('private_key'):
         key = subprocess.check_output(['openssl', 'genpkey', '-algorithm', 'X25519'])
@@ -1168,8 +1229,10 @@ def main():
             run('systemctl', 'restart', 'xiazt-sub.service')
         if owned('xiazt-panel'):
             update_panel_listen(c)
+            configure_native_subscription(c, existing=True)
             run('docker', 'start', 'xiazt-panel', capture=True)
             Panel(c).wait()
+            verify_native_subscription(c)
             # Restore the subscription/WS routes when upgrading from the HTTPS-panel version.
             path = ROOT / 'Caddyfile'
             config = caddy_config(c)
